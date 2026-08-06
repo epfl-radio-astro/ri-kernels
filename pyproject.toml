@@ -1,0 +1,90 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.10",
+    "jax==0.6.0", # Use minimum FFI api to build
+]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+cmake.version = ">=3.20"
+cmake.build-type = "Release"
+cmake.source-dir = "."
+wheel.packages = ["ri_kernels"]
+wheel.py-api = "py3"
+
+[[tool.scikit-build.overrides]]
+if.env.RI_KERNELS_CUDA = "(?i)1|on|true|yes"
+cmake.define.RI_KERNELS_CUDA = "ON"
+
+[[tool.scikit-build.overrides]]
+if.env.RI_KERNELS_ROCM = "(?i)1|on|true|yes"
+cmake.define.RI_KERNELS_ROCM = "ON"
+
+# ── Project metadata ───────────────────────────────────────────────────────────
+
+[project]
+name = "ri_kernels"
+version = "0.1.0"
+license = {file = "LICENSE"}
+readme = "README.md"
+authors = [
+  {name = "Chris Finlay", email = "christopher.finlay@epfl.ch"},
+  {name = "Simon Frasch", email = "simon.frasch@cscs.ch"},
+]
+maintainers = [
+  {name = "Chris Finlay", email = "christopher.finlay@epfl.ch"},
+  {name = "Simon Frasch", email = "simon.frasch@cscs.ch"},
+]
+description = "RI Kernels"
+
+requires-python = ">=3.10"
+dependencies = [
+    "jax>=0.6.0",
+]
+
+[project.optional-dependencies]
+test  = ["pytest", "pytest-cov"]
+# The GPU kernels ship as add-on wheels of their own (see ci/make_variant.py);
+# the extra pulls the matching one in next to a CUDA-enabled jax, so
+# `pip install ri_kernels[cuda12]` is a complete GPU install.
+#
+# The add-on depends on `ri_kernels==<same version>` in turn, but on the *bare*
+# name, never `ri_kernels[cuda12]` - a resolver treats an extra as a node of its
+# own, so this is a diamond (ri_kernels[cuda12] -> ri_kernels_cuda12 ->
+# ri_kernels) and not a cycle. Keep it that way: making the add-on depend on the
+# extra would close the loop. Same shape as jax[cuda12] -> jax-cuda12-plugin ->
+# jax.
+#
+# The pins here must track [project].version; ci/make_variant.py fails the build
+# if they drift.
+cuda12 = ["jax[cuda12]", "ri_kernels_cuda12==0.1.0"]
+cuda13 = ["jax[cuda13]", "ri_kernels_cuda13==0.1.0"]
+
+[project.urls]
+Repository = "https://github.com/epfl-radio-astro/ri_kernels.git"
+
+
+# ── Wheel building ─────────────────────────────────────────────────────────────
+
+[tool.cibuildwheel]
+# The libraries are loaded with ctypes, not imported as extension modules, so
+# `wheel.py-api = "py3"` above makes one wheel per platform cover all supported
+# interpreters. Building for a single CPython therefore produces the complete
+# set; without this cibuildwheel would build five byte-identical wheels.
+build = "cp312-*"
+skip = "*-musllinux_*"
+build-frontend = "build"
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+
+[tool.cibuildwheel.macos.environment]
+# `src/*.cpp` uses <latch>, which libc++ annotates as macOS 11.0+.
+MACOSX_DEPLOYMENT_TARGET = "11.0"
+
+
+# ── Pytest ─────────────────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+log_cli       = true
+log_cli_level = "WARNING"
+
