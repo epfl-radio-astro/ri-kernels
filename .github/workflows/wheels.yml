@@ -1,0 +1,221 @@
+name: Wheels
+
+# Builds the three distributions published from this repository:
+#
+#   ri_kernels         Python code + libri_kernels.so (CPU)
+#   ri_kernels_cuda12  libri_kernels_cuda.so built against CUDA 12
+#   ri_kernels_cuda13  libri_kernels_cuda.so built against CUDA 13
+#
+# The CUDA wheels are add-ons: they contain no Python code and depend on
+# ri_kernels of the exact same version. ci/make_variant.py derives their build
+# metadata from pyproject.toml. Wheels are built on every push and pull request;
+# they are only uploaded to PyPI when a GitHub Release is published.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  sdist:
+    name: sdist (ri_kernels)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: pipx run build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist-ri_kernels
+          path: dist/*.tar.gz
+
+  build_cpu:
+    name: ri_kernels (${{ matrix.arch }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, arch: x86_64 }
+          - { os: ubuntu-24.04-arm, arch: aarch64 }
+          - { os: macos-14, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pypa/cibuildwheel@v4.2.0
+        env:
+          CIBW_BUILD_VERBOSITY: 1
+          CIBW_TEST_REQUIRES: pytest numpy
+          CIBW_TEST_SOURCES: tests
+          # The test module skips itself at module level when no library is
+          # found, so assert the library is present before running it -
+          # otherwise a wheel missing libri_kernels.so would pass vacuously.
+          CIBW_TEST_COMMAND: >
+            python -c "from ri_kernels.jax_api import rfi_vis_op as m; assert m._TAB_LIB is not None, 'libri_kernels.so missing from wheel'"
+            && pytest ./tests -q
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-ri_kernels-${{ matrix.os }}-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+
+  build_cuda:
+    name: ri_kernels_cuda${{ matrix.cuda.major }} (${{ matrix.platform.arch }})
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # `archs` overrides the CMAKE_CUDA_ARCHITECTURES default in
+        # CMakeLists.txt, which is kept to what any CUDA 12.x can build. The
+        # published wheels target one cubin per compute-capability *major*
+        # (plus 7.5, the CUDA 13 floor): cubins are binary compatible upward
+        # within a major, so 8.0 covers 8.6/8.7/8.9, 10.0 covers 10.3 (B300)
+        # and 12.0 covers 12.1 (GB10). 10.x and 12.x are separate families and
+        # need separate cubins. This is the set the jax CUDA plugin itself
+        # ships, minus 7.0, which only CUDA 12 can still build. The trailing
+        # `-virtual` embeds PTX once, as the JIT fallback for future GPUs.
+        cuda:
+          - major: "12"
+            pkg: "12-9"
+            home: "/usr/local/cuda-12.9"
+            archs: "60-real;70-real;75-real;80-real;90-real;100-real;120-real;120-virtual"
+          - major: "13"
+            pkg: "13-0"
+            home: "/usr/local/cuda-13.0"
+            # CUDA 13 dropped Maxwell/Pascal/Volta; Turing is the floor.
+            archs: "75-real;80-real;90-real;100-real;120-real;120-virtual"
+        platform:
+          - { os: ubuntu-latest, arch: x86_64, repo_arch: x86_64 }
+          - { os: ubuntu-24.04-arm, arch: aarch64, repo_arch: sbsa }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rewrite metadata for the CUDA ${{ matrix.cuda.major }} variant
+        run: |
+          python -m pip install --disable-pip-version-check tomlkit
+          python ci/make_variant.py --cuda ${{ matrix.cuda.major }}
+
+      - uses: pypa/cibuildwheel@v4.2.0
+        env:
+          CIBW_BUILD_VERBOSITY: 1
+          # nvcc, the CUDA runtime headers/static lib, and CUB, installed into
+          # the manylinux container. Use the cuda-toolkit-${{ matrix.cuda.pkg }}
+          # metapackage instead if these split packages ever stop resolving.
+          CIBW_BEFORE_ALL_LINUX: >
+            dnf -y install dnf-plugins-core &&
+            dnf config-manager --add-repo
+            https://developer.download.nvidia.com/compute/cuda/repos/rhel8/${{ matrix.platform.repo_arch }}/cuda-rhel8.repo &&
+            dnf -y install
+            cuda-nvcc-${{ matrix.cuda.pkg }}
+            cuda-cudart-devel-${{ matrix.cuda.pkg }}
+            cuda-cccl-${{ matrix.cuda.pkg }}
+          # CMAKE_ARGS is forwarded to the configure step by scikit-build-core.
+          # It has to carry the architectures rather than SKBUILD_CMAKE_DEFINE,
+          # which splits its own value on `;`. The quotes keep cibuildwheel's
+          # shell-style parser from reading the separators as command
+          # terminators.
+          CIBW_ENVIRONMENT_LINUX: >
+            CUDACXX=${{ matrix.cuda.home }}/bin/nvcc
+            PATH=${{ matrix.cuda.home }}/bin:$PATH
+            CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda.archs }}"
+          # No test here: installing the wheel would pull ri_kernels==<version>
+          # from the index, which does not exist yet for an unreleased version. The
+          # library is smoke-tested below instead.
+          CIBW_TEST_COMMAND: ""
+
+      - name: Smoke-test the built library
+        run: python ci/check_library.py wheelhouse ri_kernels_cuda${{ matrix.cuda.major }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-ri_kernels_cuda${{ matrix.cuda.major }}-${{ matrix.platform.arch }}
+          path: wheelhouse/*.whl
+
+  check_release:
+    name: Check release tag
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match the version in pyproject.toml
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$TAG" != "v$version" ] && [ "$TAG" != "$version" ]; then
+            echo "::error::release tag '$TAG' does not match pyproject.toml version '$version'"
+            exit 1
+          fi
+          echo "Releasing version $version"
+
+  # One publish job per PyPI project: trusted publishing binds a project to
+  # a single workflow + environment, so they cannot share one.
+  publish_ri_kernels:
+    name: Publish ri_kernels
+    if: github.event_name == 'release'
+    needs: [check_release, sdist, build_cpu, build_cuda]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-ri_kernels
+      url: https://pypi.org/p/ri_kernels
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-ri_kernels-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist-ri_kernels
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # The CUDA packages pin ri_kernels==<version>, so the base package has to be
+  # on the index first.
+  publish_ri_kernels_cuda12:
+    name: Publish ri_kernels_cuda12
+    if: github.event_name == 'release'
+    needs: [publish_ri_kernels]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-ri_kernels_cuda12
+      url: https://pypi.org/p/ri_kernels_cuda12
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-ri_kernels_cuda12-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish_ri_kernels_cuda13:
+    name: Publish ri_kernels_cuda13
+    if: github.event_name == 'release'
+    needs: [publish_ri_kernels]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-ri_kernels_cuda13
+      url: https://pypi.org/p/ri_kernels_cuda13
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-ri_kernels_cuda13-*
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1

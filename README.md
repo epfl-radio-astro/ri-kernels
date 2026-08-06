@@ -68,7 +68,7 @@ The tests skip themselves when no kernel library is importable, so make sure
 ## Releasing
 
 `.github/workflows/wheels.yml` builds all three distributions on every push and
-publishes them to TestPyPI when a GitHub Release is published. The release tag
+publishes them to PyPI when a GitHub Release is published. The release tag
 must match `[project].version` in `pyproject.toml`.
 
 The CUDA wheels are generated from the same source tree by `ci/make_variant.py`,
