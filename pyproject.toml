@@ -35,7 +35,7 @@ maintainers = [
   {name = "Chris Finlay", email = "christopher.finlay@epfl.ch"},
   {name = "Simon Frasch", email = "simon.frasch@cscs.ch"},
 ]
-description = "RI Kernels"
+description = "CPU and GPU kernels for radio interferometry, exposed to JAX as FFI custom calls"
 
 requires-python = ">=3.10"
 dependencies = [
