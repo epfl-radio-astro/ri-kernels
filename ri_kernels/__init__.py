@@ -1,3 +1,3 @@
-"""RI Kernels: SIMD and GPU kernels for radio interferometry, exposed to JAX."""
+"""RI Kernels: CPU and GPU kernels for radio interferometry, exposed to JAX."""
 
 __all__ = ["jax_api"]
