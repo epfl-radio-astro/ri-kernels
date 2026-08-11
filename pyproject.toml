@@ -24,7 +24,7 @@ cmake.define.RI_KERNELS_ROCM = "ON"
 
 [project]
 name = "ri_kernels"
-version = "0.1.0"
+version = "0.2.0"
 license = {file = "LICENSE"}
 readme = "README.md"
 authors = [
@@ -57,8 +57,8 @@ test  = ["pytest", "pytest-cov"]
 #
 # The pins here must track [project].version; ci/make_variant.py fails the build
 # if they drift.
-cuda12 = ["jax[cuda12]", "ri_kernels_cuda12==0.1.0"]
-cuda13 = ["jax[cuda13]", "ri_kernels_cuda13==0.1.0"]
+cuda12 = ["jax[cuda12]", "ri_kernels_cuda12==0.2.0"]
+cuda13 = ["jax[cuda13]", "ri_kernels_cuda13==0.2.0"]
 
 [project.urls]
 Repository = "https://github.com/epfl-radio-astro/ri_kernels.git"
