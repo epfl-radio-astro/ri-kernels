@@ -1,0 +1,77 @@
+name: Tests
+
+# Builds the CPU kernels from the checkout and runs the test suite against two
+# JAX versions: the minimum supported one (the `jax>=` floor in pyproject.toml,
+# read at run time so the two cannot drift) and the latest release. Each is
+# paired with the oldest interpreter that version of JAX has wheels for, which
+# also exercises both ends of `requires-python`.
+#
+# The wheels workflow tests the *published* wheels on every platform; this one
+# tests a source build on Linux only, and is the fast signal on pull requests.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pytest:
+    name: pytest (jax ${{ matrix.jax }}, python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # jaxlib 0.6.0 ships cp310-cp313 wheels, jaxlib 0.11.0 cp312-cp314.
+          - { jax: minimum, python: "3.10" }
+          - { jax: latest, python: "3.13" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Resolve the JAX requirement
+        id: jax
+        # The minimum is the `jax>=<version>` floor from [project].dependencies;
+        # `jax==0.6.0` under [build-system] is a separate pin (the FFI API the
+        # library is compiled against) and deliberately not matched here.
+        run: |
+          if [ "${{ matrix.jax }}" = "minimum" ]; then
+            floor=$(grep -oE '"jax>=[0-9]+(\.[0-9]+)*"' pyproject.toml | head -1 | cut -d= -f2 | tr -d '"')
+            if [ -z "$floor" ]; then
+              echo "::error::could not find a jax>= requirement in pyproject.toml"
+              exit 1
+            fi
+            echo "spec=jax==$floor" >> "$GITHUB_OUTPUT"
+          else
+            echo "spec=jax" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install ri_kernels and its test dependencies
+        # One resolve, so the pin is honoured rather than installed and then
+        # upgraded by the `jax>=` dependency of the package itself.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -v "${{ steps.jax.outputs.spec }}" ".[test]"
+          python -c "import jax; print('jax', jax.__version__)"
+
+      - name: Run the tests
+        # From outside the checkout: the source tree has a `ri_kernels`
+        # directory of its own, and only the installed package carries
+        # libri_kernels.so. The test module skips itself at module level when no
+        # library is found, so assert it loaded first - otherwise a build that
+        # produced no library would pass vacuously.
+        working-directory: ${{ runner.temp }}
+        run: |
+          python -c "from ri_kernels.jax_api import rfi_vis_op as m; assert m._TAB_LIB is not None, 'libri_kernels.so was not built'"
+          pytest -q "$GITHUB_WORKSPACE/tests"
