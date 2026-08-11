@@ -5,9 +5,9 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
-#include <latch>
 #include <unistd.h>
 
+#include "parallel_for.hpp"
 #include "tensor.hpp"
 #include "visibility.h"
 #include "xla/ffi/api/c_api.h"
@@ -149,7 +149,7 @@ using rfi_amp_f64_t = ffi::Buffer<ffi::C128, 6>;
 using rfi_phase_f64_t = ffi::Buffer<ffi::F64, 6>;
 
 template <ffi::DataType AMP_DT, ffi::DataType PHASE_DT, typename T>
-ffi::Error calc_rfi_vis_cpu_impl_tmpl(
+ffi::Future calc_rfi_vis_cpu_impl_tmpl(
     ffi::ThreadPool thread_pool,
     ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a1_sorter,
     ffi::BufferR1<ffi::S32> a1_start, ffi::BufferR1<ffi::S32> a2,
@@ -157,33 +157,36 @@ ffi::Error calc_rfi_vis_cpu_impl_tmpl(
     ffi::Buffer<AMP_DT, 6> rfi_amp_fine, ffi::Buffer<PHASE_DT, 6> rfi_phase,
     ffi::Result<ffi::BufferR3<AMP_DT>> rfi_vis) {
   if (a1.dimensions()[0] != a2.dimensions()[0]) {
-    return ffi::Error::InvalidArgument(
-        "Expected a1 and a2 to have the same size");
+    return completed_future(
+        ffi::Error::InvalidArgument("Expected a1 and a2 to have the same size"));
   }
 
   for (int i = 0; i < 6; ++i) {
     if (rfi_amp_fine.dimensions()[i] != rfi_phase.dimensions()[i]) {
-      return ffi::Error::InvalidArgument(
-          "Expected rfi_amp_fine and rfi_phase to have the same shape");
+      return completed_future(ffi::Error::InvalidArgument(
+          "Expected rfi_amp_fine and rfi_phase to have the same shape"));
     }
   }
 
   if (rfi_vis->dimensions()[0] != a1.dimensions()[0]) {
-    return ffi::Error::InvalidArgument(
-        "Expected rfi_vis and a1 to have the same number of baselines");
+    return completed_future(ffi::Error::InvalidArgument(
+        "Expected rfi_vis and a1 to have the same number of baselines"));
   }
 
   if (rfi_vis->dimensions()[1] != rfi_amp_fine.dimensions()[1]) {
-    return ffi::Error::InvalidArgument(
+    return completed_future(ffi::Error::InvalidArgument(
         "Expected rfi_vis and rfi_amp_fine to have the same number of "
-        "frequencies");
+        "frequencies"));
   }
 
   if (rfi_vis->dimensions()[2] != rfi_amp_fine.dimensions()[2]) {
-    return ffi::Error::InvalidArgument(
-        "Expected rfi_vis and rfi_amp_fine to have the same number of times");
+    return completed_future(ffi::Error::InvalidArgument(
+        "Expected rfi_vis and rfi_amp_fine to have the same number of times"));
   }
 
+  // Snapshot of everything the chunks need. These views own their extents by
+  // value, so they stay valid after the handler returns - unlike the ffi::Buffer
+  // arguments, which point into the FFI call frame. See parallel_for().
   Tensor1D<const int *> a1_tensor(a1.typed_data(), a1.dimensions()[0]);
   Tensor1D<const int *> a2_tensor(a2.typed_data(), a2.dimensions()[0]);
   Tensor4D<const std::complex<T> *> rfi_amp_fine_tensor(
@@ -205,52 +208,36 @@ ffi::Error calc_rfi_vis_cpu_impl_tmpl(
   const auto n_int_t = rfi_amp_fine.dimensions()[5];
   const T n_int_inv = T(1) / T(n_int_f * n_int_t);
 
-  const int64_t n_threads = std::max<int64_t>(thread_pool.num_threads(), 1);
-
   const int64_t n_bl = a1.dimensions()[0];
-  const int64_t n_bl_per_thread = (n_bl + n_threads - 1) / n_threads;
 
-  std::latch done(n_threads);
+  return parallel_for(
+      thread_pool, n_bl,
+      [n_int_inv, a1_tensor, a2_tensor, rfi_amp_fine_tensor, rfi_phase_tensor,
+       rfi_vis_tensor](int64_t i_bl_start, int64_t i_bl_end) mutable {
+        const int64_t n_bl_this_chunk = i_bl_end - i_bl_start;
 
-  for (int64_t thread_id = 0; thread_id < n_threads; ++thread_id) {
-    const int64_t i_bl_start = thread_id * n_bl_per_thread;
-    if (i_bl_start >= n_bl) {
-      done.count_down();
-      continue;
-    }
-    thread_pool.Schedule([&, thread_id, i_bl_start]() {
-      const int64_t n_bl_this_thread =
-          std::min(i_bl_start + n_bl_per_thread, n_bl) - i_bl_start;
+        Tensor1D<const int *> a1_tensor_th(a1_tensor.ptr + i_bl_start,
+                                           n_bl_this_chunk);
+        Tensor1D<const int *> a2_tensor_th(a2_tensor.ptr + i_bl_start,
+                                           n_bl_this_chunk);
 
-      Tensor1D<const int *> a1_tensor_th(a1.typed_data() + i_bl_start,
-                                         n_bl_this_thread);
-      Tensor1D<const int *> a2_tensor_th(a2.typed_data() + i_bl_start,
-                                         n_bl_this_thread);
+        Tensor3D<std::complex<T> *> rfi_vis_tensor_th(
+            &rfi_vis_tensor(i_bl_start, 0, 0), n_bl_this_chunk,
+            rfi_vis_tensor.shape[1], rfi_vis_tensor.shape[2]);
 
-      Tensor3D<std::complex<T> *> rfi_vis_tensor_th(
-          &rfi_vis_tensor(i_bl_start, 0, 0), n_bl_this_thread,
-          rfi_vis->dimensions()[1], rfi_vis->dimensions()[2]);
-
-      if constexpr (std::is_same_v<T, float>) {
-        RI_KERNELS_EXPORT_AND_DISPATCH_T(rfi_kernel_opt_f32)
-        (n_int_inv, a1_tensor_th, a2_tensor_th, rfi_amp_fine_tensor,
-         rfi_phase_tensor, rfi_vis_tensor_th);
-      } else {
-        RI_KERNELS_EXPORT_AND_DISPATCH_T(rfi_kernel_opt_f64)
-        (n_int_inv, a1_tensor_th, a2_tensor_th, rfi_amp_fine_tensor,
-         rfi_phase_tensor, rfi_vis_tensor_th);
-      }
-
-      done.count_down();
-    });
-  }
-
-  done.wait(); // blocks the caller thread via futex — no spin
-
-  return ffi::Error::Success();
+        if constexpr (std::is_same_v<T, float>) {
+          RI_KERNELS_EXPORT_AND_DISPATCH_T(rfi_kernel_opt_f32)
+          (n_int_inv, a1_tensor_th, a2_tensor_th, rfi_amp_fine_tensor,
+           rfi_phase_tensor, rfi_vis_tensor_th);
+        } else {
+          RI_KERNELS_EXPORT_AND_DISPATCH_T(rfi_kernel_opt_f64)
+          (n_int_inv, a1_tensor_th, a2_tensor_th, rfi_amp_fine_tensor,
+           rfi_phase_tensor, rfi_vis_tensor_th);
+        }
+      });
 }
 
-ffi::Error calc_rfi_vis_cpu_f32_impl(
+ffi::Future calc_rfi_vis_cpu_f32_impl(
     ffi::ThreadPool thread_pool,
     ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a1_sorter,
     ffi::BufferR1<ffi::S32> a1_start, ffi::BufferR1<ffi::S32> a2,
@@ -262,7 +249,7 @@ ffi::Error calc_rfi_vis_cpu_f32_impl(
       rfi_amp_fine, rfi_phase, rfi_vis);
 }
 
-ffi::Error calc_rfi_vis_cpu_f64_impl(
+ffi::Future calc_rfi_vis_cpu_f64_impl(
     ffi::ThreadPool thread_pool,
     ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a1_sorter,
     ffi::BufferR1<ffi::S32> a1_start, ffi::BufferR1<ffi::S32> a2,

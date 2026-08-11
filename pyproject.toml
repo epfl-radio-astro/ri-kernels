@@ -78,7 +78,10 @@ manylinux-x86_64-image = "manylinux_2_28"
 manylinux-aarch64-image = "manylinux_2_28"
 
 [tool.cibuildwheel.macos.environment]
-# `src/*.cpp` uses <latch>, which libc++ annotates as macOS 11.0+.
+# Was required by the <latch> the CPU kernels used to synchronise on; that is
+# gone (see src/parallel_for.hpp), so nothing in the sources forces 11.0 any
+# more. Kept as the supported floor rather than lowered, which would change the
+# wheel tag.
 MACOSX_DEPLOYMENT_TARGET = "11.0"
 
 

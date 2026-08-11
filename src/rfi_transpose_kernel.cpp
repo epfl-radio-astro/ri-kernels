@@ -4,12 +4,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <latch>
 #include <stdexcept>
 #include <array>
 #include <vector>
 #include <unistd.h>
 
+#include "parallel_for.hpp"
 #include "tensor.hpp"
 #include "visibility.h"
 #include "xla/ffi/api/c_api.h"
@@ -249,7 +249,7 @@ using rfi_amp_f64_t = ffi::Buffer<ffi::C128, 6>;
 using rfi_phase_f64_t = ffi::Buffer<ffi::F64, 6>;
 
 template <ffi::DataType AMP_DT, ffi::DataType PHASE_DT, typename T>
-ffi::Error calc_rfi_transpose_cpu_impl_tmpl(
+ffi::Future calc_rfi_transpose_cpu_impl_tmpl(
     ffi::ThreadPool thread_pool,
     ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a1_sorter,
     ffi::BufferR1<ffi::S32> a1_start, ffi::BufferR1<ffi::S32> a2,
@@ -260,44 +260,48 @@ ffi::Error calc_rfi_transpose_cpu_impl_tmpl(
     ffi::Result<ffi::Buffer<PHASE_DT, 6>> rfi_phase_grad) {
 
   if (a1.dimensions()[0] != a2.dimensions()[0]) {
-    return ffi::Error::InvalidArgument(
-        "Expected a1 and a2 to have the same size");
+    return completed_future(
+        ffi::Error::InvalidArgument("Expected a1 and a2 to have the same size"));
   }
 
   for (int i = 0; i < 6; ++i) {
     if (rfi_amp_fine.dimensions()[i] != rfi_phase.dimensions()[i]) {
-      return ffi::Error::InvalidArgument(
-          "Expected rfi_amp_fine and rfi_phase to have the same shape");
+      return completed_future(ffi::Error::InvalidArgument(
+          "Expected rfi_amp_fine and rfi_phase to have the same shape"));
     }
   }
 
   if (rfi_vis_grad.dimensions()[0] != a1.dimensions()[0]) {
-    return ffi::Error::InvalidArgument(
-        "Expected rfi_vis_grad and a1 to have the same number of baselines");
+    return completed_future(ffi::Error::InvalidArgument(
+        "Expected rfi_vis_grad and a1 to have the same number of baselines"));
   }
 
   if (rfi_vis_grad.dimensions()[1] != rfi_amp_fine.dimensions()[1]) {
-    return ffi::Error::InvalidArgument(
+    return completed_future(ffi::Error::InvalidArgument(
         "Expected rfi_vis_grad and rfi_amp_fine to have the same number of "
-        "frequencies");
+        "frequencies"));
   }
 
   if (rfi_vis_grad.dimensions()[2] != rfi_amp_fine.dimensions()[2]) {
-    return ffi::Error::InvalidArgument("Expected rfi_vis_grad and rfi_amp_fine "
-                                       "to have the same number of times");
+    return completed_future(
+        ffi::Error::InvalidArgument("Expected rfi_vis_grad and rfi_amp_fine "
+                                    "to have the same number of times"));
   }
 
   for (int i = 0; i < 6; ++i) {
     if (rfi_amp_fine.dimensions()[i] != rfi_amp_fine_grad->dimensions()[i]) {
-      return ffi::Error::InvalidArgument(
-          "Expected rfi_amp_fine and rfi_amp_fine_grad to have the same shape");
+      return completed_future(ffi::Error::InvalidArgument(
+          "Expected rfi_amp_fine and rfi_amp_fine_grad to have the same shape"));
     }
     if (rfi_phase.dimensions()[i] != rfi_phase_grad->dimensions()[i]) {
-      return ffi::Error::InvalidArgument(
-          "Expected rfi_phase and rfi_phase_grad to have the same shape");
+      return completed_future(ffi::Error::InvalidArgument(
+          "Expected rfi_phase and rfi_phase_grad to have the same shape"));
     }
   }
 
+  // Snapshot of everything the chunks need. These views own their extents by
+  // value, so they stay valid after the handler returns - unlike the ffi::Buffer
+  // arguments, which point into the FFI call frame. See parallel_for().
   Tensor1D<const int *> a1_tensor(a1.typed_data(), a1.dimensions()[0]);
   Tensor1D<const int *> a1_sorter_tensor(a1_sorter.typed_data(),
                                          a1_sorter.dimensions()[0]);
@@ -338,47 +342,31 @@ ffi::Error calc_rfi_transpose_cpu_impl_tmpl(
   const auto n_int_t = rfi_amp_fine.dimensions()[5];
   const T n_int_inv = T(1) / T(n_int_f * n_int_t);
 
-  const int64_t n_threads = std::max<int64_t>(thread_pool.num_threads(), 1);
-
   const int64_t n_ant = rfi_amp_fine_tensor.shape[0];
-  const int64_t n_ant_per_thread = (n_ant + n_threads - 1) / n_threads;
 
-  std::latch done(n_threads);
-
-  for (int64_t thread_id = 0; thread_id < n_threads; ++thread_id) {
-    const int64_t i_ant_start = thread_id * n_ant_per_thread;
-    if (i_ant_start >= n_ant) {
-      done.count_down();
-      continue;
-    }
-    thread_pool.Schedule([&, i_ant_start]() {
-      const int64_t i_ant_end =
-          std::min(i_ant_start + n_ant_per_thread, n_ant);
-
-      if constexpr (std::is_same_v<T, float>) {
-        RI_KERNELS_EXPORT_AND_DISPATCH_T(rfi_transpose_kernel_opt_f32)
-        (n_int_inv, i_ant_start, i_ant_end, a1_tensor, a1_sorter_tensor,
-         a1_start_tensor, a2_tensor, a2_sorter_tensor, a2_start_tensor,
-         rfi_amp_fine_tensor, rfi_phase_tensor, rfi_grad_tensor,
-         rfi_amp_fine_grad_tensor, rfi_phase_grad_tensor);
-      } else {
-        RI_KERNELS_EXPORT_AND_DISPATCH_T(rfi_transpose_kernel_opt_f64)
-        (n_int_inv, i_ant_start, i_ant_end, a1_tensor, a1_sorter_tensor,
-         a1_start_tensor, a2_tensor, a2_sorter_tensor, a2_start_tensor,
-         rfi_amp_fine_tensor, rfi_phase_tensor, rfi_grad_tensor,
-         rfi_amp_fine_grad_tensor, rfi_phase_grad_tensor);
-      }
-
-      done.count_down();
-    });
-  }
-
-  done.wait();
-
-  return ffi::Error::Success();
+  return parallel_for(
+      thread_pool, n_ant,
+      [n_int_inv, a1_tensor, a1_sorter_tensor, a1_start_tensor, a2_tensor,
+       a2_sorter_tensor, a2_start_tensor, rfi_amp_fine_tensor, rfi_phase_tensor,
+       rfi_grad_tensor, rfi_amp_fine_grad_tensor,
+       rfi_phase_grad_tensor](int64_t i_ant_start, int64_t i_ant_end) mutable {
+        if constexpr (std::is_same_v<T, float>) {
+          RI_KERNELS_EXPORT_AND_DISPATCH_T(rfi_transpose_kernel_opt_f32)
+          (n_int_inv, i_ant_start, i_ant_end, a1_tensor, a1_sorter_tensor,
+           a1_start_tensor, a2_tensor, a2_sorter_tensor, a2_start_tensor,
+           rfi_amp_fine_tensor, rfi_phase_tensor, rfi_grad_tensor,
+           rfi_amp_fine_grad_tensor, rfi_phase_grad_tensor);
+        } else {
+          RI_KERNELS_EXPORT_AND_DISPATCH_T(rfi_transpose_kernel_opt_f64)
+          (n_int_inv, i_ant_start, i_ant_end, a1_tensor, a1_sorter_tensor,
+           a1_start_tensor, a2_tensor, a2_sorter_tensor, a2_start_tensor,
+           rfi_amp_fine_tensor, rfi_phase_tensor, rfi_grad_tensor,
+           rfi_amp_fine_grad_tensor, rfi_phase_grad_tensor);
+        }
+      });
 }
 
-ffi::Error calc_rfi_transpose_cpu_f32_impl(
+ffi::Future calc_rfi_transpose_cpu_f32_impl(
     ffi::ThreadPool thread_pool,
     ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a1_sorter,
     ffi::BufferR1<ffi::S32> a1_start, ffi::BufferR1<ffi::S32> a2,
@@ -393,7 +381,7 @@ ffi::Error calc_rfi_transpose_cpu_f32_impl(
       rfi_phase_grad);
 }
 
-ffi::Error calc_rfi_transpose_cpu_f64_impl(
+ffi::Future calc_rfi_transpose_cpu_f64_impl(
     ffi::ThreadPool thread_pool,
     ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a1_sorter,
     ffi::BufferR1<ffi::S32> a1_start, ffi::BufferR1<ffi::S32> a2,
