@@ -34,7 +34,9 @@ needs a published release. To build the GPU kernels from the checkout, use
 Other CMake options of note: `RI_KERNELS_CPU` (default `ON`),
 `RI_KERNELS_MULTI_ARCH` (dynamic SIMD dispatch, default `ON` — turn it off and
 set arch flags via `CMAKE_CXX_FLAGS` for a single-target build),
-`RI_KERNELS_BUNDLED_HIGHWAY`, and `CMAKE_CUDA_ARCHITECTURES`.
+`RI_KERNELS_BUNDLED_HIGHWAY`, `CMAKE_CUDA_ARCHITECTURES`, and
+`RI_KERNELS_STATIC_CUDART` (default `ON`; set it to `OFF` when a package
+manager should provide the shared CUDA runtime).
 
 ## Tests
 

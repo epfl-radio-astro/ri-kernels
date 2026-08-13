@@ -57,6 +57,7 @@ endif()
 option(RI_KERNELS_CPU "Build CPU extension" ON)
 option(RI_KERNELS_CUDA "Build CUDA extension" OFF)
 option(RI_KERNELS_ROCM "Build ROCm extension" OFF)
+option(RI_KERNELS_STATIC_CUDART "Link the CUDA runtime statically" ON)
 
 option(RI_KERNELS_BUNDLED_LIBS "Use all bundled libraries" ON)
 cmake_dependent_option(RI_KERNELS_BUNDLED_HIGHWAY "Use bundled highway lib" ON "RI_KERNELS_BUNDLED_LIBS" OFF)
@@ -150,7 +151,13 @@ if(RI_KERNELS_CUDA)
   add_library(ri_kernels_cuda SHARED ${RI_KERNELS_GPU_SOURCES})
   # set_target_properties(ri_kernels_cuda PROPERTIES OUTPUT_NAME "ri_kernels_cuda_${CUDAToolkit_VERSION_MAJOR}")
   target_include_directories(ri_kernels_cuda PRIVATE ${JAXLIB_HOME}/include ./src)
-  target_link_libraries(ri_kernels_cuda PRIVATE CUDA::cudart_static)
+  if(RI_KERNELS_STATIC_CUDART)
+    set_property(TARGET ri_kernels_cuda PROPERTY CUDA_RUNTIME_LIBRARY Static)
+    target_link_libraries(ri_kernels_cuda PRIVATE CUDA::cudart_static)
+  else()
+    set_property(TARGET ri_kernels_cuda PROPERTY CUDA_RUNTIME_LIBRARY Shared)
+    target_link_libraries(ri_kernels_cuda PRIVATE CUDA::cudart)
+  endif()
   target_compile_options(ri_kernels_cuda PRIVATE
 	$<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=940>
 	$<$<COMPILE_LANGUAGE:CUDA>:--diag-suppress=2473>
