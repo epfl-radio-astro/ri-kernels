@@ -89,15 +89,18 @@ jobs:
           - major: "12"
             pkg: "12-9"
             home: "/usr/local/cuda-12.9"
-            archs: "52-real;60-real;70-real;75-real;80-real;90-real;100-real;120-real;120-virtual"
+            archs: "60-real;70-real;75-real;80-real;90-real;100-real;120-real;120-virtual"
           - major: "13"
             pkg: "13-0"
             home: "/usr/local/cuda-13.0"
             # CUDA 13 dropped Maxwell/Pascal/Volta; Turing is the floor.
             archs: "75-real;80-real;90-real;100-real;120-real;120-virtual"
         platform:
-          - { os: ubuntu-latest, arch: x86_64, repo_arch: x86_64 }
-          - { os: ubuntu-24.04-arm, arch: aarch64, repo_arch: sbsa }
+          # Maxwell has no Linux SBSA target, so SM 5.2 belongs only in the
+          # x86_64 CUDA 12 wheel. Both platforms otherwise share the list from
+          # the CUDA entry above.
+          - { os: ubuntu-latest, arch: x86_64, repo_arch: x86_64, cuda12_prefix: "52-real;" }
+          - { os: ubuntu-24.04-arm, arch: aarch64, repo_arch: sbsa, cuda12_prefix: "" }
     steps:
       - uses: actions/checkout@v4
 
@@ -128,7 +131,7 @@ jobs:
           CIBW_ENVIRONMENT_LINUX: >
             CUDACXX=${{ matrix.cuda.home }}/bin/nvcc
             PATH=${{ matrix.cuda.home }}/bin:$PATH
-            CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda.archs }}"
+            CMAKE_ARGS="-DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda.major == '12' && matrix.platform.cuda12_prefix || '' }}${{ matrix.cuda.archs }}"
           # No test here: installing the wheel would pull ri_kernels==<version>
           # from the index, which does not exist yet for an unreleased version. The
           # library is smoke-tested below instead.
