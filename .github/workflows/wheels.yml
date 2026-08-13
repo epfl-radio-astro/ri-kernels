@@ -81,14 +81,15 @@ jobs:
         # (plus 7.5, the CUDA 13 floor): cubins are binary compatible upward
         # within a major, so 8.0 covers 8.6/8.7/8.9, 10.0 covers 10.3 (B300)
         # and 12.0 covers 12.1 (GB10). 10.x and 12.x are separate families and
-        # need separate cubins. This is the set the jax CUDA plugin itself
-        # ships, minus 7.0, which only CUDA 12 can still build. The trailing
-        # `-virtual` embeds PTX once, as the JIT fallback for future GPUs.
+        # need separate cubins. CUDA 12 starts at JAX's 5.2 support floor and
+        # CUDA 13 starts at 7.5 because that toolkit dropped older targets. The
+        # trailing `-virtual` embeds PTX once, as the JIT fallback for future
+        # GPUs.
         cuda:
           - major: "12"
             pkg: "12-9"
             home: "/usr/local/cuda-12.9"
-            archs: "60-real;70-real;75-real;80-real;90-real;100-real;120-real;120-virtual"
+            archs: "52-real;60-real;70-real;75-real;80-real;90-real;100-real;120-real;120-virtual"
           - major: "13"
             pkg: "13-0"
             home: "/usr/local/cuda-13.0"
