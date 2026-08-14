@@ -45,3 +45,33 @@ Tests can be run with
 ```bash
 python -m pytest tests
 ```
+
+## Delay-based RFI visibilities
+
+`RFIDelayVisOp` avoids expanding geometric delays over every frequency sample.
+The native primal, JVP, and transpose kernels support CPU, CUDA, and ROCm. It
+accepts:
+
+- amplitudes shaped
+  `(n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time)`;
+- delays in μs shaped `(n_ant, n_time, n_rfi, n_int_time)`; and
+- absolute frequencies in MHz shaped `(n_freq, n_int_freq)`.
+
+Since MHz × μs is cycles, the baseline phase is `2π f_MHz Δτ_μs`. The delay
+input is smaller than an expanded phase array by `n_freq × n_int_freq`; the
+frequency input contains only `n_freq × n_int_freq` elements. JVP and VJP rules
+differentiate amplitudes and delays. Frequencies are fixed coordinates and
+receive a zero cotangent.
+
+Absolute satellite delays are about `116,747 μs` and must not be converted
+directly to float32. Before calling the kernel, subtract a common delay across
+antennas for each time/source/sub-time sample while still in float64, then cast
+the centred result. This is exactly visibility-invariant because only `Δτ`
+enters a baseline.
+
+Float32 is intended for ordinary arrays with maximum antenna separations of
+about 10 km, corresponding to `|Δτ| ≲ 33.4 μs`. At 1 GHz the worst-case phase
+resolution is about `0.025 rad`. Use float64 for exceptional arrays approaching
+100 km. Around 1 GHz, float32 frequency resolution is about `61 Hz`, comfortably
+below both the expected minimum `10 kHz` spacing (`0.01 MHz`) and the more
+typical `0.2 MHz` spacing.
