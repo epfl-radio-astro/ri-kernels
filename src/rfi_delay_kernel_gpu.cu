@@ -33,28 +33,35 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_delay_vis_kernel(
   using reduce_t = cub::BlockReduce<T, BLOCK_SIZE>;
   __shared__ typename reduce_t::TempStorage real_storage;
   __shared__ typename reduce_t::TempStorage imag_storage;
+  extern __shared__ unsigned char dynamic_shared[];
+  T *angular_frequency = reinterpret_cast<T *>(dynamic_shared);
 
-  const INT_T n_red = n_rfi * n_int_f * n_int_t;
+  const INT_T n_compact = n_rfi * n_int_t;
   for (INT_T bl = blockIdx.y; bl < a1.shape[0]; bl += gridDim.y) {
     const INT_T ant1 = a1(bl);
     const INT_T ant2 = a2(bl);
     for (INT_T f = blockIdx.z; f < amp.shape[1]; f += gridDim.z) {
+      for (INT_T fi = threadIdx.x; fi < n_int_f; fi += BLOCK_SIZE)
+        angular_frequency[fi] = two_pi<T>() * freq(f, fi);
+      __syncthreads();
       for (INT_T t = blockIdx.x; t < amp.shape[2]; t += gridDim.x) {
         complex_t sum{0, 0};
-        for (INT_T red = threadIdx.x; red < n_red; red += BLOCK_SIZE) {
-          const INT_T ti = red % n_int_t;
-          const INT_T q = red / n_int_t;
-          const INT_T fi = q % n_int_f;
-          const INT_T r = q / n_int_f;
-          const T phase = two_pi<T>() * freq(f, fi) *
-                          (delay(ant1, t, r, ti) - delay(ant2, t, r, ti));
-          complex_t e;
-          traits::sincos_(phase, &e.y, &e.x);
-          const auto value = traits::mul(
-              traits::mul(amp(ant1, f, t, red),
-                          traits::conj(amp(ant2, f, t, red))),
-              e);
-          sum = traits::add(sum, value);
+        for (INT_T compact = threadIdx.x; compact < n_compact;
+             compact += BLOCK_SIZE) {
+          const INT_T ti = compact % n_int_t;
+          const INT_T r = compact / n_int_t;
+          const T delay_diff = delay(ant1, t, r, ti) -
+                               delay(ant2, t, r, ti);
+          INT_T red = ti + n_int_t * n_int_f * r;
+          for (INT_T fi = 0; fi < n_int_f; ++fi, red += n_int_t) {
+            complex_t e;
+            traits::sincos_(angular_frequency[fi] * delay_diff, &e.y, &e.x);
+            const auto value = traits::mul(
+                traits::mul(amp(ant1, f, t, red),
+                            traits::conj(amp(ant2, f, t, red))),
+                e);
+            sum = traits::add(sum, value);
+          }
         }
         sum.x = reduce_t(real_storage).Sum(sum.x);
         sum.y = reduce_t(imag_storage).Sum(sum.y);
@@ -63,6 +70,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_delay_vis_kernel(
           vis(bl, f, t) = complex_t{scale * sum.x, scale * sum.y};
         }
       }
+      // The reduction synchronizes between time samples. This additional
+      // barrier protects angular_frequency when a clamped grid loops over f.
+      __syncthreads();
     }
   }
 }
@@ -83,35 +93,43 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_delay_jvp_kernel(
   using reduce_t = cub::BlockReduce<T, BLOCK_SIZE>;
   __shared__ typename reduce_t::TempStorage real_storage;
   __shared__ typename reduce_t::TempStorage imag_storage;
+  extern __shared__ unsigned char dynamic_shared[];
+  T *angular_frequency = reinterpret_cast<T *>(dynamic_shared);
 
-  const INT_T n_red = n_rfi * n_int_f * n_int_t;
+  const INT_T n_compact = n_rfi * n_int_t;
   for (INT_T bl = blockIdx.y; bl < a1.shape[0]; bl += gridDim.y) {
     const INT_T ant1 = a1(bl);
     const INT_T ant2 = a2(bl);
     for (INT_T f = blockIdx.z; f < amp.shape[1]; f += gridDim.z) {
+      for (INT_T fi = threadIdx.x; fi < n_int_f; fi += BLOCK_SIZE)
+        angular_frequency[fi] = two_pi<T>() * freq(f, fi);
+      __syncthreads();
       for (INT_T t = blockIdx.x; t < amp.shape[2]; t += gridDim.x) {
         complex_t sum{0, 0};
-        for (INT_T red = threadIdx.x; red < n_red; red += BLOCK_SIZE) {
-          const INT_T ti = red % n_int_t;
-          const INT_T q = red / n_int_t;
-          const INT_T fi = q % n_int_f;
-          const INT_T r = q / n_int_f;
-          const auto aa = amp(ant1, f, t, red);
-          const auto bb = amp(ant2, f, t, red);
-          const auto base = traits::mul(aa, traits::conj(bb));
-          auto term = traits::add(
-              traits::mul(amp_dot(ant1, f, t, red), traits::conj(bb)),
-              traits::mul(aa, traits::conj(amp_dot(ant2, f, t, red))));
-          const T omega = two_pi<T>() * freq(f, fi);
-          const T dphase = omega * (delay_dot(ant1, t, r, ti) -
-                                    delay_dot(ant2, t, r, ti));
-          term.x -= dphase * base.y;
-          term.y += dphase * base.x;
-          const T phase = omega * (delay(ant1, t, r, ti) -
-                                   delay(ant2, t, r, ti));
-          complex_t e;
-          traits::sincos_(phase, &e.y, &e.x);
-          sum = traits::add(sum, traits::mul(e, term));
+        for (INT_T compact = threadIdx.x; compact < n_compact;
+             compact += BLOCK_SIZE) {
+          const INT_T ti = compact % n_int_t;
+          const INT_T r = compact / n_int_t;
+          const T delay_diff = delay(ant1, t, r, ti) -
+                               delay(ant2, t, r, ti);
+          const T delay_dot_diff = delay_dot(ant1, t, r, ti) -
+                                   delay_dot(ant2, t, r, ti);
+          INT_T red = ti + n_int_t * n_int_f * r;
+          for (INT_T fi = 0; fi < n_int_f; ++fi, red += n_int_t) {
+            const auto aa = amp(ant1, f, t, red);
+            const auto bb = amp(ant2, f, t, red);
+            const auto base = traits::mul(aa, traits::conj(bb));
+            auto term = traits::add(
+                traits::mul(amp_dot(ant1, f, t, red), traits::conj(bb)),
+                traits::mul(aa, traits::conj(amp_dot(ant2, f, t, red))));
+            const T omega = angular_frequency[fi];
+            const T dphase = omega * delay_dot_diff;
+            term.x -= dphase * base.y;
+            term.y += dphase * base.x;
+            complex_t e;
+            traits::sincos_(omega * delay_diff, &e.y, &e.x);
+            sum = traits::add(sum, traits::mul(e, term));
+          }
         }
         sum.x = reduce_t(real_storage).Sum(sum.x);
         sum.y = reduce_t(imag_storage).Sum(sum.y);
@@ -120,6 +138,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_delay_jvp_kernel(
           out(bl, f, t) = complex_t{scale * sum.x, scale * sum.y};
         }
       }
+      __syncthreads();
     }
   }
 }
@@ -226,15 +245,15 @@ ffi::Error delay_vis_dispatch(
       reinterpret_cast<complex_t *>(vis->typed_data()), vis->dimensions()[0],
       vis->dimensions()[1], vis->dimensions()[2]);
   const INT_T nr = amp.dimensions()[3], nf = amp.dimensions()[4];
-  const INT_T nt = amp.dimensions()[5], nred = nr * nf * nt;
+  const INT_T nt = amp.dimensions()[5], ncompact = nr * nt;
   const T scale = T(1) / T(nf * nt);
   const auto grid = create_clamped_grid(av.shape[2], a1v.shape[0], av.shape[1]);
 #define LAUNCH_DELAY_VIS(B)                                                     \
-  rfi_delay_vis_kernel<T, B, INT_T><<<grid, B, 0, stream>>>(                   \
+  rfi_delay_vis_kernel<T, B, INT_T><<<grid, B, sizeof(T) * nf, stream>>>(      \
       scale, a1v, a2v, av, dv, fv, vv, nr, nf, nt)
-  if (nred <= 32) LAUNCH_DELAY_VIS(32);
-  else if (nred <= 64) LAUNCH_DELAY_VIS(64);
-  else if (nred <= 128) LAUNCH_DELAY_VIS(128);
+  if (ncompact <= 32) LAUNCH_DELAY_VIS(32);
+  else if (ncompact <= 64) LAUNCH_DELAY_VIS(64);
+  else if (ncompact <= 256) LAUNCH_DELAY_VIS(128);
   else LAUNCH_DELAY_VIS(256);
 #undef LAUNCH_DELAY_VIS
   const auto status = cudaGetLastError();
@@ -257,6 +276,7 @@ ffi::Error delay_jvp_dispatch(
   Tensor1D<const int *, INT_T> a2v(a2.typed_data(), a2.dimensions()[0]);
   const INT_T nr = amp.dimensions()[3], nf = amp.dimensions()[4];
   const INT_T nt = amp.dimensions()[5], nred = nr * nf * nt;
+  const INT_T ncompact = nr * nt;
   Tensor4D<const complex_t *, INT_T> av(
       reinterpret_cast<const complex_t *>(amp.typed_data()), amp.dimensions()[0],
       amp.dimensions()[1], amp.dimensions()[2], nred);
@@ -277,11 +297,11 @@ ffi::Error delay_jvp_dispatch(
   const T scale = T(1) / T(nf * nt);
   const auto grid = create_clamped_grid(av.shape[2], a1v.shape[0], av.shape[1]);
 #define LAUNCH_DELAY_JVP(B)                                                     \
-  rfi_delay_jvp_kernel<T, B, INT_T><<<grid, B, 0, stream>>>(                   \
+  rfi_delay_jvp_kernel<T, B, INT_T><<<grid, B, sizeof(T) * nf, stream>>>(      \
       scale, a1v, a2v, av, adv, dv, ddv, fv, ov, nr, nf, nt)
-  if (nred <= 32) LAUNCH_DELAY_JVP(32);
-  else if (nred <= 64) LAUNCH_DELAY_JVP(64);
-  else if (nred <= 128) LAUNCH_DELAY_JVP(128);
+  if (ncompact <= 32) LAUNCH_DELAY_JVP(32);
+  else if (ncompact <= 64) LAUNCH_DELAY_JVP(64);
+  else if (ncompact <= 256) LAUNCH_DELAY_JVP(128);
   else LAUNCH_DELAY_JVP(256);
 #undef LAUNCH_DELAY_JVP
   const auto status = cudaGetLastError();
