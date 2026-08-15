@@ -41,9 +41,9 @@ def device(request):
         yield request.param
 
 
-def make_inputs(real, complex_, seed=0, max_delay_us=16.7):
+def make_inputs(real, complex_, seed=0, max_delay_us=16.7, shape=None):
     rng = np.random.default_rng(seed)
-    shape = (5, 3, 2, 2, 3, 2)
+    shape = shape or (5, 3, 2, 2, 3, 2)
     amp = rng.normal(size=shape) + 1j * rng.normal(size=shape)
     delay = rng.uniform(
         -max_delay_us,
@@ -133,6 +133,38 @@ def test_vjp_matches_reference_and_frequency_is_fixed(precision, device):
     assert_close(amp_bar, expected_amp, real)
     assert_close(delay_bar, expected_delay, real)
     assert_close(freq_bar, jnp.zeros_like(freq), real)
+
+
+def test_vectorized_integration_time_and_tail(precision, device):
+    real, complex_ = precision
+    shape = (5, 3, 2, 2, 3, 17)
+    amp, delay, freq = make_inputs(real, complex_, shape=shape)
+    amp_dot, delay_dot, _ = make_inputs(real, complex_, seed=1, shape=shape)
+    a1, a2 = make_baselines(amp.shape[0], shuffle=True)
+    op = RFIDelayVisOp(amp.shape[0], a1, a2)
+
+    expected = reference(amp, delay, freq, a1, a2)
+    assert_close(op.eval(amp, delay, freq), expected, real)
+
+    _, tangent = jax.jvp(
+        op.eval, (amp, delay, freq), (amp_dot, delay_dot, jnp.zeros_like(freq))
+    )
+    _, expected_tangent = jax.jvp(
+        lambda a, d: reference(a, d, freq, a1, a2),
+        (amp, delay),
+        (amp_dot, delay_dot),
+    )
+    assert_close(tangent, expected_tangent, real)
+
+    cotangent = jnp.ones(expected.shape, dtype=complex_)
+    _, pullback = jax.vjp(op.eval, amp, delay, freq)
+    amp_bar, delay_bar, _ = pullback(cotangent)
+    _, reference_pullback = jax.vjp(
+        lambda a, d: reference(a, d, freq, a1, a2), amp, delay
+    )
+    expected_amp_bar, expected_delay_bar = reference_pullback(cotangent)
+    assert_close(amp_bar, expected_amp_bar, real)
+    assert_close(delay_bar, expected_delay_bar, real)
 
 
 def test_float32_accuracy_for_ten_kilometre_array():

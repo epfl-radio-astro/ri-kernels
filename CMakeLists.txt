@@ -97,6 +97,7 @@ set(RI_KERNELS_CPU_SOURCES
   ./src/rfi_jvp_kernel.cpp
   ./src/rfi_transpose_kernel.cpp
   ./src/rfi_delay_kernel.cpp
+  ./src/rfi_delay_kernel_hwy.cpp
 )
 
 set(RI_KERNELS_GPU_SOURCES

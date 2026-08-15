@@ -1,8 +1,8 @@
-#include <cmath>
 #include <complex>
 #include <cstdint>
 
 #include "parallel_for.hpp"
+#include "rfi_delay_kernel_hwy.hpp"
 #include "tensor.hpp"
 #include "visibility.h"
 #include "xla/ffi/api/c_api.h"
@@ -11,10 +11,6 @@
 namespace ri_kernels {
 namespace ffi = xla::ffi;
 
-template <typename T> constexpr T two_pi() {
-  return T(6.283185307179586476925286766559005768L);
-}
-
 template <typename T>
 void rfi_delay_vis_range(
     std::int64_t bl_begin, std::int64_t bl_end, T scale,
@@ -22,29 +18,8 @@ void rfi_delay_vis_range(
     Tensor4D<const std::complex<T> *> amp, Tensor4D<const T *> delay,
     Tensor2D<const T *> freq, Tensor3D<std::complex<T> *> vis,
     std::int64_t n_rfi, std::int64_t n_int_f, std::int64_t n_int_t) {
-  for (std::int64_t bl = bl_begin; bl < bl_end; ++bl) {
-    const auto ant1 = a1(bl);
-    const auto ant2 = a2(bl);
-    for (std::int64_t f = 0; f < amp.shape[1]; ++f) {
-      for (std::int64_t t = 0; t < amp.shape[2]; ++t) {
-        std::complex<T> sum{0, 0};
-        for (std::int64_t r = 0; r < n_rfi; ++r) {
-          for (std::int64_t fi = 0; fi < n_int_f; ++fi) {
-            const T omega = two_pi<T>() * freq(f, fi);
-            for (std::int64_t ti = 0; ti < n_int_t; ++ti) {
-              const auto red = ti + n_int_t * (fi + n_int_f * r);
-              const T phase = omega * (delay(ant1, t, r, ti) -
-                                       delay(ant2, t, r, ti));
-              const std::complex<T> e(std::cos(phase), std::sin(phase));
-              sum += amp(ant1, f, t, red) *
-                     std::conj(amp(ant2, f, t, red)) * e;
-            }
-          }
-        }
-        vis(bl, f, t) = scale * sum;
-      }
-    }
-  }
+  rfi_delay_vis_hwy(bl_begin, bl_end, scale, a1, a2, amp, delay, freq, vis,
+                     n_rfi, n_int_f, n_int_t);
 }
 
 template <typename T>
@@ -56,35 +31,8 @@ void rfi_delay_jvp_range(
     Tensor4D<const T *> delay, Tensor4D<const T *> delay_dot,
     Tensor2D<const T *> freq, Tensor3D<std::complex<T> *> out,
     std::int64_t n_rfi, std::int64_t n_int_f, std::int64_t n_int_t) {
-  const std::complex<T> imaginary{0, 1};
-  for (std::int64_t bl = bl_begin; bl < bl_end; ++bl) {
-    const auto ant1 = a1(bl);
-    const auto ant2 = a2(bl);
-    for (std::int64_t f = 0; f < amp.shape[1]; ++f) {
-      for (std::int64_t t = 0; t < amp.shape[2]; ++t) {
-        std::complex<T> sum{0, 0};
-        for (std::int64_t r = 0; r < n_rfi; ++r) {
-          for (std::int64_t fi = 0; fi < n_int_f; ++fi) {
-            const T omega = two_pi<T>() * freq(f, fi);
-            for (std::int64_t ti = 0; ti < n_int_t; ++ti) {
-              const auto red = ti + n_int_t * (fi + n_int_f * r);
-              const auto a = amp(ant1, f, t, red);
-              const auto b = amp(ant2, f, t, red);
-              const T phase = omega * (delay(ant1, t, r, ti) -
-                                       delay(ant2, t, r, ti));
-              const std::complex<T> e(std::cos(phase), std::sin(phase));
-              const auto amp_term = amp_dot(ant1, f, t, red) * std::conj(b) +
-                                    a * std::conj(amp_dot(ant2, f, t, red));
-              const T dphase = omega * (delay_dot(ant1, t, r, ti) -
-                                        delay_dot(ant2, t, r, ti));
-              sum += e * (amp_term + imaginary * dphase * a * std::conj(b));
-            }
-          }
-        }
-        out(bl, f, t) = scale * sum;
-      }
-    }
-  }
+  rfi_delay_jvp_hwy(bl_begin, bl_end, scale, a1, a2, amp, amp_dot, delay,
+                     delay_dot, freq, out, n_rfi, n_int_f, n_int_t);
 }
 
 template <typename T>
@@ -97,59 +45,9 @@ void rfi_delay_transpose_range(
     Tensor2D<const T *> freq, Tensor3D<const std::complex<T> *> vis_bar,
     Tensor4D<std::complex<T> *> amp_bar, Tensor4D<T *> delay_bar,
     std::int64_t n_rfi, std::int64_t n_int_f, std::int64_t n_int_t) {
-  const auto n_ant = amp.shape[0];
-  const auto n_bl = a1.shape[0];
-  for (std::int64_t ant = ant_begin; ant < ant_end; ++ant) {
-    const auto a1_begin = a1_start(ant);
-    const auto a1_end = ant == n_ant - 1 ? n_bl : a1_start(ant + 1);
-    const auto a2_begin = a2_start(ant);
-    const auto a2_end = ant == n_ant - 1 ? n_bl : a2_start(ant + 1);
-
-    for (std::int64_t t = 0; t < amp.shape[2]; ++t) {
-      for (std::int64_t r = 0; r < n_rfi; ++r) {
-        for (std::int64_t ti = 0; ti < n_int_t; ++ti) {
-          T delay_sum = 0;
-          for (std::int64_t f = 0; f < amp.shape[1]; ++f) {
-            for (std::int64_t fi = 0; fi < n_int_f; ++fi) {
-              const auto red = ti + n_int_t * (fi + n_int_f * r);
-              const auto my_amp = amp(ant, f, t, red);
-              const T omega = two_pi<T>() * freq(f, fi);
-              std::complex<T> amp_sum{0, 0};
-              T phase_sum = 0;
-
-              for (auto p = a1_begin; p < a1_end; ++p) {
-                const auto bl = a1_sorter(p);
-                const auto other = a2(bl);
-                const auto other_amp = amp(other, f, t, red);
-                const T phase = omega * (delay(ant, t, r, ti) -
-                                         delay(other, t, r, ti));
-                const std::complex<T> e(std::cos(phase), std::sin(phase));
-                const auto v = vis_bar(bl, f, t) * std::conj(other_amp) * e;
-                amp_sum += v;
-                phase_sum -= v.imag() * my_amp.real() +
-                             v.real() * my_amp.imag();
-              }
-              for (auto p = a2_begin; p < a2_end; ++p) {
-                const auto bl = a2_sorter(p);
-                const auto other = a1(bl);
-                const auto other_amp = amp(other, f, t, red);
-                const T phase = omega * (delay(other, t, r, ti) -
-                                         delay(ant, t, r, ti));
-                const std::complex<T> e(std::cos(phase), std::sin(phase));
-                const auto v = std::conj(vis_bar(bl, f, t) * other_amp * e);
-                amp_sum += v;
-                phase_sum -= v.real() * my_amp.imag() +
-                             v.imag() * my_amp.real();
-              }
-              amp_bar(ant, f, t, red) = scale * amp_sum;
-              delay_sum += omega * phase_sum;
-            }
-          }
-          delay_bar(ant, t, r, ti) = scale * delay_sum;
-        }
-      }
-    }
-  }
+  rfi_delay_transpose_hwy(ant_begin, ant_end, scale, a1, a1_sorter, a1_start,
+                           a2, a2_sorter, a2_start, amp, delay, freq, vis_bar,
+                           amp_bar, delay_bar, n_rfi, n_int_f, n_int_t);
 }
 
 template <ffi::DataType AMP_DT, ffi::DataType REAL_DT, typename T>
