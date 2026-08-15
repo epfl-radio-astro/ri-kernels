@@ -20,6 +20,23 @@ template <typename T> __device__ inline T two_pi() {
   return T(6.283185307179586476925286766559005768L);
 }
 
+template <int GROUP_SIZE, typename T>
+__device__ inline T warp_sum(T value) {
+  for (int offset = GROUP_SIZE / 2; offset > 0; offset /= 2) {
+#ifdef __HIPCC__
+    value += __shfl_down(value, offset, GROUP_SIZE);
+#else
+    unsigned mask = 0xffffffffU;
+    if constexpr (GROUP_SIZE < 32) {
+      const unsigned group = (threadIdx.x % 32) / GROUP_SIZE;
+      mask = ((1U << GROUP_SIZE) - 1U) << (group * GROUP_SIZE);
+    }
+    value += __shfl_down_sync(mask, value, offset, GROUP_SIZE);
+#endif
+  }
+  return value;
+}
+
 template <typename T, int BLOCK_SIZE, typename INT_T>
 __global__ void __launch_bounds__(BLOCK_SIZE) rfi_delay_vis_kernel(
     T scale, Tensor1D<const int *, INT_T> a1,
@@ -143,10 +160,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_delay_jvp_kernel(
   }
 }
 
-// One thread owns a compact (antenna, time, source, integration-time) delay
-// element. It accumulates all frequencies into that delay cotangent and writes
-// each corresponding amplitude cotangent exactly once, avoiding atomics.
-template <typename T, int BLOCK_SIZE, typename INT_T>
+// One logical thread group owns a compact
+// (antenna, time, source, integration-time) delay element. Its lanes split the
+// coarse/fine frequencies, write distinct amplitude cotangents, and reduce the
+// delay cotangent in registers. This retains the atomics-free ownership of the
+// compact output without serializing all frequencies in one thread. fp64 uses
+// a narrower group to balance frequency parallelism against strided traffic.
+template <typename T, int BLOCK_SIZE, int GROUP_SIZE, typename INT_T>
 __global__ void __launch_bounds__(BLOCK_SIZE) rfi_delay_transpose_kernel(
     T scale, Tensor1D<const int *, INT_T> a1,
     Tensor1D<const int *, INT_T> a1_sorter,
@@ -162,8 +182,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_delay_transpose_kernel(
     INT_T n_int_t) {
   using traits = gpu_complex_traits<T>;
   using complex_t = typename traits::complex_t;
+  constexpr int groups_per_block = BLOCK_SIZE / GROUP_SIZE;
+
+  const INT_T lane = threadIdx.x % GROUP_SIZE;
+  const INT_T group = threadIdx.x / GROUP_SIZE;
   const INT_T compact_size = amp.shape[2] * n_rfi * n_int_t;
-  const INT_T stride = gridDim.x * BLOCK_SIZE;
+  const INT_T stride = gridDim.x * groups_per_block;
+  const INT_T n_frequency_terms = amp.shape[1] * n_int_f;
 
   for (INT_T ant = blockIdx.y; ant < amp.shape[0]; ant += gridDim.y) {
     const INT_T first = a1_start(ant);
@@ -172,52 +197,65 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_delay_transpose_kernel(
     const INT_T second = a2_start(ant);
     const INT_T second_end = ant == amp.shape[0] - 1 ? a2.shape[0]
                                                       : a2_start(ant + 1);
-    for (INT_T compact = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    for (INT_T compact = blockIdx.x * groups_per_block + group;
          compact < compact_size; compact += stride) {
       const INT_T ti = compact % n_int_t;
       const INT_T q = compact / n_int_t;
       const INT_T r = q % n_rfi;
       const INT_T t = q / n_rfi;
+      const T my_delay = delay(ant, t, r, ti);
       T delay_sum = 0;
-      for (INT_T f = 0; f < amp.shape[1]; ++f) {
-        for (INT_T fi = 0; fi < n_int_f; ++fi) {
-          const INT_T red = ti + n_int_t * (fi + n_int_f * r);
-          const auto my_amp = amp(ant, f, t, red);
-          const T omega = two_pi<T>() * freq(f, fi);
-          complex_t amp_sum{0, 0};
-          T phase_sum = 0;
-          for (INT_T p = first; p < first_end; ++p) {
-            const INT_T bl = a1_sorter(p);
-            const INT_T other = a2(bl);
-            const T phase = omega * (delay(ant, t, r, ti) -
-                                     delay(other, t, r, ti));
-            complex_t e;
-            traits::sincos_(phase, &e.y, &e.x);
-            const auto v = traits::mul(
-                traits::mul(vis_bar(bl, f, t),
-                            traits::conj(amp(other, f, t, red))),
-                e);
-            amp_sum = traits::add(amp_sum, v);
-            phase_sum -= v.y * my_amp.x + v.x * my_amp.y;
-          }
-          for (INT_T p = second; p < second_end; ++p) {
-            const INT_T bl = a2_sorter(p);
-            const INT_T other = a1(bl);
-            const T phase = omega * (delay(other, t, r, ti) -
-                                     delay(ant, t, r, ti));
-            complex_t e;
-            traits::sincos_(phase, &e.y, &e.x);
-            const auto v = traits::conj(traits::mul(
-                traits::mul(vis_bar(bl, f, t), amp(other, f, t, red)), e));
-            amp_sum = traits::add(amp_sum, v);
-            phase_sum -= v.x * my_amp.y + v.y * my_amp.x;
-          }
-          amp_bar(ant, f, t, red) =
-              complex_t{scale * amp_sum.x, scale * amp_sum.y};
-          delay_sum += omega * phase_sum;
+      INT_T f = 0;
+      INT_T fi = lane;
+      while (fi >= n_int_f) {
+        fi -= n_int_f;
+        ++f;
+      }
+      for (INT_T frequency_term = lane; frequency_term < n_frequency_terms;
+           frequency_term += GROUP_SIZE) {
+        const INT_T red = ti + n_int_t * (fi + n_int_f * r);
+        const auto my_amp = amp(ant, f, t, red);
+        const T omega = two_pi<T>() * freq(f, fi);
+        complex_t amp_sum{0, 0};
+        T phase_sum = 0;
+        for (INT_T p = first; p < first_end; ++p) {
+          const INT_T bl = a1_sorter(p);
+          const INT_T other = a2(bl);
+          const T phase =
+              omega * (my_delay - delay(other, t, r, ti));
+          complex_t e;
+          traits::sincos_(phase, &e.y, &e.x);
+          const auto v = traits::mul(
+              traits::mul(vis_bar(bl, f, t),
+                          traits::conj(amp(other, f, t, red))),
+              e);
+          amp_sum = traits::add(amp_sum, v);
+          phase_sum -= v.y * my_amp.x + v.x * my_amp.y;
+        }
+        for (INT_T p = second; p < second_end; ++p) {
+          const INT_T bl = a2_sorter(p);
+          const INT_T other = a1(bl);
+          const T phase =
+              omega * (delay(other, t, r, ti) - my_delay);
+          complex_t e;
+          traits::sincos_(phase, &e.y, &e.x);
+          const auto v = traits::conj(traits::mul(
+              traits::mul(vis_bar(bl, f, t), amp(other, f, t, red)), e));
+          amp_sum = traits::add(amp_sum, v);
+          phase_sum -= v.x * my_amp.y + v.y * my_amp.x;
+        }
+        amp_bar(ant, f, t, red) =
+            complex_t{scale * amp_sum.x, scale * amp_sum.y};
+        delay_sum += omega * phase_sum;
+        fi += GROUP_SIZE;
+        while (fi >= n_int_f) {
+          fi -= n_int_f;
+          ++f;
         }
       }
-      delay_bar(ant, t, r, ti) = scale * delay_sum;
+      delay_sum = warp_sum<GROUP_SIZE>(delay_sum);
+      if (lane == 0)
+        delay_bar(ant, t, r, ti) = scale * delay_sum;
     }
   }
 }
@@ -350,11 +388,30 @@ ffi::Error delay_transpose_dispatch(
                            delay.dimensions()[3]);
   constexpr int block_size = 128;
   const INT_T compact = amp.dimensions()[2] * nr * nt;
-  const INT_T blocks = (compact + block_size - 1) / block_size;
-  const auto grid = create_clamped_grid(blocks, amp.dimensions()[0], 1);
-  rfi_delay_transpose_kernel<T, block_size, INT_T><<<grid, block_size, 0, stream>>>(
-      T(1) / T(nf * nt), a1v, a1sv, a1bv, a2v, a2sv, a2bv, av, dv, fv, g,
-      ab, db, nr, nf, nt);
+  auto launch = [&](auto group_size_c) {
+    constexpr int group_size = decltype(group_size_c)::value;
+    constexpr int groups_per_block = block_size / group_size;
+    const INT_T blocks =
+        (compact + groups_per_block - 1) / groups_per_block;
+    const auto grid = create_clamped_grid(blocks, amp.dimensions()[0], 1);
+    rfi_delay_transpose_kernel<T, block_size, group_size, INT_T>
+        <<<grid, block_size, 0, stream>>>(
+            T(1) / T(nf * nt), a1v, a1sv, a1bv, a2v, a2sv, a2bv, av, dv, fv,
+            g, ab, db, nr, nf, nt);
+  };
+
+  if constexpr (std::is_same_v<T, double>) {
+    // At large fp64 sizes, strided frequency-parallel loads cost more than the
+    // extra parallelism saves. Retain one compact output per thread there.
+    const std::int64_t problem_size = std::int64_t(amp.dimensions()[0]) *
+                                      amp.dimensions()[1] * amp.dimensions()[2];
+    if (problem_size >= 8192)
+      launch(std::integral_constant<int, 1>{});
+    else
+      launch(std::integral_constant<int, 16>{});
+  } else {
+    launch(std::integral_constant<int, 32>{});
+  }
   const auto status = cudaGetLastError();
   return status == cudaSuccess
              ? ffi::Error::Success()
