@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -436,6 +437,19 @@ bool shapes_are_valid(ffi::BufferR1<ffi::S32> a1,
   return true;
 }
 
+// Tangents and cotangents are read through views built from the primal
+// extents, so a mismatched buffer would run off the end rather than fail.
+template <typename LHS, typename RHS>
+bool same_shape(const LHS &lhs, const RHS &rhs) {
+  const auto a = lhs.dimensions();
+  const auto b = rhs.dimensions();
+  if (a.size() != b.size()) return false;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
 template <ffi::DataType AMP_DT, ffi::DataType REAL_DT, typename T>
 ffi::Error delay_vis_impl(cudaStream_t stream, ffi::BufferR1<ffi::S32> a1,
     ffi::BufferR1<ffi::S32>, ffi::BufferR1<ffi::S32>,
@@ -461,6 +475,12 @@ ffi::Error delay_jvp_impl(cudaStream_t stream, ffi::BufferR1<ffi::S32> a1,
     ffi::Buffer<AMP_DT, 6> amp_dot, ffi::Buffer<REAL_DT, 4> delay,
     ffi::Buffer<REAL_DT, 4> delay_dot, ffi::Buffer<REAL_DT, 2> freq,
     ffi::Result<ffi::BufferR3<AMP_DT>> out) {
+  if (!shapes_are_valid(a1, a2, amp, delay, freq))
+    return ffi::Error::InvalidArgument(
+        "Incompatible amplitude, delay, frequency, or baseline shapes");
+  if (!same_shape(amp_dot, amp) || !same_shape(delay_dot, delay))
+    return ffi::Error::InvalidArgument(
+        "Expected amplitude and delay tangents to match their primals");
   constexpr std::int64_t limit = std::numeric_limits<std::int32_t>::max();
   if (amp.element_count() < limit && out->element_count() < limit)
     return delay_jvp_dispatch<T, std::int32_t>(stream, a1, a2, amp, amp_dot,
@@ -478,6 +498,18 @@ ffi::Error delay_transpose_impl(cudaStream_t stream,
     ffi::Buffer<REAL_DT, 2> freq, ffi::BufferR3<AMP_DT> vis_bar,
     ffi::Result<ffi::Buffer<AMP_DT, 6>> amp_bar,
     ffi::Result<ffi::Buffer<REAL_DT, 4>> delay_bar) {
+  if (!shapes_are_valid(a1, a2, amp, delay, freq))
+    return ffi::Error::InvalidArgument(
+        "Incompatible amplitude, delay, frequency, or baseline shapes");
+  if (vis_bar.dimensions()[0] != a1.dimensions()[0] ||
+      vis_bar.dimensions()[1] != amp.dimensions()[1] ||
+      vis_bar.dimensions()[2] != amp.dimensions()[2])
+    return ffi::Error::InvalidArgument(
+        "Expected the visibility cotangent to match the baseline, frequency, "
+        "and time extents");
+  if (!same_shape(*amp_bar, amp) || !same_shape(*delay_bar, delay))
+    return ffi::Error::InvalidArgument(
+        "Expected amplitude and delay cotangents to match their primals");
   constexpr std::int64_t limit = std::numeric_limits<std::int32_t>::max();
   if (amp.element_count() < limit && vis_bar.element_count() < limit)
     return delay_transpose_dispatch<T, std::int32_t>(stream, a1, a1s, a1b, a2,

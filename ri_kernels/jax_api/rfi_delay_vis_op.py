@@ -45,9 +45,10 @@ class RFIDelayVisOp:
 
         Since MHz × μs is cycles, the kernel evaluates ``2π freq_mhz ×
         (delay_us_1 - delay_us_2)``. Centre delays across antennas in float64
-        before converting them to the kernel dtype. The frequency grid is
-        treated as fixed by autodiff; derivatives are provided for amplitudes
-        and delays.
+        before converting them to the kernel dtype. Derivatives are provided
+        for amplitudes and delays only; ``freq_mhz`` is wrapped in
+        ``lax.stop_gradient``, so differentiating through it yields an explicit
+        zero rather than a silently dropped tangent.
         """
         return rfi_delay_vis_op.bind(
             self.a1,
@@ -58,7 +59,7 @@ class RFIDelayVisOp:
             self.a2_start,
             rfi_amp_fine,
             rfi_delay_us,
-            freq_mhz,
+            jax.lax.stop_gradient(freq_mhz),
         )
 
 
@@ -127,6 +128,21 @@ def _validate(amp, delay_us, freq_mhz):
     return suffix
 
 
+def _validate_like(name, primal, other):
+    """Require a tangent or cotangent to match the buffer it is paired with.
+
+    The kernels build views over these buffers from the primal extents, so a
+    mismatch reads or writes past the end instead of failing.
+    """
+    if other.shape != primal.shape or (
+        jnp.dtype(other.dtype) != jnp.dtype(primal.dtype)
+    ):
+        raise ValueError(
+            f"Expected {name} shape {primal.shape} and dtype {primal.dtype}; "
+            f"got {other.shape} and {other.dtype}"
+        )
+
+
 def _output_aval(a1, amp):
     return ShapedArray((a1.shape[0], amp.shape[1], amp.shape[2]), amp.dtype)
 
@@ -138,6 +154,7 @@ rfi_delay_transpose_op.multiple_results = True
 
 def _transpose_abstract(a1, a1s, a1b, a2, a2s, a2b, amp, delay, freq, g):
     _validate(amp, delay, freq)
+    _validate_like("visibility cotangent", _output_aval(a1, amp), g)
     return ShapedArray(amp.shape, amp.dtype), ShapedArray(delay.shape, delay.dtype)
 
 
@@ -166,6 +183,8 @@ def _jvp_abstract(
     a1, a1s, a1b, a2, a2s, a2b, amp, amp_dot, delay, delay_dot, freq
 ):
     _validate(amp, delay, freq)
+    _validate_like("amplitude tangent", amp, amp_dot)
+    _validate_like("delay tangent", delay, delay_dot)
     return _output_aval(a1, amp)
 
 
@@ -227,7 +246,17 @@ mlir.register_lowering(rfi_delay_vis_op, _vis_lowering("gpu"), platform="gpu")
 
 def _vis_jvp(args, tangents):
     *indices, amp, delay, freq = args
-    *_, amp_dot, delay_dot, _freq_dot = tangents
+    *_, amp_dot, delay_dot, freq_dot = tangents
+    # RFIDelayVisOp.eval stops the gradient on freq, so a non-zero tangent can
+    # only reach here through a direct bind. The kernel has no frequency
+    # derivative, and dvis/dfreq is not zero, so refuse rather than return a
+    # wrong tangent.
+    if not isinstance(freq_dot, ad.Zero):
+        raise TypeError(
+            "rfi_delay_vis_op treats the frequency grid as a fixed coordinate "
+            "and provides no frequency derivative. Use RFIDelayVisOp.eval, "
+            "which applies lax.stop_gradient to freq_mhz."
+        )
     if isinstance(amp_dot, ad.Zero):
         amp_dot = jnp.zeros_like(amp)
     if isinstance(delay_dot, ad.Zero):

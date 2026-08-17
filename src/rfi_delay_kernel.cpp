@@ -1,4 +1,5 @@
 #include <complex>
+#include <cstddef>
 #include <cstdint>
 
 #include "parallel_for.hpp"
@@ -50,6 +51,33 @@ void rfi_delay_transpose_range(
                            amp_bar, delay_bar, n_rfi, n_int_f, n_int_t);
 }
 
+template <ffi::DataType AMP_DT, ffi::DataType REAL_DT>
+bool shapes_are_valid(ffi::BufferR1<ffi::S32> a1, ffi::BufferR1<ffi::S32> a2,
+                      ffi::Buffer<AMP_DT, 6> amp,
+                      ffi::Buffer<REAL_DT, 4> delay,
+                      ffi::Buffer<REAL_DT, 2> freq) {
+  return a1.dimensions()[0] == a2.dimensions()[0] &&
+         delay.dimensions()[0] == amp.dimensions()[0] &&
+         delay.dimensions()[1] == amp.dimensions()[2] &&
+         delay.dimensions()[2] == amp.dimensions()[3] &&
+         delay.dimensions()[3] == amp.dimensions()[5] &&
+         freq.dimensions()[0] == amp.dimensions()[1] &&
+         freq.dimensions()[1] == amp.dimensions()[4];
+}
+
+// Tangents and cotangents are read through views built from the primal
+// extents, so a mismatched buffer would run off the end rather than fail.
+template <typename LHS, typename RHS>
+bool same_shape(const LHS &lhs, const RHS &rhs) {
+  const auto a = lhs.dimensions();
+  const auto b = rhs.dimensions();
+  if (a.size() != b.size()) return false;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (a[i] != b[i]) return false;
+  }
+  return true;
+}
+
 template <ffi::DataType AMP_DT, ffi::DataType REAL_DT, typename T>
 ffi::Future delay_vis_impl(
     ffi::ThreadPool pool, ffi::BufferR1<ffi::S32> a1,
@@ -58,13 +86,7 @@ ffi::Future delay_vis_impl(
     ffi::BufferR1<ffi::S32>, ffi::Buffer<AMP_DT, 6> amp,
     ffi::Buffer<REAL_DT, 4> delay, ffi::Buffer<REAL_DT, 2> freq,
     ffi::Result<ffi::BufferR3<AMP_DT>> vis) {
-  if (a1.dimensions()[0] != a2.dimensions()[0] ||
-      delay.dimensions()[0] != amp.dimensions()[0] ||
-      delay.dimensions()[1] != amp.dimensions()[2] ||
-      delay.dimensions()[2] != amp.dimensions()[3] ||
-      delay.dimensions()[3] != amp.dimensions()[5] ||
-      freq.dimensions()[0] != amp.dimensions()[1] ||
-      freq.dimensions()[1] != amp.dimensions()[4]) {
+  if (!shapes_are_valid(a1, a2, amp, delay, freq)) {
     return completed_future(ffi::Error::InvalidArgument(
         "Incompatible amplitude, delay, frequency, or baseline shapes"));
   }
@@ -98,6 +120,14 @@ ffi::Future delay_jvp_impl(
     ffi::Buffer<AMP_DT, 6> amp_dot, ffi::Buffer<REAL_DT, 4> delay,
     ffi::Buffer<REAL_DT, 4> delay_dot, ffi::Buffer<REAL_DT, 2> freq,
     ffi::Result<ffi::BufferR3<AMP_DT>> out) {
+  if (!shapes_are_valid(a1, a2, amp, delay, freq)) {
+    return completed_future(ffi::Error::InvalidArgument(
+        "Incompatible amplitude, delay, frequency, or baseline shapes"));
+  }
+  if (!same_shape(amp_dot, amp) || !same_shape(delay_dot, delay)) {
+    return completed_future(ffi::Error::InvalidArgument(
+        "Expected amplitude and delay tangents to match their primals"));
+  }
   Tensor1D<const int *> a1v(a1.typed_data(), a1.dimensions()[0]);
   Tensor1D<const int *> a2v(a2.typed_data(), a2.dimensions()[0]);
   Tensor4D<const std::complex<T> *> av(amp.typed_data(), amp.dimensions()[0], amp.dimensions()[1], amp.dimensions()[2], amp.dimensions()[3] * amp.dimensions()[4] * amp.dimensions()[5]);
@@ -123,6 +153,21 @@ ffi::Future delay_transpose_impl(
     ffi::BufferR3<AMP_DT> vis_bar,
     ffi::Result<ffi::Buffer<AMP_DT, 6>> amp_bar,
     ffi::Result<ffi::Buffer<REAL_DT, 4>> delay_bar) {
+  if (!shapes_are_valid(a1, a2, amp, delay, freq)) {
+    return completed_future(ffi::Error::InvalidArgument(
+        "Incompatible amplitude, delay, frequency, or baseline shapes"));
+  }
+  if (vis_bar.dimensions()[0] != a1.dimensions()[0] ||
+      vis_bar.dimensions()[1] != amp.dimensions()[1] ||
+      vis_bar.dimensions()[2] != amp.dimensions()[2]) {
+    return completed_future(ffi::Error::InvalidArgument(
+        "Expected the visibility cotangent to match the baseline, frequency, "
+        "and time extents"));
+  }
+  if (!same_shape(*amp_bar, amp) || !same_shape(*delay_bar, delay)) {
+    return completed_future(ffi::Error::InvalidArgument(
+        "Expected amplitude and delay cotangents to match their primals"));
+  }
   Tensor1D<const int *> a1v(a1.typed_data(), a1.dimensions()[0]);
   Tensor1D<const int *> a1sv(a1_sorter.typed_data(), a1_sorter.dimensions()[0]);
   Tensor1D<const int *> a1st(a1_start.typed_data(), a1_start.dimensions()[0]);

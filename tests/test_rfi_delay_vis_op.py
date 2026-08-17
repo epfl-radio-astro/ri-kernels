@@ -9,6 +9,9 @@ from ri_kernels.jax_api.rfi_delay_vis_op import (
     RFIDelayVisOp,
     _TAB_LIB_DELAY,
     _TAB_LIB_DELAY_GPU,
+    rfi_delay_jvp_op,
+    rfi_delay_transpose_op,
+    rfi_delay_vis_op,
 )
 
 
@@ -220,3 +223,55 @@ def test_rejects_incompatible_shapes_and_dtypes(precision):
     wrong_real = jnp.float64 if real == jnp.float32 else jnp.float32
     with pytest.raises(TypeError, match="frequency dtypes to match"):
         op.eval(amp, delay, freq.astype(wrong_real))
+
+
+def test_frequency_tangent_is_stopped_not_dropped(precision):
+    """eval() stop_gradients freq, so its zero tangent is explicit.
+
+    dvis/dfreq is genuinely non-zero, so a dropped tangent would be a wrong
+    answer rather than a missing feature. Differentiating the primitive
+    directly, which bypasses the stop_gradient, must fail loudly instead.
+    """
+    real, complex_ = precision
+    amp, delay, freq = make_inputs(real, complex_)
+    a1, a2 = make_baselines(amp.shape[0], shuffle=True)
+    op = RFIDelayVisOp(amp.shape[0], a1, a2)
+    freq_dot = jnp.ones_like(freq)
+
+    _, tangent = jax.jvp(
+        lambda f: op.eval(amp, delay, f), (freq,), (freq_dot,)
+    )
+    np.testing.assert_array_equal(tangent, jnp.zeros_like(tangent))
+
+    _, ref_tangent = jax.jvp(
+        lambda f: reference(amp, delay, f, a1, a2), (freq,), (freq_dot,)
+    )
+    assert float(jnp.linalg.norm(ref_tangent)) > 0
+
+    with pytest.raises(TypeError, match="no frequency derivative"):
+        jax.jvp(
+            lambda f: rfi_delay_vis_op.bind(
+                op.a1, op.a1_sorter, op.a1_start, op.a2, op.a2_sorter,
+                op.a2_start, amp, delay, f,
+            ),
+            (freq,),
+            (freq_dot,),
+        )
+
+
+def test_rejects_mismatched_tangents_and_cotangents(precision):
+    """The jvp and transpose primitives build views from the primal extents."""
+    real, complex_ = precision
+    amp, delay, freq = make_inputs(real, complex_)
+    amp_dot, delay_dot, _ = make_inputs(real, complex_, seed=1)
+    a1, a2 = make_baselines(amp.shape[0])
+    op = RFIDelayVisOp(amp.shape[0], a1, a2)
+    indices = (op.a1, op.a1_sorter, op.a1_start, op.a2, op.a2_sorter, op.a2_start)
+    cotangent = jnp.ones((len(a1), amp.shape[1], amp.shape[2]), dtype=complex_)
+
+    with pytest.raises(ValueError, match="amplitude tangent"):
+        rfi_delay_jvp_op.bind(*indices, amp, amp_dot[..., :-1], delay, delay_dot, freq)
+    with pytest.raises(ValueError, match="delay tangent"):
+        rfi_delay_jvp_op.bind(*indices, amp, amp_dot, delay, delay_dot[..., :-1], freq)
+    with pytest.raises(ValueError, match="visibility cotangent"):
+        rfi_delay_transpose_op.bind(*indices, amp, delay, freq, cotangent[:, :, :-1])
