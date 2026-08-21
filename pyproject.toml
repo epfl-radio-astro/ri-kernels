@@ -61,7 +61,7 @@ cuda12 = ["jax[cuda12]", "ri_kernels_cuda12==0.2.1"]
 cuda13 = ["jax[cuda13]", "ri_kernels_cuda13==0.2.1"]
 
 [project.urls]
-Repository = "https://github.com/epfl-radio-astro/ri_kernels.git"
+Repository = "https://github.com/epfl-radio-astro/ri-kernels"
 
 
 # ── Wheel building ─────────────────────────────────────────────────────────────
