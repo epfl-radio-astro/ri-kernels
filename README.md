@@ -46,14 +46,42 @@ Tests can be run with
 python -m pytest tests
 ```
 
-## Delay-based RFI visibilities
+## RFI visibilities
+
+Two operators compute the same quantity, the per-baseline RFI visibility
+
+```
+vis[bl, f, t] = mean over (n_int_freq, n_int_time) of
+                sum over n_rfi of A[a1] conj(A[a2]) exp(i (φ[a1] - φ[a2]))
+```
+
+for amplitudes `A` shaped `(n_ant, n_freq, n_time, n_rfi, n_int_freq,
+n_int_time)`, giving an output of shape `(n_baselines, n_freq, n_time)`. They
+differ only in how the phase `φ` is supplied. Both are constructed from the
+baseline layout and evaluated through `eval`:
+
+```python
+from ri_kernels.jax_api import RFIVisOp, RFIDelayVisOp
+
+vis = RFIVisOp(n_ant, a1, a2).eval(rfi_amp_fine, rfi_phase)
+vis = RFIDelayVisOp(n_ant, a1, a2).eval(rfi_amp_fine, rfi_delay_us, freq_mhz)
+```
+
+Each operator has native primal, JVP, and transpose kernels for CPU, CUDA, and
+ROCm, so both forward- and reverse-mode differentiation stay inside the
+kernels. Precision has to match across the inputs: complex64 with float32, or
+complex128 with float64.
+
+### Explicit phases
+
+`RFIVisOp` takes the phase in radians as a full array with the same shape as
+the amplitudes. Both amplitudes and phases are differentiated.
+
+### Delay-based phases
 
 `RFIDelayVisOp` avoids expanding geometric delays over every frequency sample.
-The native primal, JVP, and transpose kernels support CPU, CUDA, and ROCm. It
-accepts:
+Instead of the phase array it accepts:
 
-- amplitudes shaped
-  `(n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time)`;
 - delays in μs shaped `(n_ant, n_time, n_rfi, n_int_time)`; and
 - absolute frequencies in MHz shaped `(n_freq, n_int_freq)`.
 
