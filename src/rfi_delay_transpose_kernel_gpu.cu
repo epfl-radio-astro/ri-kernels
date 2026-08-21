@@ -16,21 +16,21 @@ namespace ffi = xla::ffi;
 namespace ri_kernels {
 namespace gpu {
 
-template <int GROUP_SIZE, typename T>
+// Sums across the lanes of one logical thread group, leaving the result in
+// lane 0. A warp-level collective keeps the reduction independent of the other
+// groups in the block, which matters because the grid-stride compact loop below
+// lets groups run different trip counts. For power-of-two group sizes cub picks
+// the shuffle implementation, so TempStorage is empty and costs no shared
+// memory.
+template <int GROUP_SIZE, int BLOCK_SIZE, typename T>
 __device__ inline T warp_sum(T value) {
-  for (int offset = GROUP_SIZE / 2; offset > 0; offset /= 2) {
-#ifdef __HIPCC__
-    value += __shfl_down(value, offset, GROUP_SIZE);
-#else
-    unsigned mask = 0xffffffffU;
-    if constexpr (GROUP_SIZE < 32) {
-      const unsigned group = (threadIdx.x % 32) / GROUP_SIZE;
-      mask = ((1U << GROUP_SIZE) - 1U) << (group * GROUP_SIZE);
-    }
-    value += __shfl_down_sync(mask, value, offset, GROUP_SIZE);
-#endif
+  if constexpr (GROUP_SIZE == 1) {
+    return value;
+  } else {
+    using reduce_t = cub::WarpReduce<T, GROUP_SIZE>;
+    __shared__ typename reduce_t::TempStorage storage[BLOCK_SIZE / GROUP_SIZE];
+    return reduce_t(storage[threadIdx.x / GROUP_SIZE]).Sum(value);
   }
-  return value;
 }
 
 // One logical thread group owns a compact
@@ -126,7 +126,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) rfi_delay_transpose_kernel(
           ++f;
         }
       }
-      delay_sum = warp_sum<GROUP_SIZE>(delay_sum);
+      delay_sum = warp_sum<GROUP_SIZE, BLOCK_SIZE>(delay_sum);
       if (lane == 0)
         delay_bar(ant, t, r, ti) = scale * delay_sum;
     }
