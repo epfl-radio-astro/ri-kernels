@@ -103,3 +103,57 @@ resolution is about `0.025 rad`. Use float64 for exceptional arrays approaching
 100 km. Around 1 GHz, float32 frequency resolution is about `61 Hz`, comfortably
 below both the expected minimum `10 kHz` spacing (`0.01 MHz`) and the more
 typical `0.2 MHz` spacing.
+
+## RFI visibilities from the data grid
+
+`RFIInterpVisOp` computes the same visibility as the two operators above from
+inputs that live on the *data grid* only. The RFI signal comes in per data
+cell, the phase as its value at the cell centre plus the time derivatives of
+the path there, and the fine samples inside each cell are rebuilt inside the
+kernel from the cell's stencil of neighbouring cells and interpolation tables
+the caller supplies. Nothing of the fine grid is ever read from or written to
+memory.
+
+```python
+from ri_kernels.jax_api import RFIInterpVisOp
+
+vis = RFIInterpVisOp(n_ant, a1, a2).eval(
+    amp, phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs
+)
+```
+
+- `amp`, complex `(n_ant, n_rfi, n_freq, n_time)`: the signal on the data
+  grid, and the only differentiated input.
+- `phase`, real `(n_ant, n_rfi, n_freq, n_time)`: the phase at the channel and
+  cell centre, reduced to one turn (in float64, before casting).
+- `path`, real `(n_ant, n_rfi, n_time, n_path)`: the path in metres and its
+  first `n_path - 1` time derivatives at the cell centre.
+- `w_freq`, `start_freq` and `w_time`, `start_time`: per cell, the weights
+  that turn its stencil of `n_sf` (`n_st`) neighbouring cells into its
+  `n_int_freq` (`n_int_time`) fine samples, and the first cell of the stencil.
+  Each stencil must lie inside its axis and contain its cell.
+- `dnu`, `dt`: the fine offsets from the channel centre (Hz) and the cell
+  centre (s); `freqs`: the channel centres (Hz).
+
+For one cell `(f, t)`, fine sample `(u, v)`, source `r` and antenna `a`:
+
+```
+A[a]   = sum_k sum_l w_freq[f, k, u] w_time[t, l, v] amp[a, r, start_freq[f] + k, start_time[t] + l]
+dL[a]  = sum_{k >= 1} path[a, r, t, k] dt[v]^k / k!
+phi[a] = phase[a, r, f, t] - (2 pi / c) ((freqs[f] + dnu[u]) dL[a] + dnu[u] path[a, r, t, 0])
+vis[bl, f, t] = mean_{u, v} sum_r A[a1] exp(i phi[a1]) conj(A[a2] exp(i phi[a2]))
+```
+
+The weights are data. The polynomial through the stencil, the conditional mean
+of a Gaussian process prior, or any other linear interpolant is a different
+table through the same kernel. The phase, path and tables are constants of a
+run: `eval` stops their gradients, and the JVP and transpose kernels
+differentiate the signal alone. The transpose is deterministic -- every output
+element is written by exactly one thread -- at the cost of a scratch buffer of
+`n_sf * n_st` times the signal on the GPU.
+
+These kernels are a prototype of the operator rather than a fast
+implementation: each baseline rebuilds both of its antennas' fine samples
+itself, so an antenna's samples are recomputed once per baseline it is on. A
+kernel meant to be fast would stage each antenna's samples once per cell and
+reuse them across its baselines.
