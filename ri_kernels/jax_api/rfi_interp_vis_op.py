@@ -23,6 +23,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.core import ShapedArray
 from jax.extend import core
 from jax.interpreters import ad, mlir, xla
@@ -50,6 +51,26 @@ class RFIInterpVisOp:
             self.a2_sorter,
             self.a2_start,
         ) = prepare_indices(n_ant, a1, a2)
+        # The baseline index of each antenna pair, -1 where the list has none.
+        # The staged GPU kernels form every pair of two antenna tiles once and
+        # write it to whichever orderings the list holds, so a pair must not
+        # appear twice: the second copy would never be written.
+        pairs = np.stack([np.asarray(a1), np.asarray(a2)], axis=1)
+        if len(np.unique(pairs, axis=0)) != len(pairs):
+            raise ValueError("RFIInterpVisOp needs each (a1, a2) baseline at most once")
+        self.pair_index = (
+            jnp.full((n_ant, n_ant), -1, dtype=jnp.int32)
+            .at[jnp.asarray(a1), jnp.asarray(a2)]
+            .set(jnp.arange(len(a1), dtype=jnp.int32))
+        )
+
+    @property
+    def indices(self):
+        """The index arrays every primitive takes before the data arrays."""
+        return (
+            self.a1, self.a1_sorter, self.a1_start,
+            self.a2, self.a2_sorter, self.a2_start, self.pair_index,
+        )
 
     def eval(self, amp, phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs):
         """Evaluate the visibilities, ``(n_bl, n_freq, n_time)``.
@@ -78,8 +99,7 @@ class RFIInterpVisOp:
         """
         stop = jax.lax.stop_gradient
         return rfi_interp_vis_op.bind(
-            self.a1, self.a1_sorter, self.a1_start,
-            self.a2, self.a2_sorter, self.a2_start,
+            *self.indices,
             amp, stop(phase), stop(path), stop(w_freq), start_freq,
             stop(w_time), start_time, stop(dnu), stop(dt), stop(freqs),
         )
@@ -127,7 +147,11 @@ def _check_interp_lib(platform):
         raise RuntimeError("Installed GPU library has no RFI interp kernels")
 
 
-# The positional layout of the primal arguments after the six index arrays.
+#: Index arrays every primitive takes first: a1, a1_sorter, a1_start, a2,
+#: a2_sorter, a2_start, pair_index.
+N_IDX = 7
+
+# The positional layout of the primal arguments after the index arrays.
 _ARRAY_NAMES = (
     "amp", "phase", "path", "w_freq", "start_freq", "w_time", "start_time",
     "dnu", "dt", "freqs",
@@ -192,7 +216,7 @@ def _output_aval(a1, amp):
 def _lowering(prefix, platform):
     def lowering(ctx, *args):
         _check_interp_lib(platform)
-        suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[7].dtype)
+        suffix = _dtype_suffix(ctx.avals_in[N_IDX].dtype, ctx.avals_in[N_IDX + 1].dtype)
         target = f"{prefix}{'_gpu' if platform == 'gpu' else ''}_{suffix}"
         return jax.ffi.ffi_lowering(target)(ctx, *args)
 
@@ -205,8 +229,8 @@ rfi_interp_transpose_op = core.Primitive("rfi_interp_transpose_op")
 rfi_interp_transpose_op.def_impl(partial(xla.apply_primitive, rfi_interp_transpose_op))
 
 
-def _transpose_abstract(a1, a1s, a1b, a2, a2s, a2b, *rest):
-    arrays, g = rest[:10], rest[10]
+def _transpose_abstract(*args):
+    a1, arrays, g = args[0], args[N_IDX:N_IDX + 10], args[N_IDX + 10]
     _validate(*arrays)
     _validate_like("visibility cotangent", _output_aval(a1, arrays[0]), g)
     return ShapedArray(arrays[0].shape, arrays[0].dtype)
@@ -223,7 +247,8 @@ rfi_interp_jvp_op = core.Primitive("rfi_interp_jvp_op")
 rfi_interp_jvp_op.def_impl(partial(xla.apply_primitive, rfi_interp_jvp_op))
 
 
-def _jvp_abstract(a1, a1s, a1b, a2, a2s, a2b, amp, amp_dot, *rest):
+def _jvp_abstract(*args):
+    a1, amp, amp_dot, rest = args[0], args[N_IDX], args[N_IDX + 1], args[N_IDX + 2:]
     _validate(amp, *rest)
     _validate_like("signal tangent", amp, amp_dot)
     return _output_aval(a1, amp)
@@ -235,7 +260,7 @@ rfi_interp_jvp_op.def_abstract_eval(_jvp_abstract)
 def _jvp_lowering(platform):
     def lowering(ctx, *args):
         _check_interp_lib(platform)
-        suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[8].dtype)
+        suffix = _dtype_suffix(ctx.avals_in[N_IDX].dtype, ctx.avals_in[N_IDX + 2].dtype)
         target = f"calc_rfi_interp_jvp{'_gpu' if platform == 'gpu' else ''}_{suffix}"
         return jax.ffi.ffi_lowering(target)(ctx, *args)
 
@@ -246,11 +271,12 @@ mlir.register_lowering(rfi_interp_jvp_op, _jvp_lowering("cpu"), platform="cpu")
 mlir.register_lowering(rfi_interp_jvp_op, _jvp_lowering("gpu"), platform="gpu")
 
 
-def _jvp_transpose(g, a1, a1s, a1b, a2, a2s, a2b, amp, amp_dot, *rest):
-    amp_bar = rfi_interp_transpose_op.bind(a1, a1s, a1b, a2, a2s, a2b, amp, *rest, g)
+def _jvp_transpose(g, *args):
+    indices, amp, rest = args[:N_IDX], args[N_IDX], args[N_IDX + 2:]
+    amp_bar = rfi_interp_transpose_op.bind(*indices, amp, *rest, g)
     # One cotangent, for the linear input amp_dot; every other input is a
     # constant of the linear map.
-    return (None,) * 6 + (None, amp_bar) + (None,) * len(rest)
+    return (None,) * N_IDX + (None, amp_bar) + (None,) * len(rest)
 
 
 ad.primitive_transposes[rfi_interp_jvp_op] = _jvp_transpose
@@ -262,9 +288,10 @@ rfi_interp_vis_op = core.Primitive("rfi_interp_vis_op")
 rfi_interp_vis_op.def_impl(partial(xla.apply_primitive, rfi_interp_vis_op))
 
 
-def _vis_abstract(a1, a1s, a1b, a2, a2s, a2b, *arrays):
+def _vis_abstract(*args):
+    arrays = args[N_IDX:]
     _validate(*arrays)
-    return _output_aval(a1, arrays[0])
+    return _output_aval(args[0], arrays[0])
 
 
 rfi_interp_vis_op.def_abstract_eval(_vis_abstract)
@@ -273,9 +300,9 @@ mlir.register_lowering(rfi_interp_vis_op, _lowering("calc_rfi_interp", "gpu"), p
 
 
 def _vis_jvp(args, tangents):
-    indices, arrays = args[:6], args[6:]
+    indices, arrays = args[:N_IDX], args[N_IDX:]
     amp, rest = arrays[0], arrays[1:]
-    amp_dot, rest_dots = tangents[6], tangents[7:]
+    amp_dot, rest_dots = tangents[N_IDX], tangents[N_IDX + 1:]
     # eval() stops the gradient on every input but the signal, so a non-zero
     # tangent can only reach here through a direct bind. The kernel has no
     # derivative with respect to them, so refuse rather than drop it.

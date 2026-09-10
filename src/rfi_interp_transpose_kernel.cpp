@@ -142,7 +142,7 @@ template <ffi::DataType AMP_DT, ffi::DataType REAL_DT, typename T>
 ffi::Future calc_rfi_interp_transpose_cpu_impl_tmpl(
     ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
-    interp_index_t a2_start, ffi::Buffer<AMP_DT, 4> amp,
+    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, ffi::Buffer<AMP_DT, 4> amp,
     ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> path,
     ffi::Buffer<REAL_DT, 3> w_freq, interp_index_t start_freq,
     ffi::Buffer<REAL_DT, 3> w_time, interp_index_t start_time,
@@ -211,14 +211,14 @@ ffi::Future calc_rfi_interp_transpose_cpu_impl_tmpl(
 ffi::Future calc_rfi_interp_transpose_cpu_f32_impl(
     ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
-    interp_index_t a2_start, interp_amp_f32_t amp, interp_real4_f32_t phase,
+    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, interp_amp_f32_t amp, interp_real4_f32_t phase,
     interp_real4_f32_t path, interp_real3_f32_t w_freq,
     interp_index_t start_freq, interp_real3_f32_t w_time,
     interp_index_t start_time, interp_real1_f32_t dnu, interp_real1_f32_t dt,
     interp_real1_f32_t freqs, ffi::BufferR3<ffi::C64> vis_bar,
     ffi::Result<interp_amp_f32_t> amp_bar) {
   return calc_rfi_interp_transpose_cpu_impl_tmpl<ffi::C64, ffi::F32, float>(
-      thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, amp,
+      thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, amp,
       phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
       vis_bar, amp_bar);
 }
@@ -226,14 +226,14 @@ ffi::Future calc_rfi_interp_transpose_cpu_f32_impl(
 ffi::Future calc_rfi_interp_transpose_cpu_f64_impl(
     ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
-    interp_index_t a2_start, interp_amp_f64_t amp, interp_real4_f64_t phase,
+    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, interp_amp_f64_t amp, interp_real4_f64_t phase,
     interp_real4_f64_t path, interp_real3_f64_t w_freq,
     interp_index_t start_freq, interp_real3_f64_t w_time,
     interp_index_t start_time, interp_real1_f64_t dnu, interp_real1_f64_t dt,
     interp_real1_f64_t freqs, ffi::BufferR3<ffi::C128> vis_bar,
     ffi::Result<interp_amp_f64_t> amp_bar) {
   return calc_rfi_interp_transpose_cpu_impl_tmpl<ffi::C128, ffi::F64, double>(
-      thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, amp,
+      thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, amp,
       phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
       vis_bar, amp_bar);
 }
@@ -249,6 +249,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     ffi::Ffi::Bind().Ctx<ffi::ThreadPool>()
         .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()
         .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()
+        .Arg<ffi::BufferR2<ffi::S32>>()
         .Arg<interp_amp_f32_t>()
         .Arg<interp_real4_f32_t>().Arg<interp_real4_f32_t>()
         .Arg<interp_real3_f32_t>().Arg<interp_index_t>()
@@ -262,6 +263,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     ffi::Ffi::Bind().Ctx<ffi::ThreadPool>()
         .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()
         .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()
+        .Arg<ffi::BufferR2<ffi::S32>>()
         .Arg<interp_amp_f64_t>()
         .Arg<interp_real4_f64_t>().Arg<interp_real4_f64_t>()
         .Arg<interp_real3_f64_t>().Arg<interp_index_t>()

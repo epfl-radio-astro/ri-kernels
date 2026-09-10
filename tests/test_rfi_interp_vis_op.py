@@ -255,7 +255,7 @@ def test_the_constants_tangent_is_refused_on_a_direct_bind(precision):
     args = make_inputs(real, complex_)
     a1, a2 = make_baselines(args[0].shape[0])
     op = RFIInterpVisOp(args[0].shape[0], a1, a2)
-    indices = (op.a1, op.a1_sorter, op.a1_start, op.a2, op.a2_sorter, op.a2_start)
+    indices = op.indices
     with pytest.raises(TypeError, match="no derivative with respect to phase"):
         jax.jvp(
             lambda p: rfi_interp_vis_op.bind(*indices, args[0], p, *args[2:]),
@@ -319,9 +319,25 @@ def test_rejects_mismatched_tangents_and_cotangents(precision):
     amp_dot = make_inputs(real, complex_, seed=1)[0]
     a1, a2 = make_baselines(args[0].shape[0])
     op = RFIInterpVisOp(args[0].shape[0], a1, a2)
-    indices = (op.a1, op.a1_sorter, op.a1_start, op.a2, op.a2_sorter, op.a2_start)
+    indices = op.indices
     cotangent = jnp.ones((len(a1),) + args[0].shape[2:], dtype=complex_)
     with pytest.raises(ValueError, match="signal tangent"):
         rfi_interp_jvp_op.bind(*indices, args[0], amp_dot[..., :-1], *args[1:])
     with pytest.raises(ValueError, match="visibility cotangent"):
         rfi_interp_transpose_op.bind(*indices, *args, cotangent[:, :, :-1])
+
+
+def test_rejects_a_duplicated_baseline():
+    a1 = jnp.asarray([0, 1, 0], dtype=jnp.int32)
+    a2 = jnp.asarray([1, 2, 1], dtype=jnp.int32)
+    with pytest.raises(ValueError, match="at most once"):
+        RFIInterpVisOp(3, a1, a2)
+
+
+def test_the_pair_table_indexes_the_baseline_list():
+    a1, a2 = make_baselines(4, shuffle=True)
+    op = RFIInterpVisOp(4, a1, a2)
+    table = np.asarray(op.pair_index)
+    for bl, (i, j) in enumerate(zip(np.asarray(a1), np.asarray(a2))):
+        assert table[i, j] == bl
+    assert (table >= 0).sum() == len(a1)

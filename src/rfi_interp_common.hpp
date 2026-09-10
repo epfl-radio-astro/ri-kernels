@@ -32,6 +32,8 @@
 //   dt         (n_int_t,)                      real     fine offsets from the cell
 //                                                       centre (s)
 //   freqs      (n_freq,)                       real     channel centres (Hz)
+//   pair       (n_ant, n_ant)                 int32    baseline index of (a1, a2), -1
+//                                                       where the list has none
 //   vis        (n_bl, n_freq, n_time)          complex
 //
 // For one cell (f, t) and fine sample (u, v), per source r and antenna a:
