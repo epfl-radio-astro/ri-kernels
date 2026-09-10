@@ -21,7 +21,8 @@
 //   phase      (n_ant, n_rfi, n_freq, n_time)  real     phase at the channel and cell
 //                                                       centre, reduced to one turn
 //   path       (n_ant, n_rfi, n_time, n_path)  real     path L (m) and its time
-//                                                       derivatives L_k (m/s^k)
+//                                                       derivatives L_k (m/s^k),
+//                                                       relative to the array mean
 //   w_freq     (n_freq, n_sf, n_int_f)         real     interpolation weights across
 //   start_freq (n_freq,)                       int32    each channel, and the first
 //                                                       channel of each stencil

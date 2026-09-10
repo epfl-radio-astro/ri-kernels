@@ -83,7 +83,11 @@ class RFIInterpVisOp:
                 float64 before casting: the unreduced phase is ~1e6 turns and
                 the kernel never rebuilds it from ``path``.
             path: Real ``(n_ant, n_rfi, n_time, n_path)``, the path (m) and its
-                time derivatives (m/s^k) at the cell centre.
+                time derivatives (m/s^k) at the cell centre, relative to the
+                array mean: a term common to every antenna cancels in a
+                baseline's phase difference, and the change of the full path
+                across a cell is ~1e4 wavelengths at orbital range rates, which
+                float32 cannot hold to a fraction of a turn.
             w_freq, start_freq: Real ``(n_freq, n_sf, n_int_freq)`` and int32
                 ``(n_freq,)``, the interpolation weights across each channel
                 and the first channel of each channel's stencil.

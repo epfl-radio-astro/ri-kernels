@@ -127,7 +127,9 @@ vis = RFIInterpVisOp(n_ant, a1, a2).eval(
 - `phase`, real `(n_ant, n_rfi, n_freq, n_time)`: the phase at the channel and
   cell centre, reduced to one turn (in float64, before casting).
 - `path`, real `(n_ant, n_rfi, n_time, n_path)`: the path in metres and its
-  first `n_path - 1` time derivatives at the cell centre.
+  first `n_path - 1` time derivatives at the cell centre, relative to the
+  array mean (a common term cancels in every baseline; the full path's change
+  across a cell is ~1e4 wavelengths, beyond float32).
 - `w_freq`, `start_freq` and `w_time`, `start_time`: per cell, the weights
   that turn its stencil of `n_sf` (`n_st`) neighbouring cells into its
   `n_int_freq` (`n_int_time`) fine samples, and the first cell of the stencil.

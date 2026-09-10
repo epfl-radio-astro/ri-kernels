@@ -92,11 +92,12 @@ def make_inputs(real, complex_, seed=0, n_ant=5, n_rfi=2, n_freq=3, n_time=6,
     shape = (n_ant, n_rfi, n_freq, n_time)
     amp = rng.normal(size=shape) + 1j * rng.normal(size=shape)
     phase = rng.uniform(-2 * np.pi, 0.0, size=shape)
-    scales = [1e6, 7e3, 10.0, 1.0, 0.1, 0.01][:n_path]
+    # The path relative to the array mean, as tabascal's FixedOrbitCoarse
+    # writes it: a kilometre-scale array against a LEO satellite.
+    scales = [500.0, 20.0, 0.1, 1e-3, 1e-5, 1e-7][:n_path]
     path = np.stack(
         [rng.normal(0.0, s, (n_ant, n_rfi, n_time)) for s in scales], axis=-1
     )
-    path[..., 0] = np.abs(path[..., 0])
     arrays = (amp, phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs)
     out = []
     for x in arrays:
@@ -158,15 +159,15 @@ def upcast(x):
 def assert_close(actual, expected, real):
     """Hold a kernel to the reference, at the precision the inputs allow.
 
-    In double the two agree to round-off. In single they do not, and neither
-    does the single-precision reference: the phase change across a cell,
-    ``2 pi freqs L_1 dt / c``, is ~1e4 rad per antenna at orbital range rates
-    and rounds to ~1e-3 rad in float32, in a different place for every
-    operation order. So the single-precision kernel is held to the float64
-    reference at that level (measured 1e-3 to 2e-3 relative, the same as the
-    float32 JAX reference itself), not to the float32 reference at 3e-5.
+    In double the two agree to round-off. In single the kernel is held to the
+    float64 reference rather than to the float32 one, which carries rounding
+    of its own in different places: measured a few 1e-6 relative with the
+    path relative to the array mean, as tabascal supplies it. (With the full
+    path it would be 1e-3: its change across a cell is ~1e4 rad per antenna
+    at orbital range rates, beyond what float32 resolves to a fraction of a
+    turn -- which is why the path is relative.)
     """
-    tolerance = 5e-3 if real == jnp.float32 else 5e-10
+    tolerance = 3e-5 if real == jnp.float32 else 5e-10
     scale = max(float(np.max(np.abs(expected))), 1.0)
     np.testing.assert_allclose(actual, expected, rtol=tolerance, atol=tolerance * scale)
 
