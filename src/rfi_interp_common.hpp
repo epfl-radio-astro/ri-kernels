@@ -37,6 +37,12 @@
 //                                                       times us is cycles
 //   pair       (n_ant, n_ant)                 int32    baseline index of (a1, a2), -1
 //                                                       where the list has none
+//   stride     (n_bl,)                         int32    every stride-th time sample
+//                                                       integrates the baseline: the
+//                                                       fine time samples v = stride/2,
+//                                                       stride/2 + stride, ... of each
+//                                                       cell, with every frequency
+//                                                       sample; 1 is all of them
 //   vis        (n_bl, n_freq, n_time)          complex
 //
 // For one cell (f, t) and fine sample (u, v), per source r and antenna a:
@@ -47,7 +53,10 @@
 //   phi[a]  = phase[a, r, f, t]
 //             + 2 pi ((freqs[f] + dnu[u]) dtau[a] + dnu[u] delay[a, r, t, 0])
 //   S[a]   = A[a] exp(i phi[a])
-//   vis[bl, f, t] = mean_{u, v} sum_r S[a1[bl]] conj(S[a2[bl]])
+//   vis[bl, f, t] = mean_{u, v in stride[bl]} sum_r S[a1[bl]] conj(S[a2[bl]])
+//
+// The fine samples are enumerated time-major, s = v * n_int_f + u, so a
+// baseline's subset is a run of n_int_f samples every stride-th time sample.
 //
 // Only amp is differentiated. The result is bilinear in S and S is linear in
 // amp, so the JVP is B(dS, S) + B(S, dS) with dS the tangent pushed through the
@@ -93,6 +102,26 @@ template <typename T> TAB_H_D inline Cplx<T> cconj(Cplx<T> a) {
 }
 template <typename T> TAB_H_D inline Cplx<T> cscale(T s, Cplx<T> a) {
   return {s * a.re, s * a.im};
+}
+
+// The time samples a baseline of stride `st` integrates: v = st / 2 + k st.
+template <typename INT_T> TAB_H_D inline bool stride_takes(INT_T v, INT_T st) {
+  return v >= st / 2 && (v - st / 2) % st == 0;
+}
+template <typename INT_T> TAB_H_D inline INT_T stride_count(INT_T n_int_t, INT_T st) {
+  return n_int_t > st / 2 ? (n_int_t - st / 2 + st - 1) / st : 0;
+}
+// Bit b of the result: whether time sample v_lo + b is integrated at stride
+// `st`, for b < 32. A chunk of at most 32 samples spans at most 32 time
+// samples, so one word covers a chunk.
+template <typename INT_T>
+TAB_H_D inline unsigned stride_mask(INT_T v_lo, INT_T n_int_t, INT_T st) {
+  unsigned mask = 0;
+  for (INT_T b = 0; b < 32; ++b) {
+    const INT_T v = v_lo + b;
+    if (v < n_int_t && stride_takes(v, st)) mask |= 1u << b;
+  }
+  return mask;
 }
 
 template <typename T> TAB_H_D constexpr T two_pi_c() {
@@ -198,6 +227,13 @@ bool interp_same_shape(const LHS &lhs, const RHS &rhs) {
   for (std::size_t i = 0; i < a.size(); ++i) {
     if (a[i] != b[i]) return false;
   }
+  return true;
+}
+
+// Host-side check of the strides: at least one sample each, none past the axis.
+inline bool strides_are_valid(const int *stride, std::int64_t n_bl, std::int64_t n_int_t) {
+  for (std::int64_t b = 0; b < n_bl; ++b)
+    if (stride[b] < 1 || stride[b] > n_int_t) return false;
   return true;
 }
 

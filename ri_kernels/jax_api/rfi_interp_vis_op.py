@@ -10,7 +10,13 @@ source ``r`` and antenna ``a``::
     phi[a]  = phase[a, r, f, t]
               + 2 pi ((freq_mhz[f] + dnu_mhz[u]) dtau[a] + dnu_mhz[u] delay_us[a, r, t, 0])
     S[a]   = A[a] exp(i phi[a])
-    vis[bl, f, t] = mean_{u, v} sum_r S[a1[bl]] conj(S[a2[bl]])
+    vis[bl, f, t] = mean_{u, v in stride[bl]} sum_r S[a1[bl]] conj(S[a2[bl]])
+
+where a baseline of stride ``s`` integrates the time samples ``v = s // 2,
+s // 2 + s, ...`` of each cell, with every frequency sample: the variable
+sampling of tabascal's ``RiemannVisVariable``, done inside the kernel from a
+per-baseline stride, so the slow baselines of an array cost a fraction of the
+fast ones.
 
 Only the signal ``amp`` is differentiated; the phase, the delay and the tables
 are constants of the run, and :meth:`RFIInterpVisOp.eval` stops their
@@ -42,7 +48,10 @@ from .rfi_vis_op import (
 class RFIInterpVisOp:
     """Compute RFI visibilities from the data grid."""
 
-    def __init__(self, n_ant, a1, a2):
+    def __init__(self, n_ant, a1, a2, stride=None):
+        """``stride``: int ``(n_bl,)``, every how-many-th time sample of a cell
+        baseline ``bl`` integrates (1, the default, is all of them). At least 1
+        and at most the time samples per cell, which the CPU kernels check."""
         self.a1 = a1
         self.a2 = a2
         (
@@ -63,13 +72,21 @@ class RFIInterpVisOp:
             .at[jnp.asarray(a1), jnp.asarray(a2)]
             .set(jnp.arange(len(a1), dtype=jnp.int32))
         )
+        if stride is None:
+            stride = np.ones(len(a1), dtype=np.int32)
+        stride = np.asarray(stride)
+        if stride.shape != (len(a1),) or not np.issubdtype(stride.dtype, np.integer):
+            raise ValueError(f"RFIInterpVisOp needs one integer stride per baseline, got shape {stride.shape}")
+        if (stride < 1).any():
+            raise ValueError("RFIInterpVisOp strides must be at least 1")
+        self.stride = jnp.asarray(stride, dtype=jnp.int32)
 
     @property
     def indices(self):
         """The index arrays every primitive takes before the data arrays."""
         return (
             self.a1, self.a1_sorter, self.a1_start,
-            self.a2, self.a2_sorter, self.a2_start, self.pair_index,
+            self.a2, self.a2_sorter, self.a2_start, self.pair_index, self.stride,
         )
 
     def eval(self, amp, phase, delay_us, w_freq, start_freq, w_time, start_time, dnu_mhz, dt, freq_mhz):
@@ -154,8 +171,8 @@ def _check_interp_lib(platform):
 
 
 #: Index arrays every primitive takes first: a1, a1_sorter, a1_start, a2,
-#: a2_sorter, a2_start, pair_index.
-N_IDX = 7
+#: a2_sorter, a2_start, pair_index, stride.
+N_IDX = 8
 
 # The positional layout of the primal arguments after the index arrays.
 _ARRAY_NAMES = (
@@ -219,6 +236,16 @@ def _output_aval(a1, amp):
     return ShapedArray((a1.shape[0], amp.shape[2], amp.shape[3]), amp.dtype)
 
 
+def _validate_indices(args):
+    """The shapes of the index arrays; their values the CPU kernels check."""
+    a1, pair, stride = args[0], args[6], args[7]
+    n_bl = a1.shape[0]
+    if stride.shape != (n_bl,) or jnp.dtype(stride.dtype) != jnp.int32:
+        raise ValueError(f"Expected an int32 stride per baseline, ({n_bl},); got {stride.shape} {stride.dtype}")
+    if jnp.dtype(pair.dtype) != jnp.int32 or len(pair.shape) != 2:
+        raise ValueError(f"Expected an int32 (n_ant, n_ant) pair table; got {pair.shape} {pair.dtype}")
+
+
 def _lowering(prefix, platform):
     def lowering(ctx, *args):
         _check_interp_lib(platform)
@@ -237,6 +264,7 @@ rfi_interp_transpose_op.def_impl(partial(xla.apply_primitive, rfi_interp_transpo
 
 def _transpose_abstract(*args):
     a1, arrays, g = args[0], args[N_IDX:N_IDX + 10], args[N_IDX + 10]
+    _validate_indices(args)
     _validate(*arrays)
     _validate_like("visibility cotangent", _output_aval(a1, arrays[0]), g)
     return ShapedArray(arrays[0].shape, arrays[0].dtype)
@@ -255,6 +283,7 @@ rfi_interp_jvp_op.def_impl(partial(xla.apply_primitive, rfi_interp_jvp_op))
 
 def _jvp_abstract(*args):
     a1, amp, amp_dot, rest = args[0], args[N_IDX], args[N_IDX + 1], args[N_IDX + 2:]
+    _validate_indices(args)
     _validate(amp, *rest)
     _validate_like("signal tangent", amp, amp_dot)
     return _output_aval(a1, amp)
@@ -296,6 +325,7 @@ rfi_interp_vis_op.def_impl(partial(xla.apply_primitive, rfi_interp_vis_op))
 
 def _vis_abstract(*args):
     arrays = args[N_IDX:]
+    _validate_indices(args)
     _validate(*arrays)
     return _output_aval(args[0], arrays[0])
 

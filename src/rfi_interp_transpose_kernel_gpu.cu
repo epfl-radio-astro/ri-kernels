@@ -2,7 +2,9 @@
 // RFI visibility, staged. See rfi_interp_transpose_kernel.cpp for the
 // formulas; here they are arranged as, per source, cell and antenna a,
 //
-//   G[a](s) = sum_j W[a, j] conj(S[j](s)),   W[a, j] = vbar[pair(a, j)] + conj(vbar[pair(j, a)])
+//   G[a](s) = sum_j W[a, j](s) conj(S[j](s)),
+//   W[a, j](s) = (vbar[pair(a, j)] + conj(vbar[pair(j, a)])) / count[a, j]  if the
+//                baseline integrates time sample v(s), else 0
 //
 // a product of the (n_ant, n_ant) cotangent matrix W of the cell with the
 // conjugated fine samples, which is what a tiled kernel does well: one block
@@ -35,6 +37,7 @@ namespace gpu {
 
 template <typename T, typename INT_T> struct TransposeViews {
   Tensor2D<const int *, INT_T> pair;
+  Tensor1D<const int *, INT_T> stride;
   Tensor4D<const Cplx<T> *, INT_T> amp;
   Tensor4D<const T *, INT_T> phase, delay;
   Tensor3D<const T *, INT_T> w_freq, w_time;
@@ -55,8 +58,7 @@ constexpr int kGPerThread = kOwnMax * kChunkMax / kBlockT;
 
 template <typename T, typename INT_T>
 __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_staged(
-    T scale, TransposeViews<T, INT_T> v, INT_T tile_own, INT_T chunk,
-    INT_T t0, INT_T n_tc) {
+    TransposeViews<T, INT_T> v, INT_T tile_own, INT_T chunk, INT_T t0, INT_T n_tc) {
   extern __shared__ unsigned char dynamic_shared[];
   const INT_T n_ant = v.amp.shape[0], n_rfi = v.amp.shape[1];
   const INT_T n_freq = v.amp.shape[2];
@@ -66,14 +68,18 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_staged(
   const INT_T n_own_tiles = (n_ant + tile_own - 1) / tile_own;
   const INT_T n_partner_tiles = (n_ant + kPartner - 1) / kPartner;
 
-  // Layout: weight rows | W_I (n_ant x tile_own, partner-major) | S_J tile
-  // (chunk x kPartner, sample-major) | Q (chunk x tile_own) | H_s (tile_own x
-  // n_stencil), the complex blocks from a 16-byte boundary.
+  // Layout: weight rows | W_I (n_ant x tile_own, partner-major) | the mask of
+  // the chunk's time samples each (partner, own) baseline integrates | S_J
+  // tile (chunk x kPartner, sample-major) | Q (chunk x tile_own) | H_s
+  // (tile_own x n_stencil), the complex blocks from 16-byte boundaries.
   T *wf = reinterpret_cast<T *>(dynamic_shared);
   T *wt = wf + n_sf * n_int_f;
   const std::size_t head = (sizeof(T) * (n_sf * n_int_f + n_st * n_int_t) + 15) / 16 * 16;
   Cplx<T> *W = reinterpret_cast<Cplx<T> *>(dynamic_shared + head);
-  Cplx<T> *SJ = W + n_ant * tile_own;
+  unsigned *Wmask = reinterpret_cast<unsigned *>(W + n_ant * tile_own);
+  const std::size_t mask_end = (head + sizeof(Cplx<T>) * n_ant * tile_own +
+                                sizeof(unsigned) * n_ant * tile_own + 15) / 16 * 16;
+  Cplx<T> *SJ = reinterpret_cast<Cplx<T> *>(dynamic_shared + mask_end);
   Cplx<T> *Q = SJ + chunk * kPartner;
   Cplx<T> *Hs = Q + chunk * tile_own;
 
@@ -90,17 +96,20 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_staged(
       const INT_T sf = v.start_freq(f), st = v.start_time(t);
       const T freq_f = v.freqs(f);
       // W[j, a_local] for every partner j: the cotangents of the baselines
-      // (a, j) and (j, a), the second conjugated.
+      // (a, j) and (j, a), the second conjugated, over the number of samples
+      // the baseline integrates.
       for (INT_T idx = tid; idx < n_ant * tile_own; idx += kBlockT) {
         const INT_T j = idx / tile_own, a = I * tile_own + idx % tile_own;
         Cplx<T> w{0, 0};
+        INT_T bstride = 1;
         if (a < n_ant) {
           const INT_T b1 = v.pair(a, j);
-          if (b1 >= 0) w = cadd(w, v.vis_bar(b1, f, t));
+          if (b1 >= 0) { w = cadd(w, v.vis_bar(b1, f, t)); bstride = v.stride(b1); }
           const INT_T b2 = v.pair(j, a);
-          if (b2 >= 0) w = cadd(w, cconj(v.vis_bar(b2, f, t)));
+          if (b2 >= 0) { w = cadd(w, cconj(v.vis_bar(b2, f, t))); bstride = v.stride(b2); }
         }
-        W[idx] = w;
+        const INT_T count = stride_count(n_int_t, bstride);
+        W[idx] = count > 0 ? cscale(T(1) / T(n_int_f * count), w) : Cplx<T>{0, 0};
       }
 
       for (INT_T r = 0; r < n_rfi; ++r) {
@@ -109,18 +118,50 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_staged(
 
         for (INT_T s0 = 0; s0 < n_s; s0 += chunk) {
           const INT_T cs = n_s - s0 < chunk ? n_s - s0 : chunk;
+          const INT_T v_lo = s0 / n_int_f;
+          // Which of the chunk's time samples each (partner, own) baseline
+          // integrates, one bit per time sample from v_lo.
+          __syncthreads();  // the previous chunk's products are done with the masks
+          for (INT_T idx = tid; idx < n_ant * tile_own; idx += kBlockT) {
+            const INT_T j = idx / tile_own, a = I * tile_own + idx % tile_own;
+            INT_T bstride = 1;
+            if (a < n_ant) {
+              INT_T bl = v.pair(a, j);
+              if (bl < 0) bl = v.pair(j, a);
+              if (bl >= 0) bstride = v.stride(bl);
+            }
+            Wmask[idx] = stride_mask(v_lo, n_int_t, bstride);
+          }
           // G for this thread's (a_local, s_local) entries, in registers.
           Cplx<T> g[kGPerThread];
           for (int m = 0; m < kGPerThread; ++m) g[m] = Cplx<T>{0, 0};
 
           for (INT_T J = 0; J < n_partner_tiles; ++J) {
             __syncthreads();  // the previous partner tile's products are done
+            // Skip a partner tile with no baseline to any antenna of this tile:
+            // its W block is zero, so it would contribute nothing at the cost
+            // of staging its samples (a variable-sampling call covers a
+            // fraction of the baselines).
+            {
+              __shared__ int any_baseline;
+              if (tid == 0) any_baseline = 0;
+              __syncthreads();
+              for (INT_T idx = tid; idx < tile_own * kPartner; idx += kBlockT) {
+                const INT_T a = I * tile_own + idx / kPartner, j = J * kPartner + idx % kPartner;
+                if (a < n_ant && j < n_ant && (v.pair(a, j) >= 0 || v.pair(j, a) >= 0))
+                  any_baseline = 1;
+              }
+              __syncthreads();
+              const bool skip = !any_baseline;
+              __syncthreads();  // everyone has read the flag before it is reset again
+              if (skip) continue;
+            }
             for (INT_T idx = tid; idx < cs * kPartner; idx += kBlockT) {
               const INT_T s_local = idx / kPartner, jl = idx % kPartner;
               const INT_T j = J * kPartner + jl, s = s0 + s_local;
               Cplx<T> S{0, 0};
               if (j < n_ant) {
-                const INT_T u = s / n_int_t, vv = s % n_int_t;
+                const INT_T vv = s / n_int_f, u = s % n_int_f;  // time-major
                 const auto e = phase_factor(v.phase, v.delay, freq_f, v.dnu(u), v.dt(vv), j, r, f, t);
                 S = cmul(interp_amp(v.amp, wf, wt, sf, st, n_sf, n_st, n_int_f, n_int_t, j, r, u, vv), e);
               }
@@ -132,9 +173,11 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_staged(
               const INT_T idx = tid + m * kBlockT;
               if (idx >= cs * tile_own) break;
               const INT_T s_local = idx / tile_own, a_local = idx % tile_own;
+              const unsigned bit = 1u << ((s0 + s_local) / n_int_f - v_lo);
               Cplx<T> acc = g[m];
               for (INT_T jl = 0; jl < j_end; ++jl) {
                 const INT_T j = J * kPartner + jl;
+                if (!(Wmask[j * tile_own + a_local] & bit)) continue;
                 acc = cadd(acc, cmul(W[j * tile_own + a_local], cconj(SJ[s_local * kPartner + jl])));
               }
               g[m] = acc;
@@ -149,7 +192,7 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_staged(
             const INT_T a = I * tile_own + a_local, s = s0 + s_local;
             Cplx<T> q{0, 0};
             if (a < n_ant) {
-              const INT_T u = s / n_int_t, vv = s % n_int_t;
+              const INT_T vv = s / n_int_f, u = s % n_int_f;  // time-major
               q = cmul(phase_factor(v.phase, v.delay, freq_f, v.dnu(u), v.dt(vv), a, r, f, t), g[m]);
             }
             Q[idx] = q;
@@ -161,7 +204,7 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_staged(
             Cplx<T> h = Hs[idx];
             for (INT_T s_local = 0; s_local < cs; ++s_local) {
               const INT_T s = s0 + s_local;
-              const T w = wf[k * n_int_f + s / n_int_t] * wt[l * n_int_t + s % n_int_t];
+              const T w = wf[k * n_int_f + s % n_int_f] * wt[l * n_int_t + s / n_int_f];
               h = cadd(h, cscale(w, Q[s_local * tile_own + a_local]));
             }
             Hs[idx] = h;
@@ -170,7 +213,7 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_staged(
         __syncthreads();
         for (INT_T idx = tid; idx < tile_own * n_stencil; idx += kBlockT) {
           const INT_T a = I * tile_own + idx / n_stencil, kl = idx % n_stencil;
-          if (a < n_ant) v.H(a, r, f, t - t0, kl) = cscale(scale, Hs[idx]);
+          if (a < n_ant) v.H(a, r, f, t - t0, kl) = Hs[idx];
         }
       }
     }
@@ -219,7 +262,7 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_gather(
 template <typename T, typename INT_T, ffi::DataType AMP_DT, ffi::DataType REAL_DT>
 ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
     cudaStream_t stream, ffi::ScratchAllocator &scratch,
-    ffi::BufferR2<ffi::S32> pair, ffi::Buffer<AMP_DT, 4> amp,
+    ffi::BufferR2<ffi::S32> pair, interp_index_t stride, ffi::Buffer<AMP_DT, 4> amp,
     ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> delay,
     ffi::Buffer<REAL_DT, 3> w_freq, interp_index_t start_freq,
     ffi::Buffer<REAL_DT, 3> w_time, interp_index_t start_time,
@@ -232,14 +275,18 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
   const INT_T n_st = w_time.dimensions()[1], n_int_t = w_time.dimensions()[2];
   const INT_T n_stencil = n_sf * n_st, n_s = n_int_f * n_int_t;
 
-  // Own tile: as many antennas as keep W's rows within 16 KB, at most kOwnMax.
+  // Own tile: as many antennas as keep W's rows and their masks within 24 KB,
+  // at most kOwnMax.
   INT_T tile_own = kOwnMax;
-  while (tile_own > 1 && std::size_t(n_ant) * tile_own * sizeof(Cplx<T>) > 16 * 1024) tile_own /= 2;
+  while (tile_own > 1 &&
+         std::size_t(n_ant) * tile_own * (sizeof(Cplx<T>) + sizeof(unsigned)) > 24 * 1024)
+    tile_own /= 2;
   const INT_T chunk = n_s < kChunkMax ? n_s : kChunkMax;
   const std::size_t head = (sizeof(T) * (n_sf * n_int_f + n_st * n_int_t) + 15) / 16 * 16;
+  const std::size_t mask_end = (head + sizeof(Cplx<T>) * n_ant * tile_own +
+                                sizeof(unsigned) * n_ant * tile_own + 15) / 16 * 16;
   const std::size_t shared =
-      head + sizeof(Cplx<T>) * (std::size_t(n_ant) * tile_own + chunk * kPartner +
-                                chunk * tile_own + tile_own * n_stencil);
+      mask_end + sizeof(Cplx<T>) * (chunk * kPartner + chunk * tile_own + tile_own * n_stencil);
 
   // Time chunk: as many cells as keep the scratch within 256 MB, at least one.
   const std::size_t per_cell = sizeof(Cplx<T>) * std::size_t(n_ant) * n_rfi * n_freq * n_stencil;
@@ -252,6 +299,7 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
 
   TransposeViews<T, INT_T> views{
       Tensor2D<const int *, INT_T>(pair.typed_data(), pair.dimensions()[0], pair.dimensions()[1]),
+      Tensor1D<const int *, INT_T>(stride.typed_data(), stride.dimensions()[0]),
       Tensor4D<const Cplx<T> *, INT_T>(
           reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1], a[2], a[3]),
       Tensor4D<const T *, INT_T>(phase.typed_data(), a[0], a[1], a[2], a[3]),
@@ -274,7 +322,6 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
       Tensor4D<Cplx<T> *, INT_T>(
           reinterpret_cast<Cplx<T> *>(amp_bar->typed_data()), a[0], a[1], a[2], a[3]),
   };
-  const T scale = T(1) / T(n_s);
   const INT_T n_own_tiles = (n_ant + tile_own - 1) / tile_own;
 
   auto status = cudaMemsetAsync(amp_bar->typed_data(), 0,
@@ -286,7 +333,7 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
     const INT_T cells = n_time - t0 < n_tc ? n_time - t0 : n_tc;
     const auto grid = create_clamped_grid(n_freq * cells, n_own_tiles, 1);
     rfi_interp_transpose_staged<T, INT_T><<<grid, kBlockT, shared, stream>>>(
-        scale, views, tile_own, chunk, t0, cells);
+        views, tile_own, chunk, t0, cells);
     status = cudaGetLastError();
     if (status != cudaSuccess)
       return ffi::Error::Internal(std::string("GPU kernel launch error: ") + cudaGetErrorString(status));
@@ -308,7 +355,7 @@ ffi::Error calc_rfi_interp_transpose_gpu_impl_tmpl(
     cudaStream_t stream, ffi::ScratchAllocator &scratch, interp_index_t a1,
     interp_index_t a1_sorter, interp_index_t a1_start, interp_index_t a2,
     interp_index_t a2_sorter, interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair,
-    ffi::Buffer<AMP_DT, 4> amp, ffi::Buffer<REAL_DT, 4> phase,
+    interp_index_t stride, ffi::Buffer<AMP_DT, 4> amp, ffi::Buffer<REAL_DT, 4> phase,
     ffi::Buffer<REAL_DT, 4> delay, ffi::Buffer<REAL_DT, 3> w_freq,
     interp_index_t start_freq, ffi::Buffer<REAL_DT, 3> w_time,
     interp_index_t start_time, ffi::Buffer<REAL_DT, 1> dnu,
@@ -320,6 +367,8 @@ ffi::Error calc_rfi_interp_transpose_gpu_impl_tmpl(
         "Incompatible signal, phase, delay, table, or baseline shapes");
   if (pair.dimensions()[0] != amp.dimensions()[0] || pair.dimensions()[1] != amp.dimensions()[0])
     return ffi::Error::InvalidArgument("Expected an (n_ant, n_ant) pair table");
+  if (stride.dimensions()[0] != a1.dimensions()[0])
+    return ffi::Error::InvalidArgument("Expected one stride per baseline");
   if (vis_bar.dimensions()[0] != a1.dimensions()[0] ||
       vis_bar.dimensions()[1] != amp.dimensions()[2] ||
       vis_bar.dimensions()[2] != amp.dimensions()[3])
@@ -333,10 +382,10 @@ ffi::Error calc_rfi_interp_transpose_gpu_impl_tmpl(
   // use 32 bit indexing if possible
   if (h_count < limit && vis_bar.element_count() < limit)
     return calc_rfi_interp_transpose_gpu_dispatch<T, std::int32_t>(
-        stream, scratch, pair, amp, phase, delay, w_freq, start_freq, w_time,
+        stream, scratch, pair, stride, amp, phase, delay, w_freq, start_freq, w_time,
         start_time, dnu, dt, freqs, vis_bar, amp_bar);
   return calc_rfi_interp_transpose_gpu_dispatch<T, std::int64_t>(
-      stream, scratch, pair, amp, phase, delay, w_freq, start_freq, w_time,
+      stream, scratch, pair, stride, amp, phase, delay, w_freq, start_freq, w_time,
       start_time, dnu, dt, freqs, vis_bar, amp_bar);
 }
 
@@ -344,13 +393,13 @@ ffi::Error calc_rfi_interp_transpose_gpu_f32_impl(
     cudaStream_t stream, ffi::ScratchAllocator scratch, interp_index_t a1,
     interp_index_t a1_sorter, interp_index_t a1_start, interp_index_t a2,
     interp_index_t a2_sorter, interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair,
-    interp_amp_f32_t amp, interp_real4_f32_t phase, interp_real4_f32_t delay,
+    interp_index_t stride, interp_amp_f32_t amp, interp_real4_f32_t phase, interp_real4_f32_t delay,
     interp_real3_f32_t w_freq, interp_index_t start_freq,
     interp_real3_f32_t w_time, interp_index_t start_time,
     interp_real1_f32_t dnu, interp_real1_f32_t dt, interp_real1_f32_t freqs,
     ffi::BufferR3<ffi::C64> vis_bar, ffi::Result<interp_amp_f32_t> amp_bar) {
   return calc_rfi_interp_transpose_gpu_impl_tmpl<ffi::C64, ffi::F32, float>(
-      stream, scratch, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, amp,
+      stream, scratch, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, stride, amp,
       phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
       vis_bar, amp_bar);
 }
@@ -359,13 +408,13 @@ ffi::Error calc_rfi_interp_transpose_gpu_f64_impl(
     cudaStream_t stream, ffi::ScratchAllocator scratch, interp_index_t a1,
     interp_index_t a1_sorter, interp_index_t a1_start, interp_index_t a2,
     interp_index_t a2_sorter, interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair,
-    interp_amp_f64_t amp, interp_real4_f64_t phase, interp_real4_f64_t delay,
+    interp_index_t stride, interp_amp_f64_t amp, interp_real4_f64_t phase, interp_real4_f64_t delay,
     interp_real3_f64_t w_freq, interp_index_t start_freq,
     interp_real3_f64_t w_time, interp_index_t start_time,
     interp_real1_f64_t dnu, interp_real1_f64_t dt, interp_real1_f64_t freqs,
     ffi::BufferR3<ffi::C128> vis_bar, ffi::Result<interp_amp_f64_t> amp_bar) {
   return calc_rfi_interp_transpose_gpu_impl_tmpl<ffi::C128, ffi::F64, double>(
-      stream, scratch, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, amp,
+      stream, scratch, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, stride, amp,
       phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
       vis_bar, amp_bar);
 }
@@ -381,7 +430,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>().Ctx<ffi::ScratchAllocator>()
         .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()
         .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()
-        .Arg<ffi::BufferR2<ffi::S32>>()
+        .Arg<ffi::BufferR2<ffi::S32>>().Arg<interp_index_t>()
         .Arg<interp_amp_f32_t>()
         .Arg<interp_real4_f32_t>().Arg<interp_real4_f32_t>()
         .Arg<interp_real3_f32_t>().Arg<interp_index_t>()
@@ -395,7 +444,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>().Ctx<ffi::ScratchAllocator>()
         .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()
         .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()
-        .Arg<ffi::BufferR2<ffi::S32>>()
+        .Arg<ffi::BufferR2<ffi::S32>>().Arg<interp_index_t>()
         .Arg<interp_amp_f64_t>()
         .Arg<interp_real4_f64_t>().Arg<interp_real4_f64_t>()
         .Arg<interp_real3_f64_t>().Arg<interp_index_t>()

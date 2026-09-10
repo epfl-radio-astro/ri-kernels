@@ -8,7 +8,11 @@
 // paired with, n_ant / TA times, instead of once per baseline it is on. The
 // products of the two orderings of a pair are conjugates, so each pair is
 // formed once and written to whichever of its orderings the baseline list
-// holds, through the (n_ant, n_ant) pair table the caller supplies.
+// holds, through the (n_ant, n_ant) pair table the caller supplies. Each
+// baseline integrates its own subset of the cell's time samples, every
+// stride-th (see rfi_interp_common.hpp): the samples are staged time-major
+// and a per-pair mask selects them, so the slow baselines of an array cost
+// a fraction of the fast ones.
 //
 // Shared memory is bounded whatever the problem size: the chunk of samples
 // is sized so the staged tiles stay within ~32 KB, which any device with the
@@ -34,6 +38,7 @@ namespace gpu {
 template <typename T, typename INT_T> struct InterpViews {
   Tensor1D<const int *, INT_T> a1, a2;
   Tensor2D<const int *, INT_T> pair;
+  Tensor1D<const int *, INT_T> stride;
   Tensor4D<const Cplx<T> *, INT_T> amp;
   Tensor4D<const T *, INT_T> phase, delay;
   Tensor3D<const T *, INT_T> w_freq, w_time;
@@ -44,7 +49,7 @@ template <typename T, typename INT_T> struct InterpViews {
 template <typename T, typename INT_T, ffi::DataType AMP_DT, ffi::DataType REAL_DT>
 InterpViews<T, INT_T> make_views(
     interp_index_t a1, interp_index_t a2, ffi::BufferR2<ffi::S32> pair,
-    ffi::Buffer<AMP_DT, 4> amp, ffi::Buffer<REAL_DT, 4> phase,
+    interp_index_t stride, ffi::Buffer<AMP_DT, 4> amp, ffi::Buffer<REAL_DT, 4> phase,
     ffi::Buffer<REAL_DT, 4> delay, ffi::Buffer<REAL_DT, 3> w_freq,
     interp_index_t start_freq, ffi::Buffer<REAL_DT, 3> w_time,
     interp_index_t start_time, ffi::Buffer<REAL_DT, 1> dnu,
@@ -54,6 +59,7 @@ InterpViews<T, INT_T> make_views(
       Tensor1D<const int *, INT_T>(a1.typed_data(), a1.dimensions()[0]),
       Tensor1D<const int *, INT_T>(a2.typed_data(), a2.dimensions()[0]),
       Tensor2D<const int *, INT_T>(pair.typed_data(), pair.dimensions()[0], pair.dimensions()[1]),
+      Tensor1D<const int *, INT_T>(stride.typed_data(), stride.dimensions()[0]),
       Tensor4D<const Cplx<T> *, INT_T>(
           reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1], a[2], a[3]),
       Tensor4D<const T *, INT_T>(phase.typed_data(), a[0], a[1], a[2], a[3]),
@@ -80,7 +86,7 @@ __device__ inline void staged_sample(
     const T *wf, const T *wt, INT_T sf, INT_T st, INT_T n_sf, INT_T n_st,
     INT_T n_int_f, INT_T n_int_t, T freq_f, INT_T a, INT_T r, INT_T f,
     INT_T t, INT_T s, Cplx<T> &S, Cplx<T> &dS) {
-  const INT_T u = s / n_int_t, vv = s % n_int_t;
+  const INT_T vv = s / n_int_f, u = s % n_int_f;  // time-major
   const auto e = phase_factor(v.phase, v.delay, freq_f, v.dnu(u), v.dt(vv), a, r, f, t);
   S = cmul(interp_amp(v.amp, wf, wt, sf, st, n_sf, n_st, n_int_f, n_int_t, a, r, u, vv), e);
   if constexpr (JVP) {
@@ -94,7 +100,7 @@ constexpr int kPairs = kTile * kTile / kBlock;  // baseline pairs per thread
 
 template <typename T, bool JVP, typename INT_T>
 __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
-    T scale, InterpViews<T, INT_T> v, Tensor4D<const Cplx<T> *, INT_T> amp_dot,
+    InterpViews<T, INT_T> v, Tensor4D<const Cplx<T> *, INT_T> amp_dot,
     Tensor3D<Cplx<T> *, INT_T> out, INT_T chunk, INT_T n_tiles, INT_T n_tile_pairs) {
   extern __shared__ unsigned char dynamic_shared[];
 
@@ -125,6 +131,43 @@ __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
     while (rem >= n_tiles - I) { rem -= n_tiles - I; ++I; }
     const INT_T J = I + rem;
     const bool same = I == J;
+
+    // A tile pair none of whose antenna pairs is a baseline of the list has
+    // nothing to stage or write: a baseline group of a variable-sampling call
+    // covers a fraction of the pairs, and the rest must cost nothing.
+    {
+      __shared__ int any_baseline;
+      if (tid == 0) any_baseline = 0;
+      __syncthreads();
+      for (INT_T idx = tid; idx < kTile * kTile; idx += kBlock) {
+        const INT_T a1 = I * kTile + idx / kTile, a2 = J * kTile + idx % kTile;
+        if (a1 < n_ant && a2 < n_ant && (v.pair(a1, a2) >= 0 || v.pair(a2, a1) >= 0))
+          any_baseline = 1;
+      }
+      __syncthreads();
+      const bool skip = !any_baseline;
+      __syncthreads();  // everyone has read the flag before it is reset again
+      if (skip) continue;
+    }
+
+    // This thread's pairs: their stride and the mean's normalisation, once
+    // per tile pair. A pair the list does not hold gets stride 1 and is never
+    // written.
+    INT_T pstride[kPairs];
+    T pscale[kPairs];
+    for (int k = 0; k < kPairs; ++k) {
+      const int i_local = tid / kTile + k * (kBlock / kTile);
+      const INT_T a1 = I * kTile + i_local, a2 = J * kTile + j_local;
+      INT_T bstride = 1;
+      if (a1 < n_ant && a2 < n_ant) {
+        INT_T bl = v.pair(a1, a2);
+        if (bl < 0) bl = v.pair(a2, a1);
+        if (bl >= 0) bstride = v.stride(bl);
+      }
+      pstride[k] = bstride;
+      const INT_T count = stride_count(n_int_t, bstride);
+      pscale[k] = count > 0 ? T(1) / T(n_int_f * count) : T(0);
+    }
 
     for (INT_T cell = blockIdx.x; cell < n_cells; cell += gridDim.x) {
       const INT_T f = cell / n_time, t = cell % n_time;
@@ -165,12 +208,21 @@ __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
           __syncthreads();
           const Cplx<T> *TJ = same ? tile_I : tile_J;
           const Cplx<T> *DJ = same ? dtile_I : dtile_J;
+          // Which of the chunk's time samples each pair integrates: one bit
+          // per time sample from the chunk's first, v_lo.
+          const INT_T v_lo = s0 / n_int_f;
+          unsigned mask[kPairs];
+          for (int k = 0; k < kPairs; ++k) mask[k] = stride_mask(v_lo, n_int_t, pstride[k]);
           // Multiply: pair k of this thread is (i = tid / kTile + 8 k, j = tid % kTile).
+          INT_T u = s0 % n_int_f, vv = v_lo;
           for (INT_T s = 0; s < cs; ++s) {
+            const unsigned bit = 1u << (vv - v_lo);
+            if (++u == n_int_f) { u = 0; ++vv; }  // the next sample's (u, v)
             const Cplx<T> b = TJ[s * kTile + j_local];
             Cplx<T> db{0, 0};
             if constexpr (JVP) db = DJ[s * kTile + j_local];
             for (int k = 0; k < kPairs; ++k) {
+              if (!(mask[k] & bit)) continue;
               const int i_local = tid / kTile + k * (kBlock / kTile);
               const Cplx<T> a = tile_I[s * kTile + i_local];
               if constexpr (JVP) {
@@ -193,10 +245,10 @@ __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
         const INT_T a1 = I * kTile + i_local, a2 = J * kTile + j_local;
         if (a1 >= n_ant || a2 >= n_ant) continue;
         const INT_T bl = v.pair(a1, a2);
-        if (bl >= 0) out(bl, f, t) = cscale(scale, acc[k]);
+        if (bl >= 0) out(bl, f, t) = cscale(pscale[k], acc[k]);
         if (a1 != a2) {
           const INT_T bl2 = v.pair(a2, a1);
-          if (bl2 >= 0) out(bl2, f, t) = cscale(scale, cconj(acc[k]));
+          if (bl2 >= 0) out(bl2, f, t) = cscale(pscale[k], cconj(acc[k]));
         }
       }
     }
@@ -217,15 +269,15 @@ std::int64_t staged_chunk(std::int64_t n_s, int n_tiles_shared, std::size_t budg
 template <bool JVP, typename T, typename INT_T, ffi::DataType AMP_DT, ffi::DataType REAL_DT>
 ffi::Error calc_rfi_interp_gpu_dispatch(
     cudaStream_t stream, interp_index_t a1, interp_index_t a2,
-    ffi::BufferR2<ffi::S32> pair, ffi::Buffer<AMP_DT, 4> amp,
+    ffi::BufferR2<ffi::S32> pair, interp_index_t stride, ffi::Buffer<AMP_DT, 4> amp,
     ffi::Buffer<AMP_DT, 4> amp_dot, ffi::Buffer<REAL_DT, 4> phase,
     ffi::Buffer<REAL_DT, 4> delay, ffi::Buffer<REAL_DT, 3> w_freq,
     interp_index_t start_freq, ffi::Buffer<REAL_DT, 3> w_time,
     interp_index_t start_time, ffi::Buffer<REAL_DT, 1> dnu,
     ffi::Buffer<REAL_DT, 1> dt, ffi::Buffer<REAL_DT, 1> freqs,
     ffi::Result<ffi::BufferR3<AMP_DT>> out) {
-  auto views = make_views<T, INT_T>(a1, a2, pair, amp, phase, delay, w_freq, start_freq,
-                                    w_time, start_time, dnu, dt, freqs);
+  auto views = make_views<T, INT_T>(a1, a2, pair, stride, amp, phase, delay, w_freq,
+                                    start_freq, w_time, start_time, dnu, dt, freqs);
   const auto a = amp.dimensions();
   Tensor4D<const Cplx<T> *, INT_T> amp_dot_view(
       reinterpret_cast<const Cplx<T> *>(amp_dot.typed_data()), a[0], a[1], a[2], a[3]);
@@ -235,7 +287,6 @@ ffi::Error calc_rfi_interp_gpu_dispatch(
   const INT_T n_sf = w_freq.dimensions()[1], n_int_f = w_freq.dimensions()[2];
   const INT_T n_st = w_time.dimensions()[1], n_int_t = w_time.dimensions()[2];
   const INT_T n_s = n_int_f * n_int_t;
-  const T scale = T(1) / T(n_s);
   const INT_T n_tiles = (a[0] + kTile - 1) / kTile;
   const INT_T n_tile_pairs = n_tiles * (n_tiles + 1) / 2;
   const int n_tiles_shared = JVP ? 4 : 2;
@@ -244,7 +295,7 @@ ffi::Error calc_rfi_interp_gpu_dispatch(
   const std::size_t shared = head + sizeof(Cplx<T>) * kTile * chunk * n_tiles_shared;
   const auto grid = create_clamped_grid(a[2] * a[3], n_tile_pairs, 1);
   rfi_interp_staged_kernel<T, JVP, INT_T><<<grid, kBlock, shared, stream>>>(
-      scale, views, amp_dot_view, out_view, chunk, n_tiles, n_tile_pairs);
+      views, amp_dot_view, out_view, chunk, n_tiles, n_tile_pairs);
   const auto status = cudaGetLastError();
   return status == cudaSuccess
              ? ffi::Error::Success()
@@ -256,7 +307,7 @@ template <bool JVP, ffi::DataType AMP_DT, ffi::DataType REAL_DT, typename T>
 ffi::Error calc_rfi_interp_gpu_impl_tmpl(
     cudaStream_t stream, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
-    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair,
+    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, interp_index_t stride,
     ffi::Buffer<AMP_DT, 4> amp, ffi::Buffer<AMP_DT, 4> amp_dot,
     ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> delay,
     ffi::Buffer<REAL_DT, 3> w_freq, interp_index_t start_freq,
@@ -269,31 +320,34 @@ ffi::Error calc_rfi_interp_gpu_impl_tmpl(
         "Incompatible signal, phase, delay, table, or baseline shapes");
   if (pair.dimensions()[0] != amp.dimensions()[0] || pair.dimensions()[1] != amp.dimensions()[0])
     return ffi::Error::InvalidArgument("Expected an (n_ant, n_ant) pair table");
+  if (stride.dimensions()[0] != a1.dimensions()[0])
+    return ffi::Error::InvalidArgument("Expected one stride per baseline");
   if (JVP && !interp_same_shape(amp_dot, amp))
     return ffi::Error::InvalidArgument("Expected the signal tangent to match the signal");
   constexpr std::int64_t limit = std::numeric_limits<std::int32_t>::max();
   // use 32 bit indexing if possible
   if (amp.element_count() < limit && out->element_count() < limit)
     return calc_rfi_interp_gpu_dispatch<JVP, T, std::int32_t>(
-        stream, a1, a2, pair, amp, amp_dot, phase, delay, w_freq, start_freq, w_time,
-        start_time, dnu, dt, freqs, out);
+        stream, a1, a2, pair, stride, amp, amp_dot, phase, delay, w_freq, start_freq,
+        w_time, start_time, dnu, dt, freqs, out);
   return calc_rfi_interp_gpu_dispatch<JVP, T, std::int64_t>(
-      stream, a1, a2, pair, amp, amp_dot, phase, delay, w_freq, start_freq, w_time,
-      start_time, dnu, dt, freqs, out);
+      stream, a1, a2, pair, stride, amp, amp_dot, phase, delay, w_freq, start_freq,
+      w_time, start_time, dnu, dt, freqs, out);
 }
 
 #define RI_INTERP_GPU_ENTRY(NAME, JVP, AMP_DT, REAL_DT, T, AMP_T, R4, R3, R1, DOT_PARAM, DOT_ARG) \
   ffi::Error NAME##_impl(                                                       \
       cudaStream_t stream, interp_index_t a1, interp_index_t a1_sorter,          \
       interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,      \
-      interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, AMP_T amp DOT_PARAM, \
+      interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair,                   \
+      interp_index_t stride, AMP_T amp DOT_PARAM,                                \
       R4 phase, R4 delay, R3 w_freq, interp_index_t start_freq, R3 w_time,        \
       interp_index_t start_time, R1 dnu, R1 dt, R1 freqs,                        \
       ffi::Result<ffi::BufferR3<AMP_DT>> out) {                                  \
     return calc_rfi_interp_gpu_impl_tmpl<JVP, AMP_DT, REAL_DT, T>(               \
-        stream, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, amp,     \
-        DOT_ARG, phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt,   \
-        freqs, out);                                                             \
+        stream, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, stride,  \
+        amp, DOT_ARG, phase, delay, w_freq, start_freq, w_time, start_time, dnu,  \
+        dt, freqs, out);                                                         \
   }
 
 #define RI_COMMA_DOT_F32 , interp_amp_f32_t amp_dot
@@ -314,7 +368,7 @@ extern "C" RI_KERNELS_API XLA_FFI_Error *calc_rfi_interp_jvp_gpu_f64(XLA_FFI_Cal
 #define RI_INTERP_INDEX_ARGS                                                   \
   .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()           \
       .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()       \
-      .Arg<ffi::BufferR2<ffi::S32>>()
+      .Arg<ffi::BufferR2<ffi::S32>>().Arg<interp_index_t>()
 #define RI_INTERP_TABLE_ARGS(P)                                                \
   .Arg<interp_real4_##P##_t>().Arg<interp_real4_##P##_t>()                     \
       .Arg<interp_real3_##P##_t>().Arg<interp_index_t>()                       \
