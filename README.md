@@ -118,7 +118,7 @@ memory.
 from ri_kernels.jax_api import RFIInterpVisOp
 
 vis = RFIInterpVisOp(n_ant, a1, a2).eval(
-    amp, phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs
+    amp, phase, delay_us, w_freq, start_freq, w_time, start_time, dnu_mhz, dt, freq_mhz
 )
 ```
 
@@ -126,29 +126,30 @@ vis = RFIInterpVisOp(n_ant, a1, a2).eval(
   grid, and the only differentiated input.
 - `phase`, real `(n_ant, n_rfi, n_freq, n_time)`: the phase at the channel and
   cell centre, reduced to one turn (in float64, before casting).
-- `path`, real `(n_ant, n_rfi, n_time, n_path)`: the path in metres and its
-  first `n_path - 1` time derivatives at the cell centre, relative to the
-  array mean (a common term cancels in every baseline; the full path's change
-  across a cell is ~1e4 wavelengths, beyond float32).
+- `delay_us`, real `(n_ant, n_rfi, n_time, n_path)`: the geometric delay in
+  microseconds, with the sign that makes the phase `2π f τ` as `RFIDelayVisOp`
+  has it, and its first `n_path - 1` time derivatives at the cell centre,
+  relative to the array mean (a common term cancels in every baseline; the
+  full delay's change across a cell is ~1e4 wavelengths, beyond float32).
 - `w_freq`, `start_freq` and `w_time`, `start_time`: per cell, the weights
   that turn its stencil of `n_sf` (`n_st`) neighbouring cells into its
   `n_int_freq` (`n_int_time`) fine samples, and the first cell of the stencil.
   Each stencil must lie inside its axis and contain its cell.
-- `dnu`, `dt`: the fine offsets from the channel centre (Hz) and the cell
-  centre (s); `freqs`: the channel centres (Hz).
+- `dnu_mhz`, `dt`: the fine offsets from the channel centre (MHz) and the
+  cell centre (s); `freq_mhz`: the channel centres (MHz). MHz × μs is cycles.
 
 For one cell `(f, t)`, fine sample `(u, v)`, source `r` and antenna `a`:
 
 ```
 A[a]   = sum_k sum_l w_freq[f, k, u] w_time[t, l, v] amp[a, r, start_freq[f] + k, start_time[t] + l]
-dL[a]  = sum_{k >= 1} path[a, r, t, k] dt[v]^k / k!
-phi[a] = phase[a, r, f, t] - (2 pi / c) ((freqs[f] + dnu[u]) dL[a] + dnu[u] path[a, r, t, 0])
+dtau[a] = sum_{k >= 1} delay_us[a, r, t, k] dt[v]^k / k!
+phi[a]  = phase[a, r, f, t] + 2 pi ((freq_mhz[f] + dnu_mhz[u]) dtau[a] + dnu_mhz[u] delay_us[a, r, t, 0])
 vis[bl, f, t] = mean_{u, v} sum_r A[a1] exp(i phi[a1]) conj(A[a2] exp(i phi[a2]))
 ```
 
 The weights are data. The polynomial through the stencil, the conditional mean
 of a Gaussian process prior, or any other linear interpolant is a different
-table through the same kernel. The phase, path and tables are constants of a
+table through the same kernel. The phase, delay and tables are constants of a
 run: `eval` stops their gradients, and the JVP and transpose kernels
 differentiate the signal alone. The transpose is deterministic -- every output
 element is written by exactly one thread -- at the cost of a scratch buffer of

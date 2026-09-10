@@ -36,7 +36,7 @@ namespace gpu {
 template <typename T, typename INT_T> struct TransposeViews {
   Tensor2D<const int *, INT_T> pair;
   Tensor4D<const Cplx<T> *, INT_T> amp;
-  Tensor4D<const T *, INT_T> phase, path;
+  Tensor4D<const T *, INT_T> phase, delay;
   Tensor3D<const T *, INT_T> w_freq, w_time;
   Tensor1D<const int *, INT_T> start_freq, start_time;
   Tensor1D<const T *, INT_T> dnu, dt, freqs;
@@ -121,7 +121,7 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_staged(
               Cplx<T> S{0, 0};
               if (j < n_ant) {
                 const INT_T u = s / n_int_t, vv = s % n_int_t;
-                const auto e = phase_factor(v.phase, v.path, freq_f, v.dnu(u), v.dt(vv), j, r, f, t);
+                const auto e = phase_factor(v.phase, v.delay, freq_f, v.dnu(u), v.dt(vv), j, r, f, t);
                 S = cmul(interp_amp(v.amp, wf, wt, sf, st, n_sf, n_st, n_int_f, n_int_t, j, r, u, vv), e);
               }
               SJ[idx] = S;
@@ -150,7 +150,7 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_staged(
             Cplx<T> q{0, 0};
             if (a < n_ant) {
               const INT_T u = s / n_int_t, vv = s % n_int_t;
-              q = cmul(phase_factor(v.phase, v.path, freq_f, v.dnu(u), v.dt(vv), a, r, f, t), g[m]);
+              q = cmul(phase_factor(v.phase, v.delay, freq_f, v.dnu(u), v.dt(vv), a, r, f, t), g[m]);
             }
             Q[idx] = q;
           }
@@ -220,7 +220,7 @@ template <typename T, typename INT_T, ffi::DataType AMP_DT, ffi::DataType REAL_D
 ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
     cudaStream_t stream, ffi::ScratchAllocator &scratch,
     ffi::BufferR2<ffi::S32> pair, ffi::Buffer<AMP_DT, 4> amp,
-    ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> path,
+    ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> delay,
     ffi::Buffer<REAL_DT, 3> w_freq, interp_index_t start_freq,
     ffi::Buffer<REAL_DT, 3> w_time, interp_index_t start_time,
     ffi::Buffer<REAL_DT, 1> dnu, ffi::Buffer<REAL_DT, 1> dt,
@@ -255,9 +255,9 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
       Tensor4D<const Cplx<T> *, INT_T>(
           reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1], a[2], a[3]),
       Tensor4D<const T *, INT_T>(phase.typed_data(), a[0], a[1], a[2], a[3]),
-      Tensor4D<const T *, INT_T>(path.typed_data(), path.dimensions()[0],
-                                 path.dimensions()[1], path.dimensions()[2],
-                                 path.dimensions()[3]),
+      Tensor4D<const T *, INT_T>(delay.typed_data(), delay.dimensions()[0],
+                                 delay.dimensions()[1], delay.dimensions()[2],
+                                 delay.dimensions()[3]),
       Tensor3D<const T *, INT_T>(w_freq.typed_data(), w_freq.dimensions()[0],
                                  w_freq.dimensions()[1], w_freq.dimensions()[2]),
       Tensor3D<const T *, INT_T>(w_time.typed_data(), w_time.dimensions()[0],
@@ -309,15 +309,15 @@ ffi::Error calc_rfi_interp_transpose_gpu_impl_tmpl(
     interp_index_t a1_sorter, interp_index_t a1_start, interp_index_t a2,
     interp_index_t a2_sorter, interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair,
     ffi::Buffer<AMP_DT, 4> amp, ffi::Buffer<REAL_DT, 4> phase,
-    ffi::Buffer<REAL_DT, 4> path, ffi::Buffer<REAL_DT, 3> w_freq,
+    ffi::Buffer<REAL_DT, 4> delay, ffi::Buffer<REAL_DT, 3> w_freq,
     interp_index_t start_freq, ffi::Buffer<REAL_DT, 3> w_time,
     interp_index_t start_time, ffi::Buffer<REAL_DT, 1> dnu,
     ffi::Buffer<REAL_DT, 1> dt, ffi::Buffer<REAL_DT, 1> freqs,
     ffi::BufferR3<AMP_DT> vis_bar, ffi::Result<ffi::Buffer<AMP_DT, 4>> amp_bar) {
-  if (!interp_shapes_are_valid(a1, a2, amp, phase, path, w_freq, start_freq,
+  if (!interp_shapes_are_valid(a1, a2, amp, phase, delay, w_freq, start_freq,
                                w_time, start_time, dnu, dt, freqs))
     return ffi::Error::InvalidArgument(
-        "Incompatible signal, phase, path, table, or baseline shapes");
+        "Incompatible signal, phase, delay, table, or baseline shapes");
   if (pair.dimensions()[0] != amp.dimensions()[0] || pair.dimensions()[1] != amp.dimensions()[0])
     return ffi::Error::InvalidArgument("Expected an (n_ant, n_ant) pair table");
   if (vis_bar.dimensions()[0] != a1.dimensions()[0] ||
@@ -333,10 +333,10 @@ ffi::Error calc_rfi_interp_transpose_gpu_impl_tmpl(
   // use 32 bit indexing if possible
   if (h_count < limit && vis_bar.element_count() < limit)
     return calc_rfi_interp_transpose_gpu_dispatch<T, std::int32_t>(
-        stream, scratch, pair, amp, phase, path, w_freq, start_freq, w_time,
+        stream, scratch, pair, amp, phase, delay, w_freq, start_freq, w_time,
         start_time, dnu, dt, freqs, vis_bar, amp_bar);
   return calc_rfi_interp_transpose_gpu_dispatch<T, std::int64_t>(
-      stream, scratch, pair, amp, phase, path, w_freq, start_freq, w_time,
+      stream, scratch, pair, amp, phase, delay, w_freq, start_freq, w_time,
       start_time, dnu, dt, freqs, vis_bar, amp_bar);
 }
 
@@ -344,14 +344,14 @@ ffi::Error calc_rfi_interp_transpose_gpu_f32_impl(
     cudaStream_t stream, ffi::ScratchAllocator scratch, interp_index_t a1,
     interp_index_t a1_sorter, interp_index_t a1_start, interp_index_t a2,
     interp_index_t a2_sorter, interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair,
-    interp_amp_f32_t amp, interp_real4_f32_t phase, interp_real4_f32_t path,
+    interp_amp_f32_t amp, interp_real4_f32_t phase, interp_real4_f32_t delay,
     interp_real3_f32_t w_freq, interp_index_t start_freq,
     interp_real3_f32_t w_time, interp_index_t start_time,
     interp_real1_f32_t dnu, interp_real1_f32_t dt, interp_real1_f32_t freqs,
     ffi::BufferR3<ffi::C64> vis_bar, ffi::Result<interp_amp_f32_t> amp_bar) {
   return calc_rfi_interp_transpose_gpu_impl_tmpl<ffi::C64, ffi::F32, float>(
       stream, scratch, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, amp,
-      phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
+      phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
       vis_bar, amp_bar);
 }
 
@@ -359,14 +359,14 @@ ffi::Error calc_rfi_interp_transpose_gpu_f64_impl(
     cudaStream_t stream, ffi::ScratchAllocator scratch, interp_index_t a1,
     interp_index_t a1_sorter, interp_index_t a1_start, interp_index_t a2,
     interp_index_t a2_sorter, interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair,
-    interp_amp_f64_t amp, interp_real4_f64_t phase, interp_real4_f64_t path,
+    interp_amp_f64_t amp, interp_real4_f64_t phase, interp_real4_f64_t delay,
     interp_real3_f64_t w_freq, interp_index_t start_freq,
     interp_real3_f64_t w_time, interp_index_t start_time,
     interp_real1_f64_t dnu, interp_real1_f64_t dt, interp_real1_f64_t freqs,
     ffi::BufferR3<ffi::C128> vis_bar, ffi::Result<interp_amp_f64_t> amp_bar) {
   return calc_rfi_interp_transpose_gpu_impl_tmpl<ffi::C128, ffi::F64, double>(
       stream, scratch, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, amp,
-      phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
+      phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
       vis_bar, amp_bar);
 }
 

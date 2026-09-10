@@ -34,7 +34,7 @@ namespace ffi = xla::ffi;
 template <typename T> struct TransposeViews {
   Tensor1D<const int *> a1, a1_sorter, a1_start, a2, a2_sorter, a2_start;
   Tensor4D<const Cplx<T> *> amp;
-  Tensor4D<const T *> phase, path;
+  Tensor4D<const T *> phase, delay;
   Tensor3D<const T *> w_freq, w_time;
   Tensor1D<const int *> start_freq, start_time;
   Tensor1D<const T *> dnu, dt, freqs;
@@ -84,16 +84,16 @@ void transpose_antennas(T scale, std::int64_t ant_begin, std::int64_t ant_end,
               for (std::int64_t p = first; p < first_end; ++p) {
                 const std::int64_t bl = v.a1_sorter(p), other = v.a2(bl);
                 const auto s = cmul(interp_amp(v.amp, wf, wt, sf, st, n_sf, n_st, n_int_f, n_int_t, other, r, u, vv),
-                                    phase_factor(v.phase, v.path, freq_f, dnu_u, dt_v, other, r, f, t));
+                                    phase_factor(v.phase, v.delay, freq_f, dnu_u, dt_v, other, r, f, t));
                 g = cadd(g, cmul(v.vis_bar(bl, f, t), cconj(s)));
               }
               for (std::int64_t p = second; p < second_end; ++p) {
                 const std::int64_t bl = v.a2_sorter(p), other = v.a1(bl);
                 const auto s = cmul(interp_amp(v.amp, wf, wt, sf, st, n_sf, n_st, n_int_f, n_int_t, other, r, u, vv),
-                                    phase_factor(v.phase, v.path, freq_f, dnu_u, dt_v, other, r, f, t));
+                                    phase_factor(v.phase, v.delay, freq_f, dnu_u, dt_v, other, r, f, t));
                 g = cadd(g, cconj(cmul(v.vis_bar(bl, f, t), s)));
               }
-              const auto e = phase_factor(v.phase, v.path, freq_f, dnu_u, dt_v, ant, r, f, t);
+              const auto e = phase_factor(v.phase, v.delay, freq_f, dnu_u, dt_v, ant, r, f, t);
               Q[u * n_int_t + vv] = cmul(e, g);
             }
           }
@@ -143,16 +143,16 @@ ffi::Future calc_rfi_interp_transpose_cpu_impl_tmpl(
     ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
     interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, ffi::Buffer<AMP_DT, 4> amp,
-    ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> path,
+    ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> delay,
     ffi::Buffer<REAL_DT, 3> w_freq, interp_index_t start_freq,
     ffi::Buffer<REAL_DT, 3> w_time, interp_index_t start_time,
     ffi::Buffer<REAL_DT, 1> dnu, ffi::Buffer<REAL_DT, 1> dt,
     ffi::Buffer<REAL_DT, 1> freqs, ffi::BufferR3<AMP_DT> vis_bar,
     ffi::Result<ffi::Buffer<AMP_DT, 4>> amp_bar) {
-  if (!interp_shapes_are_valid(a1, a2, amp, phase, path, w_freq, start_freq,
+  if (!interp_shapes_are_valid(a1, a2, amp, phase, delay, w_freq, start_freq,
                                w_time, start_time, dnu, dt, freqs))
     return completed_future(ffi::Error::InvalidArgument(
-        "Incompatible signal, phase, path, table, or baseline shapes"));
+        "Incompatible signal, phase, delay, table, or baseline shapes"));
   if (!stencils_cover_their_cells(start_freq.typed_data(), amp.dimensions()[2],
                                   w_freq.dimensions()[1]) ||
       !stencils_cover_their_cells(start_time.typed_data(), amp.dimensions()[3],
@@ -181,9 +181,9 @@ ffi::Future calc_rfi_interp_transpose_cpu_impl_tmpl(
           reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1],
           a[2], a[3]),
       Tensor4D<const T *>(phase.typed_data(), a[0], a[1], a[2], a[3]),
-      Tensor4D<const T *>(path.typed_data(), path.dimensions()[0],
-                          path.dimensions()[1], path.dimensions()[2],
-                          path.dimensions()[3]),
+      Tensor4D<const T *>(delay.typed_data(), delay.dimensions()[0],
+                          delay.dimensions()[1], delay.dimensions()[2],
+                          delay.dimensions()[3]),
       Tensor3D<const T *>(w_freq.typed_data(), w_freq.dimensions()[0],
                           w_freq.dimensions()[1], w_freq.dimensions()[2]),
       Tensor3D<const T *>(w_time.typed_data(), w_time.dimensions()[0],
@@ -212,14 +212,14 @@ ffi::Future calc_rfi_interp_transpose_cpu_f32_impl(
     ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
     interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, interp_amp_f32_t amp, interp_real4_f32_t phase,
-    interp_real4_f32_t path, interp_real3_f32_t w_freq,
+    interp_real4_f32_t delay, interp_real3_f32_t w_freq,
     interp_index_t start_freq, interp_real3_f32_t w_time,
     interp_index_t start_time, interp_real1_f32_t dnu, interp_real1_f32_t dt,
     interp_real1_f32_t freqs, ffi::BufferR3<ffi::C64> vis_bar,
     ffi::Result<interp_amp_f32_t> amp_bar) {
   return calc_rfi_interp_transpose_cpu_impl_tmpl<ffi::C64, ffi::F32, float>(
       thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, amp,
-      phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
+      phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
       vis_bar, amp_bar);
 }
 
@@ -227,14 +227,14 @@ ffi::Future calc_rfi_interp_transpose_cpu_f64_impl(
     ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
     interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, interp_amp_f64_t amp, interp_real4_f64_t phase,
-    interp_real4_f64_t path, interp_real3_f64_t w_freq,
+    interp_real4_f64_t delay, interp_real3_f64_t w_freq,
     interp_index_t start_freq, interp_real3_f64_t w_time,
     interp_index_t start_time, interp_real1_f64_t dnu, interp_real1_f64_t dt,
     interp_real1_f64_t freqs, ffi::BufferR3<ffi::C128> vis_bar,
     ffi::Result<interp_amp_f64_t> amp_bar) {
   return calc_rfi_interp_transpose_cpu_impl_tmpl<ffi::C128, ffi::F64, double>(
       thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, amp,
-      phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
+      phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
       vis_bar, amp_bar);
 }
 

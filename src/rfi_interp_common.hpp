@@ -20,19 +20,21 @@
 //   amp        (n_ant, n_rfi, n_freq, n_time)  complex  the signal on the data grid
 //   phase      (n_ant, n_rfi, n_freq, n_time)  real     phase at the channel and cell
 //                                                       centre, reduced to one turn
-//   path       (n_ant, n_rfi, n_time, n_path)  real     path L (m) and its time
-//                                                       derivatives L_k (m/s^k),
-//                                                       relative to the array mean
+//   delay      (n_ant, n_rfi, n_time, n_path)  real     geometric delay tau (us) and
+//                                                       its time derivatives tau_k
+//                                                       (us/s^k), relative to the
+//                                                       array mean; phase = 2 pi f tau
 //   w_freq     (n_freq, n_sf, n_int_f)         real     interpolation weights across
 //   start_freq (n_freq,)                       int32    each channel, and the first
 //                                                       channel of each stencil
 //   w_time     (n_time, n_st, n_int_t)         real     the same across each cell
 //   start_time (n_time,)                       int32
 //   dnu        (n_int_f,)                      real     fine offsets from the channel
-//                                                       centre (Hz)
+//                                                       centre (MHz)
 //   dt         (n_int_t,)                      real     fine offsets from the cell
 //                                                       centre (s)
-//   freqs      (n_freq,)                       real     channel centres (Hz)
+//   freqs      (n_freq,)                       real     channel centres (MHz); MHz
+//                                                       times us is cycles
 //   pair       (n_ant, n_ant)                 int32    baseline index of (a1, a2), -1
 //                                                       where the list has none
 //   vis        (n_bl, n_freq, n_time)          complex
@@ -41,9 +43,9 @@
 //
 //   A[a]   = sum_k sum_l w_freq[f, k, u] w_time[t, l, v]
 //                        amp[a, r, start_freq[f] + k, start_time[t] + l]
-//   dL[a]  = sum_{k >= 1} path[a, r, t, k] dt[v]^k / k!
-//   phi[a] = phase[a, r, f, t]
-//            - (2 pi / c) ((freqs[f] + dnu[u]) dL[a] + dnu[u] path[a, r, t, 0])
+//   dtau[a] = sum_{k >= 1} delay[a, r, t, k] dt[v]^k / k!
+//   phi[a]  = phase[a, r, f, t]
+//             + 2 pi ((freqs[f] + dnu[u]) dtau[a] + dnu[u] delay[a, r, t, 0])
 //   S[a]   = A[a] exp(i phi[a])
 //   vis[bl, f, t] = mean_{u, v} sum_r S[a1[bl]] conj(S[a2[bl]])
 //
@@ -93,9 +95,8 @@ template <typename T> TAB_H_D inline Cplx<T> cscale(T s, Cplx<T> a) {
   return {s * a.re, s * a.im};
 }
 
-// 2 pi / c, c the speed of light in m/s as tabascal.interferometry has it.
-template <typename T> TAB_H_D constexpr T two_pi_over_c() {
-  return T(2.0958450219516816e-08L);
+template <typename T> TAB_H_D constexpr T two_pi_c() {
+  return T(6.283185307179586476925286766559005768L);
 }
 
 template <typename T> TAB_H_D inline void sincos_t(T x, T *s, T *c) {
@@ -134,28 +135,29 @@ TAB_H_D inline Cplx<T> interp_amp(Tensor4D<const Cplx<T> *, INT_T> amp,
 }
 
 // exp(i phi) of antenna `ant`, source `r` at fine sample (u, v) of cell (f, t):
-// the reduced centre phase plus the change across the cell (the path's Taylor
-// series in dt[v]) and across the channel (linear in dnu[u]). The centre phase
-// is never rebuilt here from path[..., 0]: in single precision that is a
-// million-turn product with no fraction of a turn left in it.
+// the reduced centre phase plus the change across the cell (the delay's
+// Taylor series in dt[v]) and across the channel (linear in dnu[u]), in MHz
+// times microseconds, which is cycles. The centre phase is never rebuilt here
+// from delay[..., 0]: in single precision that is a million-turn product with
+// no fraction of a turn left in it.
 template <typename T, typename INT_T>
 TAB_H_D inline Cplx<T> phase_factor(Tensor4D<const T *, INT_T> phase,
-                                     Tensor4D<const T *, INT_T> path,
+                                     Tensor4D<const T *, INT_T> delay,
                                      T freq_f, T dnu_u, T dt_v, INT_T ant,
                                      INT_T r, INT_T f, INT_T t) {
-  const INT_T n_path = path.shape[3];
+  const INT_T n_path = delay.shape[3];
   // Horner from the highest derivative down, each term divided by k!.
   T acc = 0;
   T inv_factorial = 1;
   for (INT_T k = 2; k < n_path; ++k) inv_factorial /= T(k);
   for (INT_T k = n_path - 1; k >= 1; --k) {
-    acc = acc * dt_v + path(ant, r, t, k) * inv_factorial;
+    acc = acc * dt_v + delay(ant, r, t, k) * inv_factorial;
     inv_factorial *= T(k);
   }
-  const T d_path = acc * dt_v;
-  const T phi = phase(ant, r, f, t) -
-                two_pi_over_c<T>() *
-                    ((freq_f + dnu_u) * d_path + dnu_u * path(ant, r, t, 0));
+  const T d_tau = acc * dt_v;
+  const T phi = phase(ant, r, f, t) +
+                two_pi_c<T>() *
+                    ((freq_f + dnu_u) * d_tau + dnu_u * delay(ant, r, t, 0));
   Cplx<T> e;
   sincos_t(phi, &e.im, &e.re);
   return e;
@@ -164,7 +166,7 @@ TAB_H_D inline Cplx<T> phase_factor(Tensor4D<const T *, INT_T> phase,
 template <ffi::DataType AMP_DT, ffi::DataType REAL_DT>
 bool interp_shapes_are_valid(
     interp_index_t a1, interp_index_t a2, ffi::Buffer<AMP_DT, 4> amp,
-    ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> path,
+    ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> delay,
     ffi::Buffer<REAL_DT, 3> w_freq, interp_index_t start_freq,
     ffi::Buffer<REAL_DT, 3> w_time, interp_index_t start_time,
     ffi::Buffer<REAL_DT, 1> dnu, ffi::Buffer<REAL_DT, 1> dt,
@@ -172,7 +174,7 @@ bool interp_shapes_are_valid(
   const auto a = amp.dimensions();
   const auto n_ant = a[0], n_rfi = a[1], n_freq = a[2], n_time = a[3];
   const auto p = phase.dimensions();
-  const auto l = path.dimensions();
+  const auto l = delay.dimensions();
   const auto wf = w_freq.dimensions();
   const auto wt = w_time.dimensions();
   return a1.dimensions()[0] == a2.dimensions()[0] &&

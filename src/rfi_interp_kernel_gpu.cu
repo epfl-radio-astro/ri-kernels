@@ -35,7 +35,7 @@ template <typename T, typename INT_T> struct InterpViews {
   Tensor1D<const int *, INT_T> a1, a2;
   Tensor2D<const int *, INT_T> pair;
   Tensor4D<const Cplx<T> *, INT_T> amp;
-  Tensor4D<const T *, INT_T> phase, path;
+  Tensor4D<const T *, INT_T> phase, delay;
   Tensor3D<const T *, INT_T> w_freq, w_time;
   Tensor1D<const int *, INT_T> start_freq, start_time;
   Tensor1D<const T *, INT_T> dnu, dt, freqs;
@@ -45,7 +45,7 @@ template <typename T, typename INT_T, ffi::DataType AMP_DT, ffi::DataType REAL_D
 InterpViews<T, INT_T> make_views(
     interp_index_t a1, interp_index_t a2, ffi::BufferR2<ffi::S32> pair,
     ffi::Buffer<AMP_DT, 4> amp, ffi::Buffer<REAL_DT, 4> phase,
-    ffi::Buffer<REAL_DT, 4> path, ffi::Buffer<REAL_DT, 3> w_freq,
+    ffi::Buffer<REAL_DT, 4> delay, ffi::Buffer<REAL_DT, 3> w_freq,
     interp_index_t start_freq, ffi::Buffer<REAL_DT, 3> w_time,
     interp_index_t start_time, ffi::Buffer<REAL_DT, 1> dnu,
     ffi::Buffer<REAL_DT, 1> dt, ffi::Buffer<REAL_DT, 1> freqs) {
@@ -57,9 +57,9 @@ InterpViews<T, INT_T> make_views(
       Tensor4D<const Cplx<T> *, INT_T>(
           reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1], a[2], a[3]),
       Tensor4D<const T *, INT_T>(phase.typed_data(), a[0], a[1], a[2], a[3]),
-      Tensor4D<const T *, INT_T>(path.typed_data(), path.dimensions()[0],
-                                 path.dimensions()[1], path.dimensions()[2],
-                                 path.dimensions()[3]),
+      Tensor4D<const T *, INT_T>(delay.typed_data(), delay.dimensions()[0],
+                                 delay.dimensions()[1], delay.dimensions()[2],
+                                 delay.dimensions()[3]),
       Tensor3D<const T *, INT_T>(w_freq.typed_data(), w_freq.dimensions()[0],
                                  w_freq.dimensions()[1], w_freq.dimensions()[2]),
       Tensor3D<const T *, INT_T>(w_time.typed_data(), w_time.dimensions()[0],
@@ -81,7 +81,7 @@ __device__ inline void staged_sample(
     INT_T n_int_f, INT_T n_int_t, T freq_f, INT_T a, INT_T r, INT_T f,
     INT_T t, INT_T s, Cplx<T> &S, Cplx<T> &dS) {
   const INT_T u = s / n_int_t, vv = s % n_int_t;
-  const auto e = phase_factor(v.phase, v.path, freq_f, v.dnu(u), v.dt(vv), a, r, f, t);
+  const auto e = phase_factor(v.phase, v.delay, freq_f, v.dnu(u), v.dt(vv), a, r, f, t);
   S = cmul(interp_amp(v.amp, wf, wt, sf, st, n_sf, n_st, n_int_f, n_int_t, a, r, u, vv), e);
   if constexpr (JVP) {
     dS = cmul(interp_amp(amp_dot, wf, wt, sf, st, n_sf, n_st, n_int_f, n_int_t, a, r, u, vv), e);
@@ -219,12 +219,12 @@ ffi::Error calc_rfi_interp_gpu_dispatch(
     cudaStream_t stream, interp_index_t a1, interp_index_t a2,
     ffi::BufferR2<ffi::S32> pair, ffi::Buffer<AMP_DT, 4> amp,
     ffi::Buffer<AMP_DT, 4> amp_dot, ffi::Buffer<REAL_DT, 4> phase,
-    ffi::Buffer<REAL_DT, 4> path, ffi::Buffer<REAL_DT, 3> w_freq,
+    ffi::Buffer<REAL_DT, 4> delay, ffi::Buffer<REAL_DT, 3> w_freq,
     interp_index_t start_freq, ffi::Buffer<REAL_DT, 3> w_time,
     interp_index_t start_time, ffi::Buffer<REAL_DT, 1> dnu,
     ffi::Buffer<REAL_DT, 1> dt, ffi::Buffer<REAL_DT, 1> freqs,
     ffi::Result<ffi::BufferR3<AMP_DT>> out) {
-  auto views = make_views<T, INT_T>(a1, a2, pair, amp, phase, path, w_freq, start_freq,
+  auto views = make_views<T, INT_T>(a1, a2, pair, amp, phase, delay, w_freq, start_freq,
                                     w_time, start_time, dnu, dt, freqs);
   const auto a = amp.dimensions();
   Tensor4D<const Cplx<T> *, INT_T> amp_dot_view(
@@ -258,15 +258,15 @@ ffi::Error calc_rfi_interp_gpu_impl_tmpl(
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
     interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair,
     ffi::Buffer<AMP_DT, 4> amp, ffi::Buffer<AMP_DT, 4> amp_dot,
-    ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> path,
+    ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> delay,
     ffi::Buffer<REAL_DT, 3> w_freq, interp_index_t start_freq,
     ffi::Buffer<REAL_DT, 3> w_time, interp_index_t start_time,
     ffi::Buffer<REAL_DT, 1> dnu, ffi::Buffer<REAL_DT, 1> dt,
     ffi::Buffer<REAL_DT, 1> freqs, ffi::Result<ffi::BufferR3<AMP_DT>> out) {
-  if (!interp_shapes_are_valid(a1, a2, amp, phase, path, w_freq, start_freq,
+  if (!interp_shapes_are_valid(a1, a2, amp, phase, delay, w_freq, start_freq,
                                w_time, start_time, dnu, dt, freqs))
     return ffi::Error::InvalidArgument(
-        "Incompatible signal, phase, path, table, or baseline shapes");
+        "Incompatible signal, phase, delay, table, or baseline shapes");
   if (pair.dimensions()[0] != amp.dimensions()[0] || pair.dimensions()[1] != amp.dimensions()[0])
     return ffi::Error::InvalidArgument("Expected an (n_ant, n_ant) pair table");
   if (JVP && !interp_same_shape(amp_dot, amp))
@@ -275,10 +275,10 @@ ffi::Error calc_rfi_interp_gpu_impl_tmpl(
   // use 32 bit indexing if possible
   if (amp.element_count() < limit && out->element_count() < limit)
     return calc_rfi_interp_gpu_dispatch<JVP, T, std::int32_t>(
-        stream, a1, a2, pair, amp, amp_dot, phase, path, w_freq, start_freq, w_time,
+        stream, a1, a2, pair, amp, amp_dot, phase, delay, w_freq, start_freq, w_time,
         start_time, dnu, dt, freqs, out);
   return calc_rfi_interp_gpu_dispatch<JVP, T, std::int64_t>(
-      stream, a1, a2, pair, amp, amp_dot, phase, path, w_freq, start_freq, w_time,
+      stream, a1, a2, pair, amp, amp_dot, phase, delay, w_freq, start_freq, w_time,
       start_time, dnu, dt, freqs, out);
 }
 
@@ -287,12 +287,12 @@ ffi::Error calc_rfi_interp_gpu_impl_tmpl(
       cudaStream_t stream, interp_index_t a1, interp_index_t a1_sorter,          \
       interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,      \
       interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, AMP_T amp DOT_PARAM, \
-      R4 phase, R4 path, R3 w_freq, interp_index_t start_freq, R3 w_time,        \
+      R4 phase, R4 delay, R3 w_freq, interp_index_t start_freq, R3 w_time,        \
       interp_index_t start_time, R1 dnu, R1 dt, R1 freqs,                        \
       ffi::Result<ffi::BufferR3<AMP_DT>> out) {                                  \
     return calc_rfi_interp_gpu_impl_tmpl<JVP, AMP_DT, REAL_DT, T>(               \
         stream, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, amp,     \
-        DOT_ARG, phase, path, w_freq, start_freq, w_time, start_time, dnu, dt,   \
+        DOT_ARG, phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt,   \
         freqs, out);                                                             \
   }
 

@@ -1,18 +1,18 @@
-"""RFI visibility primitive from the data grid: the signal, phase and path
-derivatives per data cell, the fine samples rebuilt inside the kernel.
+"""RFI visibility primitive from the data grid: the signal, phase and delay
+polynomial per data cell, the fine samples rebuilt inside the kernel.
 
 The operator computes, for one cell ``(f, t)``, fine sample ``(u, v)``,
 source ``r`` and antenna ``a``::
 
-    A[a]   = sum_k sum_l w_freq[f, k, u] w_time[t, l, v]
-                         amp[a, r, start_freq[f] + k, start_time[t] + l]
-    dL[a]  = sum_{k >= 1} path[a, r, t, k] dt[v]^k / k!
-    phi[a] = phase[a, r, f, t]
-             - (2 pi / c) ((freqs[f] + dnu[u]) dL[a] + dnu[u] path[a, r, t, 0])
+    A[a]    = sum_k sum_l w_freq[f, k, u] w_time[t, l, v]
+                          amp[a, r, start_freq[f] + k, start_time[t] + l]
+    dtau[a] = sum_{k >= 1} delay_us[a, r, t, k] dt[v]^k / k!
+    phi[a]  = phase[a, r, f, t]
+              + 2 pi ((freq_mhz[f] + dnu_mhz[u]) dtau[a] + dnu_mhz[u] delay_us[a, r, t, 0])
     S[a]   = A[a] exp(i phi[a])
     vis[bl, f, t] = mean_{u, v} sum_r S[a1[bl]] conj(S[a2[bl]])
 
-Only the signal ``amp`` is differentiated; the phase, the path and the tables
+Only the signal ``amp`` is differentiated; the phase, the delay and the tables
 are constants of the run, and :meth:`RFIInterpVisOp.eval` stops their
 gradients explicitly. The weights are data: the polynomial through the
 stencil, the conditional mean of a Gaussian process, or any other linear
@@ -72,7 +72,7 @@ class RFIInterpVisOp:
             self.a2, self.a2_sorter, self.a2_start, self.pair_index,
         )
 
-    def eval(self, amp, phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs):
+    def eval(self, amp, phase, delay_us, w_freq, start_freq, w_time, start_time, dnu_mhz, dt, freq_mhz):
         """Evaluate the visibilities, ``(n_bl, n_freq, n_time)``.
 
         Args:
@@ -81,21 +81,23 @@ class RFIInterpVisOp:
             phase: Real ``(n_ant, n_rfi, n_freq, n_time)``, the phase at the
                 channel and cell centre, reduced to one turn. Reduce it in
                 float64 before casting: the unreduced phase is ~1e6 turns and
-                the kernel never rebuilds it from ``path``.
-            path: Real ``(n_ant, n_rfi, n_time, n_path)``, the path (m) and its
-                time derivatives (m/s^k) at the cell centre, relative to the
-                array mean: a term common to every antenna cancels in a
-                baseline's phase difference, and the change of the full path
-                across a cell is ~1e4 wavelengths at orbital range rates, which
-                float32 cannot hold to a fraction of a turn.
+                the kernel never rebuilds it from ``delay_us``.
+            delay_us: Real ``(n_ant, n_rfi, n_time, n_path)``, the geometric
+                delay in microseconds and its time derivatives (us/s^k) at the
+                cell centre, with the sign that makes the phase ``2 pi f tau``,
+                relative to the array mean: a term common to every antenna
+                cancels in a baseline's phase difference, and the change of the
+                full delay across a cell is ~1e4 wavelengths at orbital range
+                rates, which float32 cannot hold to a fraction of a turn.
             w_freq, start_freq: Real ``(n_freq, n_sf, n_int_freq)`` and int32
                 ``(n_freq,)``, the interpolation weights across each channel
                 and the first channel of each channel's stencil.
             w_time, start_time: The same across each cell, ``(n_time, n_st,
                 n_int_time)`` and ``(n_time,)``.
-            dnu, dt: Real ``(n_int_freq,)`` and ``(n_int_time,)``, the fine
-                offsets from the channel centre (Hz) and the cell centre (s).
-            freqs: Real ``(n_freq,)``, the channel centres (Hz).
+            dnu_mhz, dt: Real ``(n_int_freq,)`` and ``(n_int_time,)``, the fine
+                offsets from the channel centre (MHz) and the cell centre (s).
+            freq_mhz: Real ``(n_freq,)``, the channel centres (MHz). MHz times
+                microseconds is cycles, so no scaling constant enters.
 
         Each cell's stencil must lie inside its axis and contain the cell:
         ``0 <= start[c] <= c < start[c] + n_stencil <= n_cells``. Precision has
@@ -104,8 +106,8 @@ class RFIInterpVisOp:
         stop = jax.lax.stop_gradient
         return rfi_interp_vis_op.bind(
             *self.indices,
-            amp, stop(phase), stop(path), stop(w_freq), start_freq,
-            stop(w_time), start_time, stop(dnu), stop(dt), stop(freqs),
+            amp, stop(phase), stop(delay_us), stop(w_freq), start_freq,
+            stop(w_time), start_time, stop(dnu_mhz), stop(dt), stop(freq_mhz),
         )
 
 
@@ -157,16 +159,16 @@ N_IDX = 7
 
 # The positional layout of the primal arguments after the index arrays.
 _ARRAY_NAMES = (
-    "amp", "phase", "path", "w_freq", "start_freq", "w_time", "start_time",
-    "dnu", "dt", "freqs",
+    "amp", "phase", "delay_us", "w_freq", "start_freq", "w_time", "start_time",
+    "dnu_mhz", "dt", "freq_mhz",
 )
 
 
-def _validate(amp, phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs):
+def _validate(amp, phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs):
     suffix = _dtype_suffix(amp.dtype, phase.dtype)
     real = jnp.dtype(phase.dtype)
-    for name, x in (("path", path), ("w_freq", w_freq), ("w_time", w_time),
-                    ("dnu", dnu), ("dt", dt), ("freqs", freqs)):
+    for name, x in (("delay_us", delay), ("w_freq", w_freq), ("w_time", w_time),
+                    ("dnu_mhz", dnu), ("dt", dt), ("freq_mhz", freqs)):
         if jnp.dtype(x.dtype) != real:
             raise TypeError(
                 f"RFI interp kernels require every real input to share the phase "
@@ -180,23 +182,23 @@ def _validate(amp, phase, path, w_freq, start_freq, w_time, start_time, dnu, dt,
     n_ant, n_rfi, n_freq, n_time = amp.shape
     expected = {
         "phase": amp.shape,
-        "path": (n_ant, n_rfi, n_time, path.shape[-1] if len(path.shape) == 4 else -1),
+        "delay_us": (n_ant, n_rfi, n_time, delay.shape[-1] if len(delay.shape) == 4 else -1),
         "w_freq": (n_freq, w_freq.shape[1] if len(w_freq.shape) == 3 else -1, len(dnu.shape) == 1 and dnu.shape[0]),
         "start_freq": (n_freq,),
         "w_time": (n_time, w_time.shape[1] if len(w_time.shape) == 3 else -1, len(dt.shape) == 1 and dt.shape[0]),
         "start_time": (n_time,),
-        "freqs": (n_freq,),
+        "freq_mhz": (n_freq,),
     }
-    got = {"phase": phase.shape, "path": path.shape, "w_freq": w_freq.shape,
+    got = {"phase": phase.shape, "delay_us": delay.shape, "w_freq": w_freq.shape,
            "start_freq": start_freq.shape, "w_time": w_time.shape,
-           "start_time": start_time.shape, "freqs": freqs.shape}
+           "start_time": start_time.shape, "freq_mhz": freqs.shape}
     for name, shape in expected.items():
         if tuple(got[name]) != tuple(shape):
             raise ValueError(f"Expected {name} shape {tuple(shape)}; got {tuple(got[name])}")
     if not (1 <= w_freq.shape[1] <= n_freq and 1 <= w_time.shape[1] <= n_time):
         raise ValueError("A stencil cannot be wider than its axis")
-    if path.shape[-1] < 1:
-        raise ValueError("path needs at least the path itself, (..., 1)")
+    if delay.shape[-1] < 1:
+        raise ValueError("delay_us needs at least the delay itself, (..., 1)")
     return suffix
 
 

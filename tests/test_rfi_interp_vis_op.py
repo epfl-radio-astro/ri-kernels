@@ -26,9 +26,6 @@ from ri_kernels.jax_api.rfi_interp_vis_op import (
 if _TAB_LIB_INTERP is None:
     pytest.skip("RFI interp FFI library is not built", allow_module_level=True)
 
-C_LIGHT = 299792458.0
-
-
 @pytest.fixture(params=[(jnp.float32, jnp.complex64), (jnp.float64, jnp.complex128)])
 def precision(request):
     real, complex_ = request.param
@@ -84,21 +81,21 @@ def make_inputs(real, complex_, seed=0, n_ant=5, n_rfi=2, n_freq=3, n_time=6,
     rng = np.random.default_rng(seed)
     int_time, chan_width = 2.0, 1e4
     dt = fine_offsets(n_int_t, int_time)
-    dnu = fine_offsets(n_int_f, chan_width)
-    freqs = 1.5e8 + chan_width * np.arange(n_freq)
+    dnu = fine_offsets(n_int_f, chan_width) / 1e6  # MHz
+    freqs = (1.5e8 + chan_width * np.arange(n_freq)) / 1e6  # MHz
     w_time, start_time = interp_tables(n_time, half_width, dt / int_time)
     w_freq, start_freq = interp_tables(n_freq, half_width, dnu / chan_width)
 
     shape = (n_ant, n_rfi, n_freq, n_time)
     amp = rng.normal(size=shape) + 1j * rng.normal(size=shape)
     phase = rng.uniform(-2 * np.pi, 0.0, size=shape)
-    # The path relative to the array mean, as tabascal's FixedOrbitCoarse
-    # writes it: a kilometre-scale array against a LEO satellite.
-    scales = [500.0, 20.0, 0.1, 1e-3, 1e-5, 1e-7][:n_path]
-    path = np.stack(
+    # The delay relative to the array mean, in microseconds, as tabascal's
+    # FixedOrbitCoarse writes it: a kilometre-scale array against a LEO satellite.
+    scales = [1.7, 0.07, 3e-4, 3e-6, 3e-8, 3e-10][:n_path]
+    delay = np.stack(
         [rng.normal(0.0, s, (n_ant, n_rfi, n_time)) for s in scales], axis=-1
     )
-    arrays = (amp, phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs)
+    arrays = (amp, phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs)
     out = []
     for x in arrays:
         if np.iscomplexobj(x):
@@ -122,8 +119,9 @@ def make_baselines(n_ant, shuffle=False, autocorr=True):
 
 # --- the reference -------------------------------------------------------------
 
-def reference(amp, phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs, a1, a2):
-    """The operator in plain JAX, one time cell at a time."""
+def reference(amp, phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs, a1, a2):
+    """The operator in plain JAX, one time cell at a time: delays in
+    microseconds, frequencies in MHz, their product in cycles."""
     n_ant, n_rfi, n_freq, n_time = amp.shape
     n_sf, n_st = w_freq.shape[1], w_time.shape[1]
     idx_freq = start_freq[:, None] + jnp.arange(n_sf)  # (n_freq, n_sf)
@@ -133,13 +131,13 @@ def reference(amp, phase, path, w_freq, start_freq, w_time, start_time, dnu, dt,
         stencil = jnp.take(amp, idx_time, axis=3)  # (n_ant, n_rfi, n_freq, n_st)
         stencil = jnp.take(stencil, idx_freq, axis=2)  # (n_ant, n_rfi, n_freq, n_sf, n_st)
         A = jnp.einsum("arfkl,fku,lv->arfuv", stencil, w_freq, w_time[t])
-        d_path = sum(
-            path[:, :, t, k, None] * dt**k / factorial(k) for k in range(1, path.shape[-1])
-        ) if path.shape[-1] > 1 else jnp.zeros(amp.shape[:2] + dt.shape, dt.dtype)
-        nu = freqs[:, None] + dnu[None, :]  # (n_freq, n_int_f)
-        phi = phase[..., t][..., None, None] - (2 * jnp.pi / C_LIGHT) * (
-            nu[None, None, :, :, None] * d_path[:, :, None, None, :]
-            + dnu[None, None, None, :, None] * path[:, :, t, 0][:, :, None, None, None]
+        d_tau = sum(
+            delay[:, :, t, k, None] * dt**k / factorial(k) for k in range(1, delay.shape[-1])
+        ) if delay.shape[-1] > 1 else jnp.zeros(amp.shape[:2] + dt.shape, dt.dtype)
+        nu = freqs[:, None] + dnu[None, :]  # (n_freq, n_int_f), MHz
+        phi = phase[..., t][..., None, None] + 2 * jnp.pi * (
+            nu[None, None, :, :, None] * d_tau[:, :, None, None, :]
+            + dnu[None, None, None, :, None] * delay[:, :, t, 0][:, :, None, None, None]
         )
         S = A * jnp.exp(1j * phi)
         product = S[a1] * jnp.conj(S[a2])  # (n_bl, n_rfi, n_freq, n_int_f, n_int_t)
@@ -247,7 +245,7 @@ def test_the_constants_get_zero_cotangents(precision, device):
     vis, pullback = jax.vjp(op.eval, *args)
     bars = pullback(jnp.ones_like(vis))
     assert float(jnp.abs(bars[0]).max()) > 0
-    for name, bar, x in zip(("phase", "path", "w_freq"), bars[1:4], args[1:4]):
+    for name, bar, x in zip(("phase", "delay_us", "w_freq"), bars[1:4], args[1:4]):
         np.testing.assert_array_equal(bar, jnp.zeros_like(x)), name
 
 
@@ -284,18 +282,18 @@ def test_rejects_incompatible_shapes_and_dtypes(precision):
     args = make_inputs(real, complex_)
     a1, a2 = make_baselines(args[0].shape[0])
     op = RFIInterpVisOp(args[0].shape[0], a1, a2)
-    amp, phase, path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs = args
+    amp, phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs = args
     with pytest.raises(ValueError, match="Expected phase shape"):
-        op.eval(amp, phase[..., :-1], path, w_freq, start_freq, w_time, start_time, dnu, dt, freqs)
+        op.eval(amp, phase[..., :-1], delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs)
     with pytest.raises(ValueError, match="Expected w_time shape"):
-        op.eval(amp, phase, path, w_freq, start_freq, w_time[..., :-1], start_time, dnu, dt, freqs)
-    with pytest.raises(ValueError, match="Expected path shape"):
-        op.eval(amp, phase, path[:, :, :-1], w_freq, start_freq, w_time, start_time, dnu, dt, freqs)
+        op.eval(amp, phase, delay, w_freq, start_freq, w_time[..., :-1], start_time, dnu, dt, freqs)
+    with pytest.raises(ValueError, match="Expected delay_us shape"):
+        op.eval(amp, phase, delay[:, :, :-1], w_freq, start_freq, w_time, start_time, dnu, dt, freqs)
     wrong_real = jnp.float64 if real == jnp.float32 else jnp.float32
     with pytest.raises(TypeError, match="share the phase dtype"):
-        op.eval(amp, phase, path.astype(wrong_real), w_freq, start_freq, w_time, start_time, dnu, dt, freqs)
+        op.eval(amp, phase, delay.astype(wrong_real), w_freq, start_freq, w_time, start_time, dnu, dt, freqs)
     with pytest.raises(TypeError, match="int32 start_time"):
-        op.eval(amp, phase, path, w_freq, start_freq, w_time, start_time.astype(jnp.int64), dnu, dt, freqs)
+        op.eval(amp, phase, delay, w_freq, start_freq, w_time, start_time.astype(jnp.int64), dnu, dt, freqs)
 
 
 def test_rejects_a_stencil_that_leaves_its_cell():
