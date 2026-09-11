@@ -20,7 +20,7 @@ namespace ffi = xla::ffi;
 // Value-type snapshot of the inputs: parallel_for runs the body after the
 // handler has returned, when the ffi::Buffer arguments are gone.
 template <typename T> struct InterpViews {
-  Tensor1D<const int *> a1, a2, stride;
+  Tensor1D<const int *> a1, a2;
   Tensor4D<const Cplx<T> *> amp;
   Tensor4D<const T *> phase, delay;
   Tensor3D<const T *> w_freq, w_time;
@@ -29,7 +29,7 @@ template <typename T> struct InterpViews {
 };
 
 template <typename T, ffi::DataType AMP_DT, ffi::DataType REAL_DT>
-InterpViews<T> make_views(interp_index_t a1, interp_index_t a2, interp_index_t stride,
+InterpViews<T> make_views(interp_index_t a1, interp_index_t a2,
                           ffi::Buffer<AMP_DT, 4> amp,
                           ffi::Buffer<REAL_DT, 4> phase,
                           ffi::Buffer<REAL_DT, 4> delay,
@@ -43,7 +43,6 @@ InterpViews<T> make_views(interp_index_t a1, interp_index_t a2, interp_index_t s
   return InterpViews<T>{
       Tensor1D<const int *>(a1.typed_data(), a1.dimensions()[0]),
       Tensor1D<const int *>(a2.typed_data(), a2.dimensions()[0]),
-      Tensor1D<const int *>(stride.typed_data(), stride.dimensions()[0]),
       Tensor4D<const Cplx<T> *>(
           reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1],
           a[2], a[3]),
@@ -76,11 +75,7 @@ void interp_rows(std::int64_t bl_begin, std::int64_t bl_end,
 
   for (std::int64_t bl = bl_begin; bl < bl_end; ++bl) {
     const std::int64_t ant1 = v.a1(bl), ant2 = v.a2(bl);
-    // Every st-th time sample of the cell, from st / 2, with every frequency
-    // sample: the mean is over those.
-    const std::int64_t bstride = v.stride(bl);
-    const std::int64_t count = stride_count(n_int_t, bstride);
-    const T scale = count > 0 ? T(1) / T(n_int_f * count) : T(0);
+    const T scale = T(1) / T(n_int_f * n_int_t);
     for (std::int64_t f = 0; f < n_freq; ++f) {
       const T *wf = &v.w_freq(f, 0, 0);
       const std::int64_t sf = v.start_freq(f);
@@ -91,7 +86,7 @@ void interp_rows(std::int64_t bl_begin, std::int64_t bl_end,
         Cplx<T> sum{0, 0};
         for (std::int64_t r = 0; r < n_rfi; ++r) {
           for (std::int64_t u = 0; u < n_int_f; ++u) {
-            for (std::int64_t vv = bstride / 2; vv < n_int_t; vv += bstride) {
+            for (std::int64_t vv = 0; vv < n_int_t; ++vv) {
               const T dnu_u = v.dnu(u), dt_v = v.dt(vv);
               const auto e1 = phase_factor(v.phase, v.delay, freq_f, dnu_u, dt_v, ant1, r, f, t);
               const auto e2 = phase_factor(v.phase, v.delay, freq_f, dnu_u, dt_v, ant2, r, f, t);
@@ -114,7 +109,7 @@ void interp_rows(std::int64_t bl_begin, std::int64_t bl_end,
 }
 
 template <typename T, ffi::DataType AMP_DT, ffi::DataType REAL_DT>
-ffi::Error check_inputs(interp_index_t a1, interp_index_t a2, interp_index_t stride,
+ffi::Error check_inputs(interp_index_t a1, interp_index_t a2,
                         ffi::Buffer<AMP_DT, 4> amp, ffi::Buffer<REAL_DT, 4> phase,
                         ffi::Buffer<REAL_DT, 4> delay, ffi::Buffer<REAL_DT, 3> w_freq,
                         interp_index_t start_freq, ffi::Buffer<REAL_DT, 3> w_time,
@@ -130,10 +125,6 @@ ffi::Error check_inputs(interp_index_t a1, interp_index_t a2, interp_index_t str
                                   w_time.dimensions()[1]))
     return ffi::Error::InvalidArgument(
         "Each cell's stencil must lie inside the axis and contain the cell");
-  if (stride.dimensions()[0] != a1.dimensions()[0] ||
-      !strides_are_valid(stride.typed_data(), a1.dimensions()[0], w_time.dimensions()[2]))
-    return ffi::Error::InvalidArgument(
-        "Expected one stride per baseline, between 1 and the time samples per cell");
   return ffi::Error::Success();
 }
 
@@ -141,7 +132,7 @@ template <bool JVP, ffi::DataType AMP_DT, ffi::DataType REAL_DT, typename T>
 ffi::Future calc_rfi_interp_cpu_impl_tmpl(
     ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
-    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, interp_index_t stride,
+    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair,
     ffi::BufferR2<ffi::S32> tile_pairs, ffi::Buffer<AMP_DT, 4> amp,
     ffi::Buffer<AMP_DT, 4> amp_dot, ffi::Buffer<REAL_DT, 4> phase,
     ffi::Buffer<REAL_DT, 4> delay, ffi::Buffer<REAL_DT, 3> w_freq,
@@ -149,14 +140,14 @@ ffi::Future calc_rfi_interp_cpu_impl_tmpl(
     interp_index_t start_time, ffi::Buffer<REAL_DT, 1> dnu,
     ffi::Buffer<REAL_DT, 1> dt, ffi::Buffer<REAL_DT, 1> freqs,
     ffi::Result<ffi::BufferR3<AMP_DT>> out) {
-  auto error = check_inputs<T>(a1, a2, stride, amp, phase, delay, w_freq, start_freq,
+  auto error = check_inputs<T>(a1, a2, amp, phase, delay, w_freq, start_freq,
                                w_time, start_time, dnu, dt, freqs);
   if (!error.success()) return completed_future(std::move(error));
   if (JVP && !interp_same_shape(amp_dot, amp))
     return completed_future(ffi::Error::InvalidArgument(
         "Expected the signal tangent to match the signal"));
 
-  auto views = make_views<T>(a1, a2, stride, amp, phase, delay, w_freq, start_freq,
+  auto views = make_views<T>(a1, a2, amp, phase, delay, w_freq, start_freq,
                              w_time, start_time, dnu, dt, freqs);
   const auto a = amp.dimensions();
   Tensor4D<const Cplx<T> *> amp_dot_view(
@@ -179,26 +170,26 @@ ffi::Future calc_rfi_interp_cpu_impl_tmpl(
 ffi::Future calc_rfi_interp_cpu_f32_impl(
     ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
-    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, interp_index_t stride, ffi::BufferR2<ffi::S32> tile_pairs, interp_amp_f32_t amp, interp_real4_f32_t phase,
+    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tile_pairs, interp_amp_f32_t amp, interp_real4_f32_t phase,
     interp_real4_f32_t delay, interp_real3_f32_t w_freq,
     interp_index_t start_freq, interp_real3_f32_t w_time,
     interp_index_t start_time, interp_real1_f32_t dnu, interp_real1_f32_t dt,
     interp_real1_f32_t freqs, ffi::Result<ffi::BufferR3<ffi::C64>> vis) {
   return calc_rfi_interp_cpu_impl_tmpl<false, ffi::C64, ffi::F32, float>(
-      thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, stride, tile_pairs, amp, amp,
+      thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, tile_pairs, amp, amp,
       phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs, vis);
 }
 
 ffi::Future calc_rfi_interp_cpu_f64_impl(
     ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
-    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, interp_index_t stride, ffi::BufferR2<ffi::S32> tile_pairs, interp_amp_f64_t amp, interp_real4_f64_t phase,
+    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tile_pairs, interp_amp_f64_t amp, interp_real4_f64_t phase,
     interp_real4_f64_t delay, interp_real3_f64_t w_freq,
     interp_index_t start_freq, interp_real3_f64_t w_time,
     interp_index_t start_time, interp_real1_f64_t dnu, interp_real1_f64_t dt,
     interp_real1_f64_t freqs, ffi::Result<ffi::BufferR3<ffi::C128>> vis) {
   return calc_rfi_interp_cpu_impl_tmpl<false, ffi::C128, ffi::F64, double>(
-      thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, stride, tile_pairs, amp, amp,
+      thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, tile_pairs, amp, amp,
       phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs, vis);
 }
 
@@ -207,14 +198,14 @@ ffi::Future calc_rfi_interp_cpu_f64_impl(
 ffi::Future calc_rfi_interp_jvp_cpu_f32_impl(
     ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
-    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, interp_index_t stride, ffi::BufferR2<ffi::S32> tile_pairs, interp_amp_f32_t amp, interp_amp_f32_t amp_dot,
+    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tile_pairs, interp_amp_f32_t amp, interp_amp_f32_t amp_dot,
     interp_real4_f32_t phase, interp_real4_f32_t delay,
     interp_real3_f32_t w_freq, interp_index_t start_freq,
     interp_real3_f32_t w_time, interp_index_t start_time,
     interp_real1_f32_t dnu, interp_real1_f32_t dt, interp_real1_f32_t freqs,
     ffi::Result<ffi::BufferR3<ffi::C64>> out) {
   return calc_rfi_interp_cpu_impl_tmpl<true, ffi::C64, ffi::F32, float>(
-      thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, stride, tile_pairs, amp,
+      thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, tile_pairs, amp,
       amp_dot, phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt,
       freqs, out);
 }
@@ -222,14 +213,14 @@ ffi::Future calc_rfi_interp_jvp_cpu_f32_impl(
 ffi::Future calc_rfi_interp_jvp_cpu_f64_impl(
     ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
-    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, interp_index_t stride, ffi::BufferR2<ffi::S32> tile_pairs, interp_amp_f64_t amp, interp_amp_f64_t amp_dot,
+    interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tile_pairs, interp_amp_f64_t amp, interp_amp_f64_t amp_dot,
     interp_real4_f64_t phase, interp_real4_f64_t delay,
     interp_real3_f64_t w_freq, interp_index_t start_freq,
     interp_real3_f64_t w_time, interp_index_t start_time,
     interp_real1_f64_t dnu, interp_real1_f64_t dt, interp_real1_f64_t freqs,
     ffi::Result<ffi::BufferR3<ffi::C128>> out) {
   return calc_rfi_interp_cpu_impl_tmpl<true, ffi::C128, ffi::F64, double>(
-      thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, stride, tile_pairs, amp,
+      thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, tile_pairs, amp,
       amp_dot, phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt,
       freqs, out);
 }
@@ -247,7 +238,7 @@ calc_rfi_interp_jvp_cpu_f64(XLA_FFI_CallFrame *call_frame);
 #define RI_INTERP_INDEX_ARGS                                                   \
   .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()           \
       .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()       \
-      .Arg<ffi::BufferR2<ffi::S32>>().Arg<interp_index_t>().Arg<ffi::BufferR2<ffi::S32>>()
+      .Arg<ffi::BufferR2<ffi::S32>>().Arg<ffi::BufferR2<ffi::S32>>()
 #define RI_INTERP_TABLE_ARGS(P)                                                \
   .Arg<interp_real4_##P##_t>().Arg<interp_real4_##P##_t>()                     \
       .Arg<interp_real3_##P##_t>().Arg<interp_index_t>()                       \

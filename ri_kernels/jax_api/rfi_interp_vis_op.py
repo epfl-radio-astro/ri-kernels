@@ -10,13 +10,10 @@ source ``r`` and antenna ``a``::
     phi[a]  = phase[a, r, f, t]
               + 2 pi ((freq_mhz[f] + dnu_mhz[u]) dtau[a] + dnu_mhz[u] delay_us[a, r, t, 0])
     S[a]   = A[a] exp(i phi[a])
-    vis[bl, f, t] = mean_{u, v in stride[bl]} sum_r S[a1[bl]] conj(S[a2[bl]])
+    vis[bl, f, t] = mean_{u, v} sum_r S[a1[bl]] conj(S[a2[bl]])
 
-where a baseline of stride ``s`` integrates the time samples ``v = s // 2,
-s // 2 + s, ...`` of each cell, with every frequency sample: the variable
-sampling of tabascal's ``RiemannVisVariable``, done inside the kernel from a
-per-baseline stride, so the slow baselines of an array cost a fraction of the
-fast ones.
+over every fine sample of the cell (variable sampling per baseline group is a
+matter of calling it per group with tables cut to the group's samples).
 
 Only the signal ``amp`` is differentiated; the phase, the delay and the tables
 are constants of the run, and :meth:`RFIInterpVisOp.eval` stops their
@@ -49,27 +46,22 @@ from .rfi_vis_op import (
 TILE = 32
 
 
-def tile_pair_list(n_ant, a1, a2, stride):
-    """The active antenna pairs of each unordered tile pair, sorted by stride.
+def tile_pair_list(n_ant, a1, a2):
+    """The antenna pairs the baseline list covers, per unordered tile pair.
 
     The staged GPU kernels give a block one pair of antenna tiles and its
-    threads the pairs within it; a thread works one pair's own subset of the
-    samples, so neighbouring threads must hold pairs of like stride or a warp
-    idles on the slow ones while it serves the fast. Row ``tp`` of the result,
-    for the unordered tile pair ``(I, J)`` with ``I <= J`` in the order
-    ``(0,0), (0,1), ..., (0,n-1), (1,1), ...``, lists the pairs the baseline
-    list holds in that tile pair as ``i_local * TILE + j_local + stride << 10``
-    (the pair's (I, J) ordering; within a tile paired with itself
-    ``i_local <= j_local``), sorted by descending stride and, within a stride,
-    along the tile's diagonals ``(j_local - i_local) % TILE``, so that the
-    pairs of consecutive threads have distinct antennas on both sides and
-    their scatter-adds do not collide. Padded with -1. Both orderings of a
-    pair share an entry when they share a stride and have one each otherwise.
-    Shape ``(n_tile_pairs, TILE * TILE)`` int32.
+    threads the pairs within it. Row ``tp`` of the result, for the unordered
+    tile pair ``(I, J)`` with ``I <= J`` in the order ``(0,0), (0,1), ...,
+    (0,n-1), (1,1), ...``, lists the pairs the baseline list holds in that
+    tile pair as ``i_local * TILE + j_local`` (the pair's (I, J) ordering;
+    within a tile paired with itself ``i_local <= j_local``), each once
+    whatever orderings the list holds, along the tile's diagonals
+    ``(j_local - i_local) % TILE``, padded with -1. Shape
+    ``(n_tile_pairs, TILE * TILE)`` int32.
     """
     n_tiles = (n_ant + TILE - 1) // TILE
     n_tile_pairs = n_tiles * (n_tiles + 1) // 2
-    rows = [[] for _ in range(n_tile_pairs)]
+    rows = [set() for _ in range(n_tile_pairs)]
     for b in range(len(a1)):
         p, q = int(a1[b]), int(a2[b])
         i, j = (p, q) if p // TILE <= q // TILE else (q, p)
@@ -78,21 +70,18 @@ def tile_pair_list(n_ant, a1, a2, stride):
         if I == J and il > jl:
             il, jl = jl, il
         tp = I * n_tiles - I * (I - 1) // 2 + (J - I)
-        rows[tp].append((-int(stride[b]), (jl - il) % TILE, il, jl))
+        rows[tp].add(((jl - il) % TILE, il, jl))
     out = np.full((n_tile_pairs, TILE * TILE), -1, dtype=np.int32)
     for tp, row in enumerate(rows):
-        row = sorted(set(row))
-        out[tp, : len(row)] = [il * TILE + jl + (-neg_stride << 10) for neg_stride, _, il, jl in row]
+        row = sorted(row)
+        out[tp, : len(row)] = [il * TILE + jl for _, il, jl in row]
     return out
 
 
 class RFIInterpVisOp:
     """Compute RFI visibilities from the data grid."""
 
-    def __init__(self, n_ant, a1, a2, stride=None):
-        """``stride``: int ``(n_bl,)``, every how-many-th time sample of a cell
-        baseline ``bl`` integrates (1, the default, is all of them). At least 1
-        and at most the time samples per cell, which the CPU kernels check."""
+    def __init__(self, n_ant, a1, a2):
         self.a1 = a1
         self.a2 = a2
         (
@@ -113,23 +102,14 @@ class RFIInterpVisOp:
             .at[jnp.asarray(a1), jnp.asarray(a2)]
             .set(jnp.arange(len(a1), dtype=jnp.int32))
         )
-        if stride is None:
-            stride = np.ones(len(a1), dtype=np.int32)
-        stride = np.asarray(stride)
-        if stride.shape != (len(a1),) or not np.issubdtype(stride.dtype, np.integer):
-            raise ValueError(f"RFIInterpVisOp needs one integer stride per baseline, got shape {stride.shape}")
-        if (stride < 1).any():
-            raise ValueError("RFIInterpVisOp strides must be at least 1")
-        self.stride = jnp.asarray(stride, dtype=jnp.int32)
-        self.tile_pairs = jnp.asarray(tile_pair_list(n_ant, np.asarray(a1), np.asarray(a2), stride))
+        self.tile_pairs = jnp.asarray(tile_pair_list(n_ant, np.asarray(a1), np.asarray(a2)))
 
     @property
     def indices(self):
         """The index arrays every primitive takes before the data arrays."""
         return (
             self.a1, self.a1_sorter, self.a1_start,
-            self.a2, self.a2_sorter, self.a2_start, self.pair_index, self.stride,
-            self.tile_pairs,
+            self.a2, self.a2_sorter, self.a2_start, self.pair_index, self.tile_pairs,
         )
 
 
@@ -215,8 +195,8 @@ def _check_interp_lib(platform):
 
 
 #: Index arrays every primitive takes first: a1, a1_sorter, a1_start, a2,
-#: a2_sorter, a2_start, pair_index, stride, tile_pairs.
-N_IDX = 9
+#: a2_sorter, a2_start, pair_index, tile_pairs.
+N_IDX = 8
 
 # The positional layout of the primal arguments after the index arrays.
 _ARRAY_NAMES = (
@@ -282,10 +262,7 @@ def _output_aval(a1, amp):
 
 def _validate_indices(args):
     """The shapes of the index arrays; their values the CPU kernels check."""
-    a1, pair, stride, tile_pairs = args[0], args[6], args[7], args[8]
-    n_bl = a1.shape[0]
-    if stride.shape != (n_bl,) or jnp.dtype(stride.dtype) != jnp.int32:
-        raise ValueError(f"Expected an int32 stride per baseline, ({n_bl},); got {stride.shape} {stride.dtype}")
+    a1, pair, tile_pairs = args[0], args[6], args[7]
     if jnp.dtype(pair.dtype) != jnp.int32 or len(pair.shape) != 2:
         raise ValueError(f"Expected an int32 (n_ant, n_ant) pair table; got {pair.shape} {pair.dtype}")
     if jnp.dtype(tile_pairs.dtype) != jnp.int32 or len(tile_pairs.shape) != 2 or tile_pairs.shape[1] != TILE * TILE:

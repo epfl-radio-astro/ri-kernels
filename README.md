@@ -117,20 +117,16 @@ memory.
 ```python
 from ri_kernels.jax_api import RFIInterpVisOp
 
-vis = RFIInterpVisOp(n_ant, a1, a2, stride=None).eval(
+vis = RFIInterpVisOp(n_ant, a1, a2).eval(
     amp, phase, delay_us, w_freq, start_freq, w_time, start_time, dnu_mhz, dt, freq_mhz
 )
 ```
 
-`stride`, int `(n_bl,)`, is every how-many-th time sample of a cell each
-baseline integrates, from sample `stride // 2` (1, the default, is all of
-them): the variable sampling of tabascal's `RiemannVisVariable`, done inside
-the kernel, so the slow baselines of an array cost a fraction of the fast ones.
-The constructor also builds, per pair of 32-antenna tiles, the list of the
-pairs the baselines cover there sorted by stride (`tile_pair_list`); the
-staged GPU kernels work a tile pair per block and walk that list, so that a
-warp's threads hold pairs of like stride and each pair visits only its own
-samples.
+The constructor builds, per pair of 32-antenna tiles, the list of the pairs
+the baselines cover there (`tile_pair_list`); the staged GPU kernels work a
+tile pair per block from the fine samples materialised once per cell.
+Variable sampling per baseline group is a matter of calling the operator per
+group with the time tables cut to the group's samples.
 
 - `amp`, complex `(n_ant, n_rfi, n_freq, n_time)`: the signal on the data
   grid, and the only differentiated input.
@@ -154,7 +150,7 @@ For one cell `(f, t)`, fine sample `(u, v)`, source `r` and antenna `a`:
 A[a]   = sum_k sum_l w_freq[f, k, u] w_time[t, l, v] amp[a, r, start_freq[f] + k, start_time[t] + l]
 dtau[a] = sum_{k >= 1} delay_us[a, r, t, k] dt[v]^k / k!
 phi[a]  = phase[a, r, f, t] + 2 pi ((freq_mhz[f] + dnu_mhz[u]) dtau[a] + dnu_mhz[u] delay_us[a, r, t, 0])
-vis[bl, f, t] = mean_{u, v in stride[bl]} sum_r A[a1] exp(i phi[a1]) conj(A[a2] exp(i phi[a2]))
+vis[bl, f, t] = mean_{u, v} sum_r A[a1] exp(i phi[a1]) conj(A[a2] exp(i phi[a2]))
 ```
 
 The weights are data. The polynomial through the stencil, the conditional mean

@@ -107,11 +107,6 @@ def make_inputs(real, complex_, seed=0, n_ant=5, n_rfi=2, n_freq=3, n_time=6,
     return out
 
 
-def make_strides(n_bl, n_int_t, seed=5):
-    """A stride per baseline, 1 to the samples per cell."""
-    return jnp.asarray(np.random.default_rng(seed).integers(1, n_int_t + 1, size=n_bl), dtype=jnp.int32)
-
-
 def make_baselines(n_ant, shuffle=False, autocorr=True):
     lo = 0 if autocorr else 1
     pairs = np.asarray(
@@ -124,19 +119,14 @@ def make_baselines(n_ant, shuffle=False, autocorr=True):
 
 # --- the reference -------------------------------------------------------------
 
-def reference(amp, phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs, a1, a2, stride=None):
+def reference(amp, phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs, a1, a2):
     """The operator in plain JAX, one time cell at a time: delays in
-    microseconds, frequencies in MHz, their product in cycles. A baseline of
-    stride s averages the time samples s // 2, s // 2 + s, ... only."""
+    microseconds, frequencies in MHz, their product in cycles."""
     n_ant, n_rfi, n_freq, n_time = amp.shape
     n_sf, n_st = w_freq.shape[1], w_time.shape[1]
     n_int_t = len(dt)
     idx_freq = start_freq[:, None] + jnp.arange(n_sf)  # (n_freq, n_sf)
-    if stride is None:
-        stride = jnp.ones(len(a1), dtype=jnp.int32)
-    v = jnp.arange(n_int_t)
-    takes = (v[None, :] >= stride[:, None] // 2) & ((v[None, :] - stride[:, None] // 2) % stride[:, None] == 0)
-    weight = takes.astype(amp.dtype) / (len(dnu) * takes.sum(axis=1, keepdims=True))  # (n_bl, n_int_t)
+    weight = jnp.full((len(a1), n_int_t), 1.0 / (len(dnu) * n_int_t), dtype=amp.dtype)  # (n_bl, n_int_t)
     cells = []
     for t in range(n_time):
         idx_time = start_time[t] + jnp.arange(n_st)
@@ -212,42 +202,6 @@ def test_eval_and_jit_match_reference(precision, shape, shuffle, device):
     expected = reference(*expected_args(args, real), a1, a2)
     assert_close(op.eval(*args), expected, real)
     assert_close(jax.jit(op.eval)(*args), expected, real)
-
-
-@pytest.mark.parametrize("shape", SHAPES.values(), ids=SHAPES.keys())
-def test_strided_baselines_match_reference(precision, shape, device):
-    """Each baseline integrates every stride-th time sample, and its own mean."""
-    real, complex_ = precision
-    args = make_inputs(real, complex_, **shape)
-    a1, a2 = make_baselines(args[0].shape[0], shuffle=True)
-    stride = make_strides(len(a1), len(args[8]))
-    op = RFIInterpVisOp(args[0].shape[0], a1, a2, stride=stride)
-    expected = reference(*expected_args(args, real), a1, a2, stride)
-    assert_close(op.eval(*args), expected, real)
-    amp_dot = make_inputs(real, complex_, seed=1, **shape)[0]
-    ref_args = expected_args(args, real)
-    _, tangent = jax.jvp(lambda a: op.eval(a, *args[1:]), (args[0],), (amp_dot,))
-    _, exp_t = jax.jvp(lambda a: reference(a, *ref_args[1:], a1, a2, stride), (ref_args[0],),
-                       (upcast(amp_dot) if real == jnp.float32 else amp_dot,))
-    assert_close(tangent, exp_t, real)
-    cot = jnp.ones((len(a1),) + args[0].shape[2:], dtype=complex_)
-    _, pullback = jax.vjp(lambda a: op.eval(a, *args[1:]), args[0])
-    _, ref_pullback = jax.vjp(lambda a: reference(a, *ref_args[1:], a1, a2, stride), ref_args[0])
-    assert_close(pullback(cot)[0], ref_pullback(upcast(cot) if real == jnp.float32 else cot)[0], real)
-
-
-def test_a_stride_that_leaves_no_sample_is_refused():
-    real, complex_ = jnp.float64, jnp.complex128
-    if not jax.config.jax_enable_x64:
-        pytest.skip("x64 is disabled")
-    args = make_inputs(real, complex_)
-    a1, a2 = make_baselines(args[0].shape[0])
-    with pytest.raises(ValueError, match="at least 1"):
-        RFIInterpVisOp(args[0].shape[0], a1, a2, stride=np.zeros(len(a1), dtype=np.int32))
-    op = RFIInterpVisOp(args[0].shape[0], a1, a2, stride=np.full(len(a1), len(args[8]) + 1, dtype=np.int32))
-    with jax.default_device(jax.devices("cpu")[0]):
-        with pytest.raises(Exception, match="between 1 and"):
-            jax.block_until_ready(op.eval(*args))
 
 
 @pytest.mark.parametrize("shape", SHAPES.values(), ids=SHAPES.keys())
@@ -391,13 +345,12 @@ def test_the_pair_table_indexes_the_baseline_list():
     assert (table >= 0).sum() == len(a1)
 
 
-def test_the_tile_pair_list_holds_each_pair_once_sorted_by_stride():
+def test_the_tile_pair_list_holds_each_pair_once():
     from ri_kernels.jax_api.rfi_interp_vis_op import TILE, tile_pair_list
 
     n_ant = 70  # three tiles, the last one partial
     a1, a2 = (np.asarray(x) for x in make_baselines(n_ant, shuffle=True))
-    stride = np.random.default_rng(5).integers(1, 7, size=len(a1)).astype(np.int32)
-    lst = tile_pair_list(n_ant, a1, a2, stride)
+    lst = tile_pair_list(n_ant, a1, a2)
     n_tiles = 3
     assert lst.shape == (n_tiles * (n_tiles + 1) // 2, TILE * TILE) and lst.dtype == np.int32
 
@@ -405,8 +358,6 @@ def test_the_tile_pair_list_holds_each_pair_once_sorted_by_stride():
     for tp, row in enumerate(lst):
         entries = row[row >= 0]
         assert (row[len(entries):] == -1).all(), "padding after the entries"
-        strides = entries >> 10
-        assert (np.diff(strides) <= 0).all(), "sorted by descending stride"
         I = 0
         rem = tp
         while rem >= n_tiles - I:
@@ -414,12 +365,12 @@ def test_the_tile_pair_list_holds_each_pair_once_sorted_by_stride():
             I += 1
         J = I + rem
         for e in entries:
-            i, j = I * TILE + (e & 1023) // TILE, J * TILE + (e & (TILE - 1))
+            i, j = I * TILE + e // TILE, J * TILE + e % TILE
             assert i < n_ant and j < n_ant
             if I == J:
                 assert i <= j
-            seen[(i, j, int(e >> 10))] = seen.get((i, j, int(e >> 10)), 0) + 1
-    assert all(n == 1 for n in seen.values()), "each (pair, stride) once"
-    expected = {(min(p, q), max(p, q), int(s)) if p // TILE == q // TILE else ((p, q, int(s)) if p // TILE < q // TILE else (q, p, int(s)))
-                for p, q, s in zip(a1, a2, stride)}
+            seen[(i, j)] = seen.get((i, j), 0) + 1
+    assert all(n == 1 for n in seen.values()), "each pair once"
+    expected = {(min(p, q), max(p, q)) if p // TILE == q // TILE else ((p, q) if p // TILE < q // TILE else (q, p))
+                for p, q in zip(a1, a2)}
     assert set(seen) == expected
