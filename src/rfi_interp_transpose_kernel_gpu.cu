@@ -31,6 +31,7 @@
 // within the 48 KB every device offers, whatever the stencil.
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <string>
 
@@ -47,6 +48,29 @@ namespace ffi = xla::ffi;
 
 namespace ri_kernels {
 namespace gpu {
+
+// How much scratch one call may take for the chunk it works on. The kernels
+// walk the time cells in chunks so that this bounds what they hold whatever
+// the problem size; a smaller budget is more chunks and a smaller peak.
+// RI_INTERP_SCRATCH_MB sets the default at build time and the environment
+// variable overrides it at run time, so a run can be fitted to a card without
+// rebuilding.
+#ifndef RI_INTERP_SCRATCH_MB
+#define RI_INTERP_SCRATCH_MB 256u
+#endif
+
+inline std::size_t interp_scratch_budget() {
+  static const std::size_t budget = [] {
+    std::size_t mb = RI_INTERP_SCRATCH_MB;
+    if (const char *env = std::getenv("RI_KERNELS_INTERP_SCRATCH_MB")) {
+      const long value = std::strtol(env, nullptr, 10);
+      if (value > 0) mb = std::size_t(value);
+    }
+    return mb * 1024u * 1024u;
+  }();
+
+  return budget;
+}
 
 constexpr int kTileT = 32;     // antennas per tile
 constexpr int kBlockT = 256;   // threads per block
@@ -335,7 +359,7 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
   // the samples and the phase factors) within 256 MB, at least one.
   const std::size_t per_cell_h = sizeof(Cplx<T>) * std::size_t(n_tile_pairs) * 2 * kTileT * n_rfi * n_freq * n_slots;
   const std::size_t per_cell_s = sizeof(Cplx<T>) * std::size_t(n_ant) * n_rfi * n_freq * n_s;
-  INT_T n_tc = INT_T((256u * 1024 * 1024) / (per_cell_h + 2 * per_cell_s));
+  INT_T n_tc = INT_T(interp_scratch_budget() / (per_cell_h + 2 * per_cell_s));
   if (n_tc < 1) n_tc = 1;
   if (n_tc > n_time) n_tc = n_time;
   auto h_mem = scratch.Allocate((per_cell_h + 2 * per_cell_s) * n_tc, alignof(Cplx<T>));
