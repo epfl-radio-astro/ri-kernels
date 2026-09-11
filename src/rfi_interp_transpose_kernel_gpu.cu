@@ -1,34 +1,42 @@
 // GPU transpose (VJP with respect to the data-grid signal) of the data-grid
-// RFI visibility, staged. See rfi_interp_transpose_kernel.cpp for the
-// formulas. Here they are arranged as the forward's mirror: for a pair of
-// antenna tiles (I, J) on one cell, with W the (kTile x kTile) matrix of the
-// tile pair's cotangent weights,
+// RFI visibility, staged. See rfi_interp_transpose_kernel.cpp for the formulas.
+//
+// A block owns one tile of kTile antennas, one cell and one source, and walks
+// every partner tile to build its own antennas' cotangent samples:
 //
 //   W[i, j] = (vbar[pair(i, j)] + conj(vbar[pair(j, i)])) / n_samples,
-//   Q_I[i](s) = E_i(s) sum_j W[i, j] conj(S_J[j](s)),
-//   Q_J[j](s) = E_j(s) sum_i conj(W[i, j]) conj(S_I[i](s)),
+//   G[i](s) = sum over every partner j of  W[i, j] conj(S[j](s)),
+//   Q[i](s) = E_i(s) G[i](s),
+//   H[i, kl] = sum_s w_freq[.., s] w_time[.., s] Q[i](s).
 //
-// two small dense products per source and chunk of samples, from the two
-// tiles' samples staged in shared memory and the phase factors E, followed
-// by the push of Q through the stencil weights onto a per-tile-pair partial
-// of the stencil cotangents H. The fine samples and phase factors of a chunk
-// of time cells are materialised first, once per cell and antenna
-// (rfi_interp_samples_gpu.cuh), so staging is contiguous loads. Every
-// element is owned by one thread: no atomics, and the result is
-// deterministic. The partials are chunked over time cells, and a gather
-// kernel sums each antenna's tile pairs and the cells whose stencils cover
-// a data-grid element, in a fixed order.
+// The partner tile that owns j does the mirror of this with W(J, I), which is
+// the conjugate transpose of W(I, J), so every baseline reaches both of its
+// antennas exactly once and no block writes another's antennas.
+//
+// Owning the output rather than the tile pair is what keeps this from growing
+// as the square of the antenna count. The phase factor and the stencil
+// contraction are applied once per antenna, not once per tile pair it appears
+// in, and the partials H carry an antenna axis rather than a tile-pair one:
+// (n_ant, n_rfi, n_freq, n_time_chunk, n_slots) instead of
+// (n_tile_pairs, 2, kTile, ...), smaller by a factor of n_tiles + 1 -- 162 MB
+// to 18 MB at 256 antennas, 32 sources and 32 channels. The gather then has no
+// tile-pair axis to sum over either.
+//
+// The fine samples and phase factors of a chunk of time cells are materialised
+// first, once per cell and antenna (rfi_interp_samples_gpu.cuh), so staging is
+// contiguous loads. Every element is owned by one thread: no atomics, and the
+// result is deterministic.
 //
 // The full variant adds the phase's and the delay's cotangents: per fine
-// sample phi_bar = Re(i S G) = -Im(S G) with G the cotangent factor before
-// the phase (see rfi_interp_transpose_kernel.cpp), summed over the cell's
-// samples for the phase and weighted by d phi / d delay[k] for the delay,
-// both carried as extra slots of the per-tile-pair partials and gathered
-// the same way (the delay's summed over the channels as well).
+// sample phi_bar = Re(i S G) = -Im(S G), summed over the cell's samples for
+// the phase and weighted by d phi / d delay[k] for the delay, both carried as
+// extra slots of the partials and gathered the same way (the delay's summed
+// over the channels as well).
 //
-// Shared memory: the cell's weight rows, W in both layouts (16 KB single),
-// the two staged tiles and the two Q tiles (the chunk is sized for 16 KB):
-// within the 48 KB every device offers, whatever the stencil.
+// Shared memory: the cell's weight rows, one partner's cotangent weights, the
+// own and partner sample tiles with the cotangent samples, and the cell's
+// partials for this source. The sample chunk shrinks until that fits what the
+// device will give a block.
 
 #include <algorithm>
 #include <cstdint>
@@ -89,10 +97,10 @@ template <typename T, typename INT_T> struct TransposeViews {
   Tensor3D<const Cplx<T> *, INT_T> vis_bar;
   // The chunk's materialised samples and phase factors (rfi_interp_samples_gpu.cuh).
   const Cplx<T> *S, *E;
-  // Per-tile-pair partials of the per-cell cotangents for the time cells of
-  // the current chunk, laid out (n_tile_pairs, 2 sides, kTileT, n_rfi,
-  // n_freq, n_time_chunk, n_slots): the n_sf * n_st stencil cotangents and,
-  // in the full variant, the phase's and the n_path delay cotangents after.
+  // The per-cell cotangents for the time cells of the current chunk, laid out
+  // (n_ant, n_rfi, n_freq, n_time_chunk, n_slots): the n_sf * n_st stencil
+  // cotangents and, in the full variant, the phase's and the n_path delay
+  // cotangents after them.
   Cplx<T> *H;
   Tensor4D<Cplx<T> *, INT_T> amp_bar;
   // The full variant's extra outputs; unset otherwise.
@@ -100,29 +108,14 @@ template <typename T, typename INT_T> struct TransposeViews {
 };
 
 template <typename INT_T>
-__device__ inline std::int64_t h_index(INT_T tp, INT_T side, INT_T a_local, INT_T r, INT_T f,
-                                       INT_T t_local, INT_T kl, INT_T n_rfi, INT_T n_freq,
-                                       INT_T n_tc, INT_T n_stencil) {
-  return (((((std::int64_t(tp) * 2 + side) * kTileT + a_local) * n_rfi + r) * n_freq + f) * n_tc + t_local) * n_stencil + kl;
-}
-
-// The unordered tile pair (I, J), I <= J, of a linear index, and back.
-template <typename INT_T>
-__device__ inline void tile_pair_of_t(INT_T tp, INT_T n_tiles, INT_T &I, INT_T &J) {
-  I = 0;
-  INT_T rem = tp;
-  while (rem >= n_tiles - I) { rem -= n_tiles - I; ++I; }
-  J = I + rem;
-}
-template <typename INT_T>
-__device__ inline INT_T tile_pair_index(INT_T I, INT_T J, INT_T n_tiles) {
-  return I * n_tiles - I * (I - 1) / 2 + (J - I);
+__device__ inline std::int64_t h_index(INT_T a, INT_T r, INT_T f, INT_T t_local, INT_T slot,
+                                       INT_T n_rfi, INT_T n_freq, INT_T n_tc, INT_T n_slots) {
+  return ((((std::int64_t(a) * n_rfi + r) * n_freq + f) * n_tc + t_local) * n_slots) + slot;
 }
 
 template <typename T, typename INT_T, bool FULL>
-__global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_pairs(
-    TransposeViews<T, INT_T> v, INT_T n_tiles, INT_T n_tile_pairs, INT_T t0, INT_T n_tc,
-    INT_T kChunk) {
+__global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_own(
+    TransposeViews<T, INT_T> v, INT_T n_tiles, INT_T t0, INT_T n_tc, INT_T kChunk) {
   extern __shared__ unsigned char dynamic_shared[];
 
   const INT_T n_ant = v.amp.shape[0], n_rfi = v.amp.shape[1];
@@ -137,127 +130,134 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_pairs(
   T *wf = reinterpret_cast<T *>(dynamic_shared);
   T *wt = wf + n_sf * n_int_f;
   const std::size_t head = (sizeof(T) * (n_sf * n_int_f + n_st * n_int_t) + 15) / 16 * 16;
-  Cplx<T> *Wp = reinterpret_cast<Cplx<T> *>(dynamic_shared + head);  // [i][j]
-  Cplx<T> *Wt = Wp + kTileT * kTileT;                                 // [j][i]
-  Cplx<T> *S_I = Wt + kTileT * kTileT;                                // [s][a]
-  Cplx<T> *S_J = S_I + kChunk * kTileT;
-  Cplx<T> *Q_I = S_J + kChunk * kTileT;
-  Cplx<T> *Q_J = Q_I + kChunk * kTileT;
-  T *P_I = reinterpret_cast<T *>(Q_J + kChunk * kTileT);  // [s][a]: -Im(S G), full variant
-  T *P_J = P_I + kChunk * kTileT;
+  Cplx<T> *W = reinterpret_cast<Cplx<T> *>(dynamic_shared + head);  // [j][i], one partner
+  Cplx<T> *S_own = W + kTileT * kTileT;                             // [s][a]
+  Cplx<T> *S_par = S_own + kChunk * kTileT;
+  Cplx<T> *G = S_par + kChunk * kTileT;                             // [s][i]
+  Cplx<T> *Hacc = G + kChunk * kTileT;                              // [slot][i]
+  T *P = reinterpret_cast<T *>(Hacc + kTileT * n_slots);            // [s][i], full variant
 
   const int tid = threadIdx.x;
+  const INT_T I = blockIdx.y;             // the tile of antennas this block owns
+  const INT_T r = blockIdx.z;             // and the source
 
-  for (INT_T tp = blockIdx.y; tp < n_tile_pairs; tp += gridDim.y) {
-    if (v.tile_pairs(tp, 0) < 0) continue;  // no baseline in this tile pair
-    INT_T I, J;
-    tile_pair_of_t(tp, n_tiles, I, J);
-    const bool same = I == J;
-    const INT_T n_sides = same ? 1 : 2;
+  for (INT_T cell = blockIdx.x; cell < n_freq * n_tc; cell += gridDim.x) {
+    const INT_T f = cell / n_tc, t_local = cell % n_tc, t = t0 + t_local;
+    const T freq_f = v.freqs(f);
+    __syncthreads();  // the previous cell is done with the shared arrays
+    for (INT_T i = tid; i < n_sf * n_int_f; i += kBlockT)
+      wf[i] = v.w_freq(f, i / n_int_f, i % n_int_f);
+    for (INT_T i = tid; i < n_st * n_int_t; i += kBlockT)
+      wt[i] = v.w_time(t, i / n_int_t, i % n_int_t);
+    for (INT_T idx = tid; idx < kTileT * n_slots; idx += kBlockT) Hacc[idx] = Cplx<T>{0, 0};
 
-    for (INT_T cell = blockIdx.x; cell < n_freq * n_tc; cell += gridDim.x) {
-      const INT_T f = cell / n_tc, t_local = cell % n_tc, t = t0 + t_local;
-      const T freq_f = v.freqs(f);
-      __syncthreads();  // the previous cell is done with the shared arrays
-      for (INT_T i = tid; i < n_sf * n_int_f; i += kBlockT)
-        wf[i] = v.w_freq(f, i / n_int_f, i % n_int_f);
-      for (INT_T i = tid; i < n_st * n_int_t; i += kBlockT)
-        wt[i] = v.w_time(t, i / n_int_t, i % n_int_t);
-      // The tile pair's cotangent weights: W[i, j] gathers the baseline that
-      // holds (i, j) in that order and the conjugate of the one holding (j, i);
-      // an autocorrelation is both, its cotangent plus the conjugate.
-      for (INT_T idx = tid; idx < kTileT * kTileT; idx += kBlockT) {
-        const INT_T i = idx / kTileT, j = idx % kTileT;
-        const INT_T a1 = I * kTileT + i, a2 = J * kTileT + j;
-        Cplx<T> w{0, 0};
-        if (a1 < n_ant && a2 < n_ant) {
-          const INT_T bl = v.pair(a1, a2);
-          if (bl >= 0) w = cadd(w, cscale(inv, v.vis_bar(bl, f, t)));
-          const INT_T bl2 = v.pair(a2, a1);
-          if (bl2 >= 0) w = cadd(w, cscale(inv, cconj(v.vis_bar(bl2, f, t))));
-        }
-        Wp[i * kTileT + j] = w;
-        Wt[j * kTileT + i] = w;
+    for (INT_T s0 = 0; s0 < n_s; s0 += kChunk) {
+      const INT_T cs = n_s - s0 < kChunk ? n_s - s0 : kChunk;
+      __syncthreads();  // the weights and the previous chunk's contraction
+      // The own tile's samples, and a clean G to accumulate the partners into.
+      for (INT_T idx = tid; idx < cs * kTileT; idx += kBlockT) {
+        const INT_T s_local = idx / kTileT, i_local = idx % kTileT;
+        const INT_T a = I * kTileT + i_local;
+        S_own[idx] = a < n_ant
+                         ? v.S[sample_index(f, t_local, r, s0 + s_local, a, n_tc, n_rfi, n_s, n_ant)]
+                         : Cplx<T>{0, 0};
+        G[idx] = Cplx<T>{0, 0};
       }
 
-      for (INT_T r = 0; r < n_rfi; ++r) {
-        for (INT_T s0 = 0; s0 < n_s; s0 += kChunk) {
-          const INT_T cs = n_s - s0 < kChunk ? n_s - s0 : kChunk;
-          __syncthreads();  // weights ready; the previous chunk's contraction done
+      for (INT_T J = 0; J < n_tiles; ++J) {
+        __syncthreads();  // the previous partner's W and samples are done with
+        // This partner's cotangent weights. Cheap beside the product below --
+        // one entry against kChunk sample products -- so rebuilding them per
+        // source and per chunk costs less than holding every partner's.
+        for (INT_T idx = tid; idx < kTileT * kTileT; idx += kBlockT) {
+          const INT_T i_local = idx / kTileT, j_local = idx % kTileT;
+          const INT_T a = I * kTileT + i_local, b = J * kTileT + j_local;
+          Cplx<T> w{0, 0};
+          if (a < n_ant && b < n_ant) {
+            const INT_T bl = v.pair(a, b);
+            if (bl >= 0) w = cadd(w, cscale(inv, v.vis_bar(bl, f, t)));
+            const INT_T bl2 = v.pair(b, a);
+            if (bl2 >= 0) w = cadd(w, cscale(inv, cconj(v.vis_bar(bl2, f, t))));
+          }
+          // Stored transposed, [j][i]: the product below has a thread per own
+          // antenna i and walks j, so this is what makes a warp's reads
+          // consecutive words rather than 32 apart in the same bank.
+          W[j_local * kTileT + i_local] = w;
+        }
+        if (J != I) {
           for (INT_T idx = tid; idx < cs * kTileT; idx += kBlockT) {
-            const INT_T s_local = idx / kTileT, a_local = idx % kTileT;
-            const INT_T s = s0 + s_local;
-            const INT_T a = I * kTileT + a_local;
-            S_I[idx] = a < n_ant ? v.S[sample_index(f, t_local, r, s, a, n_tc, n_rfi, n_s, n_ant)] : Cplx<T>{0, 0};
-            if (!same) {
-              const INT_T a2 = J * kTileT + a_local;
-              S_J[idx] = a2 < n_ant ? v.S[sample_index(f, t_local, r, s, a2, n_tc, n_rfi, n_s, n_ant)] : Cplx<T>{0, 0};
-            }
-          }
-          __syncthreads();
-          const Cplx<T> *TJ = same ? S_I : S_J;
-          // Q_I: lanes along i read W's transpose and broadcast the partner sample.
-          for (INT_T idx = tid; idx < cs * kTileT; idx += kBlockT) {
-            const INT_T s_local = idx / kTileT, i = idx % kTileT;
-            Cplx<T> acc{0, 0};
-            for (INT_T j = 0; j < kTileT; ++j)
-              acc = cadd(acc, cmul(Wt[j * kTileT + i], cconj(TJ[s_local * kTileT + j])));
-            const INT_T a = I * kTileT + i;
-            Q_I[idx] = a < n_ant ? cmul(v.E[sample_index(f, t_local, r, s0 + s_local, a, n_tc, n_rfi, n_s, n_ant)], acc)
-                                 : Cplx<T>{0, 0};
-            if constexpr (FULL) P_I[idx] = -cmul(S_I[idx], acc).im;
-          }
-          if (!same) {
-            for (INT_T idx = tid; idx < cs * kTileT; idx += kBlockT) {
-              const INT_T s_local = idx / kTileT, j = idx % kTileT;
-              Cplx<T> acc{0, 0};
-              for (INT_T i = 0; i < kTileT; ++i)
-                acc = cadd(acc, cmul(cconj(Wp[i * kTileT + j]), cconj(S_I[s_local * kTileT + i])));
-              const INT_T a2 = J * kTileT + j;
-              Q_J[idx] = a2 < n_ant ? cmul(v.E[sample_index(f, t_local, r, s0 + s_local, a2, n_tc, n_rfi, n_s, n_ant)], acc)
-                                    : Cplx<T>{0, 0};
-              if constexpr (FULL) P_J[idx] = -cmul(S_J[idx], acc).im;
-            }
-          }
-          __syncthreads();
-          // Push the chunk through the stencil weights onto the partial in
-          // scratch: one thread per element across the chunks.
-          for (INT_T idx = tid; idx < n_sides * kTileT * n_slots; idx += kBlockT) {
-            const INT_T a_local = idx % kTileT, rest = idx / kTileT;
-            const INT_T slot = rest % n_slots, side = rest / n_slots;
-            Cplx<T> h{0, 0};
-            if (slot < n_stencil) {
-              const INT_T kf = slot / n_st, kt = slot % n_st;
-              const Cplx<T> *Q = side ? Q_J : Q_I;
-              for (INT_T s_local = 0; s_local < cs; ++s_local) {
-                const INT_T s = s0 + s_local, vv = s / n_int_f, u = s % n_int_f;
-                h = cadd(h, cscale(wf[kf * n_int_f + u] * wt[kt * n_int_t + vv], Q[s_local * kTileT + a_local]));
-              }
-            } else if constexpr (FULL) {
-              // The phase's cotangent, then the delay's per polynomial order.
-              const T *P = side ? P_J : P_I;
-              const INT_T k = slot - n_stencil - 1;
-              for (INT_T s_local = 0; s_local < cs; ++s_local) {
-                const INT_T s = s0 + s_local, vv = s / n_int_f, u = s % n_int_f;
-                const T pc = P[s_local * kTileT + a_local];
-                h.re += k < 0 ? pc : delay_phase_coeff(k, freq_f, v.dnu(u), v.dt(vv)) * pc;
-              }
-            }
-            Cplx<T> &target = v.H[h_index(tp, side, a_local, r, f, t_local, slot, n_rfi, n_freq, n_tc, n_slots)];
-            target = s0 == 0 ? h : cadd(target, h);
+            const INT_T s_local = idx / kTileT, j_local = idx % kTileT;
+            const INT_T b = J * kTileT + j_local;
+            S_par[idx] = b < n_ant
+                             ? v.S[sample_index(f, t_local, r, s0 + s_local, b, n_tc, n_rfi, n_s, n_ant)]
+                             : Cplx<T>{0, 0};
           }
         }
+        __syncthreads();
+        const Cplx<T> *SJ = J == I ? S_own : S_par;
+        // G[i](s) += sum_j W[i, j] conj(S_J[j](s)).
+        for (INT_T idx = tid; idx < cs * kTileT; idx += kBlockT) {
+          const INT_T s_local = idx / kTileT, i_local = idx % kTileT;
+          Cplx<T> acc{0, 0};
+          for (INT_T j = 0; j < kTileT; ++j)
+            acc = cadd(acc, cmul(W[j * kTileT + i_local], cconj(SJ[s_local * kTileT + j])));
+          G[idx] = cadd(G[idx], acc);
+        }
       }
+
+      __syncthreads();
+      // G is complete for this chunk: turn it by the antenna's phase factor and
+      // push it through the stencil weights, once, onto the cell's partials.
+      for (INT_T idx = tid; idx < cs * kTileT; idx += kBlockT) {
+        const INT_T s_local = idx / kTileT, i_local = idx % kTileT;
+        const INT_T a = I * kTileT + i_local;
+        if (a >= n_ant) {
+          G[idx] = Cplx<T>{0, 0};
+          if constexpr (FULL) P[idx] = T(0);
+          continue;
+        }
+        const Cplx<T> e = v.E[sample_index(f, t_local, r, s0 + s_local, a, n_tc, n_rfi, n_s, n_ant)];
+        if constexpr (FULL) P[idx] = -cmul(S_own[idx], G[idx]).im;
+        G[idx] = cmul(e, G[idx]);
+      }
+      __syncthreads();
+      for (INT_T idx = tid; idx < kTileT * n_slots; idx += kBlockT) {
+        const INT_T i_local = idx % kTileT, slot = idx / kTileT;
+        Cplx<T> h{0, 0};
+        if (slot < n_stencil) {
+          const INT_T kf = slot / n_st, kt = slot % n_st;
+          for (INT_T s_local = 0; s_local < cs; ++s_local) {
+            const INT_T s = s0 + s_local, vv = s / n_int_f, u = s % n_int_f;
+            h = cadd(h, cscale(wf[kf * n_int_f + u] * wt[kt * n_int_t + vv], G[s_local * kTileT + i_local]));
+          }
+        } else if constexpr (FULL) {
+          const INT_T k = slot - n_stencil - 1;  // -1 is the phase, then the delay orders
+          for (INT_T s_local = 0; s_local < cs; ++s_local) {
+            const INT_T s = s0 + s_local, vv = s / n_int_f, u = s % n_int_f;
+            const T pc = P[s_local * kTileT + i_local];
+            h.re += k < 0 ? pc : delay_phase_coeff(k, freq_f, v.dnu(u), v.dt(vv)) * pc;
+          }
+        }
+        Hacc[idx] = cadd(Hacc[idx], h);
+      }
+    }
+
+    // The cell's partials for this antenna tile and source, written once.
+    __syncthreads();
+    for (INT_T idx = tid; idx < kTileT * n_slots; idx += kBlockT) {
+      const INT_T i_local = idx % kTileT, slot = idx / kTileT;
+      const INT_T a = I * kTileT + i_local;
+      if (a < n_ant)
+        v.H[h_index(a, r, f, t_local, slot, n_rfi, n_freq, n_tc, n_slots)] = Hacc[idx];
     }
   }
 }
 
-// Sum, per data-grid element, the partials of the antenna's tile pairs over
-// the chunk's cells whose stencils cover it. Every output element is written
-// by one thread per chunk, in a fixed order.
+// Sum, per data-grid element, the cells of the chunk whose stencils cover it.
+// Every output element is written by one thread per chunk, in a fixed order.
 template <typename T, typename INT_T>
 __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_gather(
-    TransposeViews<T, INT_T> v, INT_T n_tiles, INT_T t0, INT_T n_tc, INT_T n_slots) {
+    TransposeViews<T, INT_T> v, INT_T t0, INT_T n_tc, INT_T n_slots) {
   const INT_T n_ant = v.amp.shape[0], n_rfi = v.amp.shape[1];
   const INT_T n_freq = v.amp.shape[2], n_time = v.amp.shape[3];
   const INT_T n_sf = v.w_freq.shape[1], n_st = v.w_time.shape[1];
@@ -273,7 +273,6 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_gather(
     const INT_T q2 = q / n_freq;
     const INT_T r = q2 % n_rfi;
     const INT_T ant = q2 / n_rfi;
-    const INT_T Ia = ant / kTileT, a_local = ant % kTileT;
     Cplx<T> sum{0, 0};
     const INT_T f_lo = fp - n_sf + 1 > 0 ? fp - n_sf + 1 : 0;
     const INT_T f_hi = fp + n_sf < n_freq ? fp + n_sf : n_freq;
@@ -285,24 +284,18 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_gather(
       for (INT_T t = t_lo; t < t_hi; ++t) {
         const INT_T l = tpt - v.start_time(t);
         if (l < 0 || l >= n_st) continue;
-        for (INT_T Jb = 0; Jb < n_tiles; ++Jb) {
-          const INT_T tp = Jb >= Ia ? tile_pair_index(Ia, Jb, n_tiles) : tile_pair_index(Jb, Ia, n_tiles);
-          if (v.tile_pairs(tp, 0) < 0) continue;  // never written: no baseline there
-          const INT_T side = Jb >= Ia ? 0 : 1;
-          sum = cadd(sum, v.H[h_index(tp, side, a_local, r, f, t - t0, k * n_st + l, n_rfi, n_freq, n_tc, n_slots)]);
-        }
+        sum = cadd(sum, v.H[h_index(ant, r, f, t - t0, k * n_st + l, n_rfi, n_freq, n_tc, n_slots)]);
       }
     }
     v.amp_bar(ant, r, fp, tpt) = cadd(v.amp_bar(ant, r, fp, tpt), sum);
   }
 }
 
-// The full variant's phase and delay cotangents: per antenna, source and time
-// cell of the chunk, the phase's per channel from the cell's own slot, the
-// delay's summed over the channels, each over the antenna's tile pairs.
+// The full variant's phase and delay cotangents: the phase's is the cell's own
+// slot, the delay's are summed over the channels.
 template <typename T, typename INT_T>
 __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_gather_phase(
-    TransposeViews<T, INT_T> v, INT_T n_tiles, INT_T t0, INT_T n_tc, INT_T n_slots) {
+    TransposeViews<T, INT_T> v, INT_T t0, INT_T n_tc, INT_T n_slots) {
   const INT_T n_ant = v.amp.shape[0], n_rfi = v.amp.shape[1], n_freq = v.amp.shape[2];
   const INT_T n_sf = v.w_freq.shape[1], n_st = v.w_time.shape[1];
   const INT_T n_stencil = n_sf * n_st, n_path = v.delay.shape[3];
@@ -311,20 +304,13 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_gather_phase(
        i += INT_T(gridDim.x) * kBlockT) {
     const INT_T t_local = i % n_tc, q = i / n_tc;
     const INT_T r = q % n_rfi, ant = q / n_rfi;
-    const INT_T Ia = ant / kTileT, a_local = ant % kTileT;
     for (INT_T k = 0; k < n_path; ++k) v.delay_bar(ant, r, t0 + t_local, k) = 0;
     for (INT_T f = 0; f < n_freq; ++f) {
-      T phase_sum = 0;
-      for (INT_T Jb = 0; Jb < n_tiles; ++Jb) {
-        const INT_T tp = Jb >= Ia ? tile_pair_index(Ia, Jb, n_tiles) : tile_pair_index(Jb, Ia, n_tiles);
-        if (v.tile_pairs(tp, 0) < 0) continue;
-        const INT_T side = Jb >= Ia ? 0 : 1;
-        phase_sum += v.H[h_index(tp, side, a_local, r, f, t_local, n_stencil, n_rfi, n_freq, n_tc, n_slots)].re;
-        for (INT_T k = 0; k < n_path; ++k)
-          v.delay_bar(ant, r, t0 + t_local, k) +=
-              v.H[h_index(tp, side, a_local, r, f, t_local, n_stencil + 1 + k, n_rfi, n_freq, n_tc, n_slots)].re;
-      }
-      v.phase_bar(ant, r, f, t0 + t_local) = phase_sum;
+      v.phase_bar(ant, r, f, t0 + t_local) =
+          v.H[h_index(ant, r, f, t_local, n_stencil, n_rfi, n_freq, n_tc, n_slots)].re;
+      for (INT_T k = 0; k < n_path; ++k)
+        v.delay_bar(ant, r, t0 + t_local, k) +=
+            v.H[h_index(ant, r, f, t_local, n_stencil + 1 + k, n_rfi, n_freq, n_tc, n_slots)].re;
     }
   }
 }
@@ -349,18 +335,19 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
   const INT_T n_stencil = n_sf * n_st, n_s = n_int_f * n_int_t;
   const INT_T n_slots = FULL ? n_stencil + 1 + INT_T(dd[3]) : n_stencil;
   const INT_T n_tiles = (n_ant + kTileT - 1) / kTileT;
-  const INT_T n_tile_pairs = n_tiles * (n_tiles + 1) / 2;
 
-  // Shared memory: the cell's weight rows, the tile pair's cotangent weights in
-  // both layouts, and the staged tiles. Only the last is ours to size, so the
-  // chunk halves until the whole fits what the device will give a block -- 48 KB
-  // everywhere, more on a kernel that opts in. The weight rows grow with the
-  // stencil width and the samples per cell, so a long cell in double precision
-  // is what runs this out, and it does so before the tiles do.
+  // Shared memory, in the order the kernel lays it out: the cell's weight rows,
+  // one partner's cotangent weights and this source's partials, which are there
+  // whatever the chunk; then the own and partner sample tiles and the cotangent
+  // samples, which scale with it. The chunk halves until the whole fits what the
+  // device will give a block -- 48 KB everywhere, more on a kernel that opts in.
+  // The weight rows grow with the stencil width and the samples per cell, so a
+  // long cell in double precision is what runs this out.
   const std::size_t head = (sizeof(T) * (n_sf * n_int_f + n_st * n_int_t) + 15) / 16 * 16;
-  const std::size_t fixed = head + sizeof(Cplx<T>) * 2 * std::size_t(kTileT) * kTileT;
+  const std::size_t fixed = head + sizeof(Cplx<T>) * std::size_t(kTileT) * kTileT +
+                            sizeof(Cplx<T>) * std::size_t(kTileT) * std::size_t(n_slots);
   const std::size_t per_sample =
-      sizeof(Cplx<T>) * 4 * std::size_t(kTileT) + (FULL ? sizeof(T) * 2 * std::size_t(kTileT) : 0);
+      sizeof(Cplx<T>) * 3 * std::size_t(kTileT) + (FULL ? sizeof(T) * std::size_t(kTileT) : 0);
   const std::size_t shared_limit = max_dynamic_shared_bytes();
   std::int64_t kChunk = ChunkT<T>::value;
   while (kChunk > 1 && fixed + per_sample * std::size_t(kChunk) > shared_limit) kChunk /= 2;
@@ -373,7 +360,7 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
         std::to_string(head) + " of that and grow with the stencil width and the samples per cell, "
         "so a shorter cell, a narrower stencil or single precision will fit.");
   if (shared > 48 * 1024) {
-    const auto attr = cudaFuncSetAttribute(rfi_interp_transpose_pairs<T, INT_T, FULL>,
+    const auto attr = cudaFuncSetAttribute(rfi_interp_transpose_own<T, INT_T, FULL>,
                                            cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared));
     if (attr != cudaSuccess)
       return ffi::Error::Internal(std::string("Could not raise the shared memory limit to ") +
@@ -382,7 +369,7 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
 
   // Time chunk: as many cells as keep the scratch (the per-tile-pair partials,
   // the samples and the phase factors) within 256 MB, at least one.
-  const std::size_t per_cell_h = sizeof(Cplx<T>) * std::size_t(n_tile_pairs) * 2 * kTileT * n_rfi * n_freq * n_slots;
+  const std::size_t per_cell_h = sizeof(Cplx<T>) * std::size_t(n_ant) * n_rfi * n_freq * n_slots;
   const std::size_t per_cell_s = sizeof(Cplx<T>) * std::size_t(n_ant) * n_rfi * n_freq * n_s;
   INT_T n_tc = INT_T(interp_scratch_budget() / (per_cell_h + 2 * per_cell_s));
   if (n_tc < 1) n_tc = 1;
@@ -439,23 +426,25 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
     status = cudaGetLastError();
     if (status != cudaSuccess)
       return ffi::Error::Internal(std::string("GPU kernel launch error: ") + cudaGetErrorString(status));
-    const auto grid = create_clamped_grid(n_freq * cells, n_tile_pairs, 1);
-    rfi_interp_transpose_pairs<T, INT_T, FULL><<<grid, kBlockT, shared, stream>>>(
-        views, n_tiles, n_tile_pairs, t0, cells, INT_T(kChunk));
+    // A block per (cell, own tile, source): the source axis keeps the grid wide
+    // where the tile count alone would not, small arrays having few tiles.
+    const auto grid = create_clamped_grid(n_freq * cells, int(n_tiles), int(n_rfi));
+    rfi_interp_transpose_own<T, INT_T, FULL><<<grid, kBlockT, shared, stream>>>(
+        views, n_tiles, t0, cells, INT_T(kChunk));
     status = cudaGetLastError();
     if (status != cudaSuccess)
       return ffi::Error::Internal(std::string("GPU kernel launch error: ") + cudaGetErrorString(status));
     const std::int64_t reach = std::int64_t(cells) + 2 * (n_st - 1);
     const std::int64_t n_out = std::int64_t(n_ant) * n_rfi * n_freq * reach;
     const auto gather_grid = create_clamped_grid(int((n_out + kBlockT - 1) / kBlockT), 1, 1);
-    rfi_interp_transpose_gather<T, INT_T><<<gather_grid, kBlockT, 0, stream>>>(views, n_tiles, t0, cells, n_slots);
+    rfi_interp_transpose_gather<T, INT_T><<<gather_grid, kBlockT, 0, stream>>>(views, t0, cells, n_slots);
     status = cudaGetLastError();
     if (status != cudaSuccess)
       return ffi::Error::Internal(std::string("GPU kernel launch error: ") + cudaGetErrorString(status));
     if constexpr (FULL) {
       const std::int64_t n_cells_out = std::int64_t(n_ant) * n_rfi * cells;
       const auto phase_grid = create_clamped_grid(int((n_cells_out + kBlockT - 1) / kBlockT), 1, 1);
-      rfi_interp_transpose_gather_phase<T, INT_T><<<phase_grid, kBlockT, 0, stream>>>(views, n_tiles, t0, cells, n_slots);
+      rfi_interp_transpose_gather_phase<T, INT_T><<<phase_grid, kBlockT, 0, stream>>>(views, t0, cells, n_slots);
       status = cudaGetLastError();
       if (status != cudaSuccess)
         return ffi::Error::Internal(std::string("GPU kernel launch error: ") + cudaGetErrorString(status));
