@@ -51,8 +51,9 @@
 //
 // The fine samples are enumerated time-major, s = v * n_int_f + u.
 //
-// Only amp is differentiated. The result is bilinear in S and S is linear in
-// amp, so the JVP is B(dS, S) + B(S, dS) with dS the tangent pushed through the
+// The result is bilinear in S. S is linear in amp and, through exp(i phi),
+// depends on phase and delay with dS = i dphi S, dphi the phase formula on
+// their tangents. The JVP is B(dS, S) + B(S, dS) with dS the tangent pushed through the
 // same interpolation and phase factor, and the transpose scatters the
 // visibility cotangent back to each antenna's fine samples, multiplies by that
 // antenna's phase factor and contracts with the weight tables, one stencil per
@@ -83,6 +84,11 @@ using interp_index_t = ffi::BufferR1<ffi::S32>;
 template <typename T> struct Cplx {
   T re, im;
 };
+
+// i * a
+template <typename T> TAB_H_D inline Cplx<T> ctimes_i(Cplx<T> a) {
+  return {-a.im, a.re};
+}
 
 template <typename T> TAB_H_D inline Cplx<T> cadd(Cplx<T> a, Cplx<T> b) {
   return {a.re + b.re, a.im + b.im};
@@ -136,17 +142,17 @@ TAB_H_D inline Cplx<T> interp_amp(Tensor4D<const Cplx<T> *, INT_T> amp,
   return a;
 }
 
-// exp(i phi) of antenna `ant`, source `r` at fine sample (u, v) of cell (f, t):
-// the reduced centre phase plus the change across the cell (the delay's
-// Taylor series in dt[v]) and across the channel (linear in dnu[u]), in MHz
-// times microseconds, which is cycles. The centre phase is never rebuilt here
-// from delay[..., 0]: in single precision that is a million-turn product with
-// no fraction of a turn left in it.
-template <typename T, typename INT_T>
-TAB_H_D inline Cplx<T> phase_factor(Tensor4D<const T *, INT_T> phase,
-                                     Tensor4D<const T *, INT_T> delay,
-                                     T freq_f, T dnu_u, T dt_v, INT_T ant,
-                                     INT_T r, INT_T f, INT_T t) {
+// The phase phi of antenna `ant`, source `r` at fine sample (u, v) of cell
+// (f, t): the reduced centre phase plus the change across the cell (the
+// delay's Taylor series in dt[v]) and across the channel (linear in dnu[u]),
+// in MHz times microseconds, which is cycles. The centre phase is never
+// rebuilt here from delay[..., 0]: in single precision that is a million-turn
+// product with no fractional turn left. Linear in (phase, delay), so called
+// on their tangents it is the phase's tangent.
+template <typename T, typename INT_T = std::int64_t>
+TAB_H_D inline T phase_value(Tensor4D<const T *, INT_T> phase,
+                             Tensor4D<const T *, INT_T> delay, T freq_f, T dnu_u,
+                             T dt_v, INT_T ant, INT_T r, INT_T f, INT_T t) {
   const INT_T n_path = delay.shape[3];
   // Horner from the highest derivative down, each term divided by k!.
   T acc = 0;
@@ -157,9 +163,27 @@ TAB_H_D inline Cplx<T> phase_factor(Tensor4D<const T *, INT_T> phase,
     inv_factorial *= T(k);
   }
   const T d_tau = acc * dt_v;
-  const T phi = phase(ant, r, f, t) +
-                two_pi_c<T>() *
-                    ((freq_f + dnu_u) * d_tau + dnu_u * delay(ant, r, t, 0));
+  return phase(ant, r, f, t) +
+         two_pi_c<T>() * ((freq_f + dnu_u) * d_tau + dnu_u * delay(ant, r, t, 0));
+}
+
+// d phi / d delay[..., k] at fine sample (u, v): the delay itself enters
+// through the channel offset only, the derivatives through the cell offset.
+template <typename T, typename INT_T = std::int64_t>
+TAB_H_D inline T delay_phase_coeff(INT_T k, T freq_f, T dnu_u, T dt_v) {
+  if (k == 0) return two_pi_c<T>() * dnu_u;
+  T term = dt_v;
+  for (INT_T j = 2; j <= k; ++j) term *= dt_v / T(j);
+  return two_pi_c<T>() * (freq_f + dnu_u) * term;
+}
+
+// exp(i phi) at the same sample.
+template <typename T, typename INT_T = std::int64_t>
+TAB_H_D inline Cplx<T> phase_factor(Tensor4D<const T *, INT_T> phase,
+                                     Tensor4D<const T *, INT_T> delay,
+                                     T freq_f, T dnu_u, T dt_v, INT_T ant,
+                                     INT_T r, INT_T f, INT_T t) {
+  const T phi = phase_value(phase, delay, freq_f, dnu_u, dt_v, ant, r, f, t);
   Cplx<T> e;
   sincos_t(phi, &e.im, &e.re);
   return e;

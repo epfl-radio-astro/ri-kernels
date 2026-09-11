@@ -128,8 +128,19 @@ tile pair per block from the fine samples materialised once per cell.
 Variable sampling per baseline group is a matter of calling the operator per
 group with the time tables cut to the group's samples.
 
+The operator differentiates the signal, the phase and the delay polynomial,
+and carries two kernel pairs for it: a JVP and transpose for the signal
+alone, and a full pair that takes the phase and delay tangents as well
+(`dS = i dphi S`) and returns their cotangents (per fine sample
+`-Im(S G)`, `G` the cotangent factor before the phase; summed over the
+cell's samples for the phase, weighted by `d phi / d delay[k]` for the
+delay). The JVP rule binds the signal-only pair whenever the phase and delay
+tangents are symbolic zeros, a fixed orbit with nothing learnable upstream
+of them, so such a run computes no phase derivative; a fitted trajectory
+gets the full pair without a switch.
+
 - `amp`, complex `(n_ant, n_rfi, n_freq, n_time)`: the signal on the data
-  grid, and the only differentiated input.
+  grid. Differentiated, as are `phase` and `delay_us`.
 - `phase`, real `(n_ant, n_rfi, n_freq, n_time)`: the phase at the channel and
   cell centre, reduced to one turn (in float64, before casting).
 - `delay_us`, real `(n_ant, n_rfi, n_time, n_path)`: the geometric delay in

@@ -42,9 +42,17 @@ template <typename T> struct TransposeViews {
   Tensor1D<const T *> dnu, dt, freqs;
   Tensor3D<const Cplx<T> *> vis_bar;
   Tensor4D<Cplx<T> *> amp_bar;
+  // The full transpose's extra outputs; unset views otherwise.
+  Tensor4D<T *> phase_bar, delay_bar;
 };
 
-template <typename T>
+// The cotangent of the phase at one fine sample, from that sample S and the
+// cotangent G of the sample's conjugate-free factor (see the loop below):
+// d vis / d phi = i S conj(S_other), and the transpose of a real input takes
+// the real part, so phi_bar = Re(i S G) = -Im(S G). Summed over the cell's
+// samples it is the phase's cotangent, weighted by d phi / d delay[k] the
+// delay's.
+template <typename T, bool FULL>
 void transpose_antennas(std::int64_t ant_begin, std::int64_t ant_end,
                         TransposeViews<T> v) {
   const std::int64_t n_ant = v.amp.shape[0], n_rfi = v.amp.shape[1];
@@ -63,7 +71,13 @@ void transpose_antennas(std::int64_t ant_begin, std::int64_t ant_end,
     return H[kl + n_stencil * (t + n_time * (f + n_freq * r))];
   };
 
+  const std::int64_t n_path = v.delay.shape[3];
   for (std::int64_t ant = ant_begin; ant < ant_end; ++ant) {
+    if constexpr (FULL) {
+      for (std::int64_t r = 0; r < n_rfi; ++r)
+        for (std::int64_t t = 0; t < n_time; ++t)
+          for (std::int64_t k = 0; k < n_path; ++k) v.delay_bar(ant, r, t, k) = 0;
+    }
     const std::int64_t first = v.a1_start(ant);
     const std::int64_t first_end = ant == n_ant - 1 ? n_bl : v.a1_start(ant + 1);
     const std::int64_t second = v.a2_start(ant);
@@ -80,6 +94,7 @@ void transpose_antennas(std::int64_t ant_begin, std::int64_t ant_end,
 
           // Q(u, v): the cotangent of this antenna's fine samples, times its
           // own phase factor.
+          T phase_cot = 0;
           for (std::int64_t u = 0; u < n_int_f; ++u) {
             for (std::int64_t vv = 0; vv < n_int_t; ++vv) {
               const T dnu_u = v.dnu(u), dt_v = v.dt(vv);
@@ -98,8 +113,16 @@ void transpose_antennas(std::int64_t ant_begin, std::int64_t ant_end,
               }
               const auto e = phase_factor(v.phase, v.delay, freq_f, dnu_u, dt_v, ant, r, f, t);
               Q[u * n_int_t + vv] = cmul(e, g);
+              if constexpr (FULL) {
+                const auto s_own = cmul(interp_amp(v.amp, wf, wt, sf, st, n_sf, n_st, n_int_f, n_int_t, ant, r, u, vv), e);
+                const T pc = -cmul(s_own, g).im;
+                phase_cot += pc;
+                for (std::int64_t k = 0; k < n_path; ++k)
+                  v.delay_bar(ant, r, t, k) += delay_phase_coeff(k, freq_f, dnu_u, dt_v) * pc;
+              }
             }
           }
+          if constexpr (FULL) v.phase_bar(ant, r, f, t) = phase_cot;
 
           // The stencil's cotangents: Q pushed back through the weights.
           for (std::int64_t k = 0; k < n_sf; ++k) {
@@ -141,7 +164,7 @@ void transpose_antennas(std::int64_t ant_begin, std::int64_t ant_end,
   }
 }
 
-template <ffi::DataType AMP_DT, ffi::DataType REAL_DT, typename T>
+template <bool FULL, ffi::DataType AMP_DT, ffi::DataType REAL_DT, typename T>
 ffi::Future calc_rfi_interp_transpose_cpu_impl_tmpl(
     ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
@@ -152,7 +175,9 @@ ffi::Future calc_rfi_interp_transpose_cpu_impl_tmpl(
     ffi::Buffer<REAL_DT, 3> w_time, interp_index_t start_time,
     ffi::Buffer<REAL_DT, 1> dnu, ffi::Buffer<REAL_DT, 1> dt,
     ffi::Buffer<REAL_DT, 1> freqs, ffi::BufferR3<AMP_DT> vis_bar,
-    ffi::Result<ffi::Buffer<AMP_DT, 4>> amp_bar) {
+    ffi::Result<ffi::Buffer<AMP_DT, 4>> amp_bar,
+    ffi::Result<ffi::Buffer<REAL_DT, 4>> *phase_bar,
+    ffi::Result<ffi::Buffer<REAL_DT, 4>> *delay_bar) {
   if (!interp_shapes_are_valid(a1, a2, amp, phase, delay, w_freq, start_freq,
                                w_time, start_time, dnu, dt, freqs))
     return completed_future(ffi::Error::InvalidArgument(
@@ -172,6 +197,9 @@ ffi::Future calc_rfi_interp_transpose_cpu_impl_tmpl(
   if (!interp_same_shape(*amp_bar, amp))
     return completed_future(ffi::Error::InvalidArgument(
         "Expected the signal cotangent to match the signal"));
+  if (FULL && !(interp_same_shape(**phase_bar, phase) && interp_same_shape(**delay_bar, delay)))
+    return completed_future(ffi::Error::InvalidArgument(
+        "Expected the phase and delay cotangents to match the phase and delay"));
 
   const auto a = amp.dimensions();
   TransposeViews<T> views{
@@ -203,10 +231,13 @@ ffi::Future calc_rfi_interp_transpose_cpu_impl_tmpl(
           vis_bar.dimensions()[2]),
       Tensor4D<Cplx<T> *>(reinterpret_cast<Cplx<T> *>(amp_bar->typed_data()),
                           a[0], a[1], a[2], a[3]),
+      Tensor4D<T *>(FULL ? (*phase_bar)->typed_data() : nullptr, a[0], a[1], a[2], a[3]),
+      Tensor4D<T *>(FULL ? (*delay_bar)->typed_data() : nullptr, delay.dimensions()[0],
+                    delay.dimensions()[1], delay.dimensions()[2], delay.dimensions()[3]),
   };
   return parallel_for(thread_pool, a[0],
                       [views](std::int64_t begin, std::int64_t end) mutable {
-                        transpose_antennas<T>(begin, end, views);
+                        transpose_antennas<T, FULL>(begin, end, views);
                       });
 }
 
@@ -219,10 +250,10 @@ ffi::Future calc_rfi_interp_transpose_cpu_f32_impl(
     interp_index_t start_time, interp_real1_f32_t dnu, interp_real1_f32_t dt,
     interp_real1_f32_t freqs, ffi::BufferR3<ffi::C64> vis_bar,
     ffi::Result<interp_amp_f32_t> amp_bar) {
-  return calc_rfi_interp_transpose_cpu_impl_tmpl<ffi::C64, ffi::F32, float>(
+  return calc_rfi_interp_transpose_cpu_impl_tmpl<false, ffi::C64, ffi::F32, float>(
       thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, tile_pairs, amp,
       phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
-      vis_bar, amp_bar);
+      vis_bar, amp_bar, nullptr, nullptr);
 }
 
 ffi::Future calc_rfi_interp_transpose_cpu_f64_impl(
@@ -234,11 +265,36 @@ ffi::Future calc_rfi_interp_transpose_cpu_f64_impl(
     interp_index_t start_time, interp_real1_f64_t dnu, interp_real1_f64_t dt,
     interp_real1_f64_t freqs, ffi::BufferR3<ffi::C128> vis_bar,
     ffi::Result<interp_amp_f64_t> amp_bar) {
-  return calc_rfi_interp_transpose_cpu_impl_tmpl<ffi::C128, ffi::F64, double>(
+  return calc_rfi_interp_transpose_cpu_impl_tmpl<false, ffi::C128, ffi::F64, double>(
       thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, tile_pairs, amp,
       phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs,
-      vis_bar, amp_bar);
+      vis_bar, amp_bar, nullptr, nullptr);
 }
+
+// ---- full transpose: the signal's, the phase's and the delay's cotangents ----
+
+#define RI_INTERP_FULL_TRANSPOSE_CPU_ENTRY(NAME, AMP_DT, REAL_DT, T, AMP_T, R4, R3, R1, VBAR_T) \
+  ffi::Future NAME##_impl(                                                          \
+      ffi::ThreadPool thread_pool, interp_index_t a1, interp_index_t a1_sorter,      \
+      interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,          \
+      interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair,                        \
+      ffi::BufferR2<ffi::S32> tile_pairs, AMP_T amp, R4 phase, R4 delay, R3 w_freq,  \
+      interp_index_t start_freq, R3 w_time, interp_index_t start_time, R1 dnu,       \
+      R1 dt, R1 freqs, VBAR_T vis_bar, ffi::Result<AMP_T> amp_bar,                   \
+      ffi::Result<R4> phase_bar, ffi::Result<R4> delay_bar) {                        \
+    return calc_rfi_interp_transpose_cpu_impl_tmpl<true, AMP_DT, REAL_DT, T>(        \
+        thread_pool, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair,         \
+        tile_pairs, amp, phase, delay, w_freq, start_freq, w_time, start_time, dnu,  \
+        dt, freqs, vis_bar, amp_bar, &phase_bar, &delay_bar);                        \
+  }
+
+RI_INTERP_FULL_TRANSPOSE_CPU_ENTRY(calc_rfi_interp_full_transpose_cpu_f32, ffi::C64, ffi::F32, float, interp_amp_f32_t, interp_real4_f32_t, interp_real3_f32_t, interp_real1_f32_t, ffi::BufferR3<ffi::C64>)
+RI_INTERP_FULL_TRANSPOSE_CPU_ENTRY(calc_rfi_interp_full_transpose_cpu_f64, ffi::C128, ffi::F64, double, interp_amp_f64_t, interp_real4_f64_t, interp_real3_f64_t, interp_real1_f64_t, ffi::BufferR3<ffi::C128>)
+
+extern "C" RI_KERNELS_API XLA_FFI_Error *
+calc_rfi_interp_full_transpose_cpu_f32(XLA_FFI_CallFrame *call_frame);
+extern "C" RI_KERNELS_API XLA_FFI_Error *
+calc_rfi_interp_full_transpose_cpu_f64(XLA_FFI_CallFrame *call_frame);
 
 // Exported: see visibility.h. The attribute has to sit inside the extern "C".
 extern "C" RI_KERNELS_API XLA_FFI_Error *
@@ -273,5 +329,33 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<interp_real1_f64_t>().Arg<interp_real1_f64_t>().Arg<interp_real1_f64_t>()
         .Arg<ffi::BufferR3<ffi::C128>>()
         .Ret<interp_amp_f64_t>());
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    calc_rfi_interp_full_transpose_cpu_f32, calc_rfi_interp_full_transpose_cpu_f32_impl,
+    ffi::Ffi::Bind().Ctx<ffi::ThreadPool>()
+        .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()
+        .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()
+        .Arg<ffi::BufferR2<ffi::S32>>().Arg<ffi::BufferR2<ffi::S32>>()
+        .Arg<interp_amp_f32_t>()
+        .Arg<interp_real4_f32_t>().Arg<interp_real4_f32_t>()
+        .Arg<interp_real3_f32_t>().Arg<interp_index_t>()
+        .Arg<interp_real3_f32_t>().Arg<interp_index_t>()
+        .Arg<interp_real1_f32_t>().Arg<interp_real1_f32_t>().Arg<interp_real1_f32_t>()
+        .Arg<ffi::BufferR3<ffi::C64>>()
+        .Ret<interp_amp_f32_t>().Ret<interp_real4_f32_t>().Ret<interp_real4_f32_t>());
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    calc_rfi_interp_full_transpose_cpu_f64, calc_rfi_interp_full_transpose_cpu_f64_impl,
+    ffi::Ffi::Bind().Ctx<ffi::ThreadPool>()
+        .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()
+        .Arg<interp_index_t>().Arg<interp_index_t>().Arg<interp_index_t>()
+        .Arg<ffi::BufferR2<ffi::S32>>().Arg<ffi::BufferR2<ffi::S32>>()
+        .Arg<interp_amp_f64_t>()
+        .Arg<interp_real4_f64_t>().Arg<interp_real4_f64_t>()
+        .Arg<interp_real3_f64_t>().Arg<interp_index_t>()
+        .Arg<interp_real3_f64_t>().Arg<interp_index_t>()
+        .Arg<interp_real1_f64_t>().Arg<interp_real1_f64_t>().Arg<interp_real1_f64_t>()
+        .Arg<ffi::BufferR3<ffi::C128>>()
+        .Ret<interp_amp_f64_t>().Ret<interp_real4_f64_t>().Ret<interp_real4_f64_t>());
 
 } // namespace ri_kernels

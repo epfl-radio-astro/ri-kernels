@@ -209,12 +209,13 @@ std::int64_t staged_time_samples(std::int64_t n_int_f, std::int64_t n_int_t, int
   return c_v < 1 ? 1 : c_v;
 }
 
-template <bool JVP, typename T, typename INT_T, ffi::DataType AMP_DT, ffi::DataType REAL_DT>
+template <bool JVP, bool FULL, typename T, typename INT_T, ffi::DataType AMP_DT, ffi::DataType REAL_DT>
 ffi::Error calc_rfi_interp_gpu_dispatch(
     cudaStream_t stream, ffi::ScratchAllocator &scratch, interp_index_t a1, interp_index_t a2,
     ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tile_pairs,
     ffi::Buffer<AMP_DT, 4> amp, ffi::Buffer<AMP_DT, 4> amp_dot,
-    ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> delay,
+    ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> phase_dot,
+    ffi::Buffer<REAL_DT, 4> delay, ffi::Buffer<REAL_DT, 4> delay_dot,
     ffi::Buffer<REAL_DT, 3> w_freq, interp_index_t start_freq,
     ffi::Buffer<REAL_DT, 3> w_time, interp_index_t start_time,
     ffi::Buffer<REAL_DT, 1> dnu, ffi::Buffer<REAL_DT, 1> dt,
@@ -248,14 +249,18 @@ ffi::Error calc_rfi_interp_gpu_dispatch(
     return ffi::Error::Internal("Could not allocate scratch memory for the fine samples");
   Cplx<T> *S = reinterpret_cast<Cplx<T> *>(*s_mem);
   Cplx<T> *dS = JVP ? S + std::size_t(n_ant) * n_rfi * n_freq * n_s * n_tc : nullptr;
-  const SampleViews<T, INT_T> sample_views{views.amp, amp_dot_view, views.phase, views.delay,
-                                           views.w_freq, views.w_time, views.start_freq,
-                                           views.start_time, views.dnu, views.dt, views.freqs};
+  const auto dd = delay.dimensions();
+  const SampleViews<T, INT_T> sample_views{
+      views.amp, amp_dot_view, views.phase, views.delay,
+      Tensor4D<const T *, INT_T>(phase_dot.typed_data(), a[0], a[1], a[2], a[3]),
+      Tensor4D<const T *, INT_T>(delay_dot.typed_data(), dd[0], dd[1], dd[2], dd[3]),
+      views.w_freq, views.w_time, views.start_freq, views.start_time, views.dnu, views.dt, views.freqs};
+  constexpr int mode = JVP ? (FULL ? kSamplesAndFullTangent : kSamplesAndTangent) : kSamplesOnly;
 
   for (INT_T t0 = 0; t0 < n_time; t0 += n_tc) {
     const INT_T cells = n_time - t0 < n_tc ? n_time - t0 : n_tc;
     const auto sample_grid = create_clamped_grid(int(n_freq * n_rfi * n_ant), 1, 1);
-    rfi_interp_samples_kernel<T, INT_T, JVP ? kSamplesAndTangent : kSamplesOnly>
+    rfi_interp_samples_kernel<T, INT_T, mode>
         <<<sample_grid, kSampleBlock, 0, stream>>>(sample_views, S, dS, t0, cells);
     auto status = cudaGetLastError();
     if (status != cudaSuccess)
@@ -272,14 +277,15 @@ ffi::Error calc_rfi_interp_gpu_dispatch(
 
 // The allocator is move-only: the entry points take it by value from the
 // binding and lend it down the call chain by reference.
-template <bool JVP, ffi::DataType AMP_DT, ffi::DataType REAL_DT, typename T>
+template <bool JVP, bool FULL, ffi::DataType AMP_DT, ffi::DataType REAL_DT, typename T>
 ffi::Error calc_rfi_interp_gpu_impl_tmpl(
     cudaStream_t stream, ffi::ScratchAllocator &scratch, interp_index_t a1, interp_index_t a1_sorter,
     interp_index_t a1_start, interp_index_t a2, interp_index_t a2_sorter,
     interp_index_t a2_start, ffi::BufferR2<ffi::S32> pair,
     ffi::BufferR2<ffi::S32> tile_pairs,
     ffi::Buffer<AMP_DT, 4> amp, ffi::Buffer<AMP_DT, 4> amp_dot,
-    ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> delay,
+    ffi::Buffer<REAL_DT, 4> phase, ffi::Buffer<REAL_DT, 4> phase_dot,
+    ffi::Buffer<REAL_DT, 4> delay, ffi::Buffer<REAL_DT, 4> delay_dot,
     ffi::Buffer<REAL_DT, 3> w_freq, interp_index_t start_freq,
     ffi::Buffer<REAL_DT, 3> w_time, interp_index_t start_time,
     ffi::Buffer<REAL_DT, 1> dnu, ffi::Buffer<REAL_DT, 1> dt,
@@ -296,15 +302,17 @@ ffi::Error calc_rfi_interp_gpu_impl_tmpl(
     return ffi::Error::InvalidArgument("Expected a (n_tile_pairs, 1024) tile-pair list");
   if (JVP && !interp_same_shape(amp_dot, amp))
     return ffi::Error::InvalidArgument("Expected the signal tangent to match the signal");
+  if (FULL && !(interp_same_shape(phase_dot, phase) && interp_same_shape(delay_dot, delay)))
+    return ffi::Error::InvalidArgument("Expected the phase and delay tangents to match the phase and delay");
   constexpr std::int64_t limit = std::numeric_limits<std::int32_t>::max();
   // use 32 bit indexing if possible
   if (amp.element_count() < limit && out->element_count() < limit)
-    return calc_rfi_interp_gpu_dispatch<JVP, T, std::int32_t>(
-        stream, scratch, a1, a2, pair, tile_pairs, amp, amp_dot, phase, delay, w_freq,
-        start_freq, w_time, start_time, dnu, dt, freqs, out);
-  return calc_rfi_interp_gpu_dispatch<JVP, T, std::int64_t>(
-      stream, scratch, a1, a2, pair, tile_pairs, amp, amp_dot, phase, delay, w_freq,
-      start_freq, w_time, start_time, dnu, dt, freqs, out);
+    return calc_rfi_interp_gpu_dispatch<JVP, FULL, T, std::int32_t>(
+        stream, scratch, a1, a2, pair, tile_pairs, amp, amp_dot, phase, phase_dot, delay,
+        delay_dot, w_freq, start_freq, w_time, start_time, dnu, dt, freqs, out);
+  return calc_rfi_interp_gpu_dispatch<JVP, FULL, T, std::int64_t>(
+      stream, scratch, a1, a2, pair, tile_pairs, amp, amp_dot, phase, phase_dot, delay,
+      delay_dot, w_freq, start_freq, w_time, start_time, dnu, dt, freqs, out);
 }
 
 #define RI_INTERP_GPU_ENTRY(NAME, JVP, AMP_DT, REAL_DT, T, AMP_T, R4, R3, R1, DOT_PARAM, DOT_ARG) \
@@ -317,9 +325,9 @@ ffi::Error calc_rfi_interp_gpu_impl_tmpl(
       R4 phase, R4 delay, R3 w_freq, interp_index_t start_freq, R3 w_time,        \
       interp_index_t start_time, R1 dnu, R1 dt, R1 freqs,                        \
       ffi::Result<ffi::BufferR3<AMP_DT>> out) {                                  \
-    return calc_rfi_interp_gpu_impl_tmpl<JVP, AMP_DT, REAL_DT, T>(               \
+    return calc_rfi_interp_gpu_impl_tmpl<JVP, false, AMP_DT, REAL_DT, T>(        \
         stream, scratch, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair, \
-        tile_pairs, amp, DOT_ARG, phase, delay, w_freq, start_freq, w_time,      \
+        tile_pairs, amp, DOT_ARG, phase, phase, delay, delay, w_freq, start_freq, w_time, \
         start_time, dnu, dt, freqs, out);                                        \
   }
 
@@ -332,7 +340,28 @@ RI_INTERP_GPU_ENTRY(calc_rfi_interp_gpu_f64, false, ffi::C128, ffi::F64, double,
 RI_INTERP_GPU_ENTRY(calc_rfi_interp_jvp_gpu_f32, true, ffi::C64, ffi::F32, float, interp_amp_f32_t, interp_real4_f32_t, interp_real3_f32_t, interp_real1_f32_t, RI_COMMA_DOT_F32, amp_dot)
 RI_INTERP_GPU_ENTRY(calc_rfi_interp_jvp_gpu_f64, true, ffi::C128, ffi::F64, double, interp_amp_f64_t, interp_real4_f64_t, interp_real3_f64_t, interp_real1_f64_t, RI_COMMA_DOT_F64, amp_dot)
 
+// The full JVP: tangents on the signal, the phase and the delay.
+#define RI_INTERP_FULL_JVP_GPU_ENTRY(NAME, AMP_DT, REAL_DT, T, AMP_T, R4, R3, R1, OUT_T) \
+  ffi::Error NAME##_impl(                                                          \
+      cudaStream_t stream, ffi::ScratchAllocator scratch, interp_index_t a1,        \
+      interp_index_t a1_sorter, interp_index_t a1_start, interp_index_t a2,         \
+      interp_index_t a2_sorter, interp_index_t a2_start,                            \
+      ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tile_pairs, AMP_T amp,  \
+      AMP_T amp_dot, R4 phase, R4 phase_dot, R4 delay, R4 delay_dot, R3 w_freq,      \
+      interp_index_t start_freq, R3 w_time, interp_index_t start_time, R1 dnu,       \
+      R1 dt, R1 freqs, ffi::Result<OUT_T> out) {                                     \
+    return calc_rfi_interp_gpu_impl_tmpl<true, true, AMP_DT, REAL_DT, T>(            \
+        stream, scratch, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, pair,     \
+        tile_pairs, amp, amp_dot, phase, phase_dot, delay, delay_dot, w_freq,        \
+        start_freq, w_time, start_time, dnu, dt, freqs, out);                        \
+  }
+
+RI_INTERP_FULL_JVP_GPU_ENTRY(calc_rfi_interp_full_jvp_gpu_f32, ffi::C64, ffi::F32, float, interp_amp_f32_t, interp_real4_f32_t, interp_real3_f32_t, interp_real1_f32_t, ffi::BufferR3<ffi::C64>)
+RI_INTERP_FULL_JVP_GPU_ENTRY(calc_rfi_interp_full_jvp_gpu_f64, ffi::C128, ffi::F64, double, interp_amp_f64_t, interp_real4_f64_t, interp_real3_f64_t, interp_real1_f64_t, ffi::BufferR3<ffi::C128>)
+
 // Exported: see visibility.h. The attribute has to sit inside the extern "C".
+extern "C" RI_KERNELS_API XLA_FFI_Error *calc_rfi_interp_full_jvp_gpu_f32(XLA_FFI_CallFrame *call_frame);
+extern "C" RI_KERNELS_API XLA_FFI_Error *calc_rfi_interp_full_jvp_gpu_f64(XLA_FFI_CallFrame *call_frame);
 extern "C" RI_KERNELS_API XLA_FFI_Error *calc_rfi_interp_gpu_f32(XLA_FFI_CallFrame *call_frame);
 extern "C" RI_KERNELS_API XLA_FFI_Error *calc_rfi_interp_gpu_f64(XLA_FFI_CallFrame *call_frame);
 extern "C" RI_KERNELS_API XLA_FFI_Error *calc_rfi_interp_jvp_gpu_f32(XLA_FFI_CallFrame *call_frame);
@@ -370,6 +399,26 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_interp_jvp_gpu_f64, calc_rfi_interp_jvp_g
                                   RI_INTERP_INDEX_ARGS.Arg<interp_amp_f64_t>()
                                   .Arg<interp_amp_f64_t>()
                                   RI_INTERP_TABLE_ARGS(f64)
+                                  .Ret<ffi::BufferR3<ffi::C128>>());
+
+#define RI_INTERP_FULL_TABLE_ARGS(P)                                           \
+  .Arg<interp_real4_##P##_t>().Arg<interp_real4_##P##_t>()                     \
+      .Arg<interp_real4_##P##_t>().Arg<interp_real4_##P##_t>()                 \
+      .Arg<interp_real3_##P##_t>().Arg<interp_index_t>()                       \
+      .Arg<interp_real3_##P##_t>().Arg<interp_index_t>()                       \
+      .Arg<interp_real1_##P##_t>().Arg<interp_real1_##P##_t>()                 \
+      .Arg<interp_real1_##P##_t>()
+XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_interp_full_jvp_gpu_f32, calc_rfi_interp_full_jvp_gpu_f32_impl,
+                              ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>().Ctx<ffi::ScratchAllocator>()
+                                  RI_INTERP_INDEX_ARGS.Arg<interp_amp_f32_t>()
+                                  .Arg<interp_amp_f32_t>()
+                                  RI_INTERP_FULL_TABLE_ARGS(f32)
+                                  .Ret<ffi::BufferR3<ffi::C64>>());
+XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_interp_full_jvp_gpu_f64, calc_rfi_interp_full_jvp_gpu_f64_impl,
+                              ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>().Ctx<ffi::ScratchAllocator>()
+                                  RI_INTERP_INDEX_ARGS.Arg<interp_amp_f64_t>()
+                                  .Arg<interp_amp_f64_t>()
+                                  RI_INTERP_FULL_TABLE_ARGS(f64)
                                   .Ret<ffi::BufferR3<ffi::C128>>());
 
 } // namespace gpu

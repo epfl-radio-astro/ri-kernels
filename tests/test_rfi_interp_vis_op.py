@@ -18,6 +18,8 @@ from ri_kernels.jax_api.rfi_interp_vis_op import (
     RFIInterpVisOp,
     _TAB_LIB_INTERP,
     _TAB_LIB_INTERP_GPU,
+    rfi_interp_full_jvp_op,
+    rfi_interp_full_transpose_op,
     rfi_interp_jvp_op,
     rfi_interp_transpose_op,
     rfi_interp_vis_op,
@@ -240,15 +242,19 @@ def test_vjp_matches_reference(precision, shape, device):
 
 
 def test_the_constants_get_zero_cotangents(precision, device):
-    """eval() stops the gradient on everything but the signal."""
+    """eval() stops the gradient on the tables and the channel centres; the
+    signal, the phase and the delay get cotangents."""
     real, complex_ = precision
     args = make_inputs(real, complex_)
     a1, a2 = make_baselines(args[0].shape[0])
     op = RFIInterpVisOp(args[0].shape[0], a1, a2)
     vis, pullback = jax.vjp(op.eval, *args)
     bars = pullback(jnp.ones_like(vis))
-    assert float(jnp.abs(bars[0]).max()) > 0
-    for name, bar, x in zip(("phase", "delay_us", "w_freq"), bars[1:4], args[1:4]):
+    for name, bar in zip(("amp", "phase", "delay_us"), bars[:3]):
+        assert float(jnp.abs(bar).max()) > 0, name
+    for name, bar, x in zip(("w_freq", "w_time", "dnu_mhz", "dt", "freq_mhz"),
+                            (bars[3], bars[5], bars[7], bars[8], bars[9]),
+                            (args[3], args[5], args[7], args[8], args[9])):
         np.testing.assert_array_equal(bar, jnp.zeros_like(x)), name
 
 
@@ -258,11 +264,11 @@ def test_the_constants_tangent_is_refused_on_a_direct_bind(precision):
     a1, a2 = make_baselines(args[0].shape[0])
     op = RFIInterpVisOp(args[0].shape[0], a1, a2)
     indices = op.indices
-    with pytest.raises(TypeError, match="no derivative with respect to phase"):
+    with pytest.raises(TypeError, match="no derivative with respect to w_freq"):
         jax.jvp(
-            lambda p: rfi_interp_vis_op.bind(*indices, args[0], p, *args[2:]),
-            (args[1],),
-            (jnp.ones_like(args[1]),),
+            lambda w: rfi_interp_vis_op.bind(*indices, *args[:3], w, *args[4:]),
+            (args[3],),
+            (jnp.ones_like(args[3]),),
         )
 
 
@@ -374,3 +380,90 @@ def test_the_tile_pair_list_holds_each_pair_once():
     expected = {(min(p, q), max(p, q)) if p // TILE == q // TILE else ((p, q) if p // TILE < q // TILE else (q, p))
                 for p, q in zip(a1, a2)}
     assert set(seen) == expected
+
+
+# --- the phase and delay derivatives --------------------------------------------
+
+def _phase_delay_tangents(args, real, seed=7):
+    """Random tangents on the phase (radians) and the delay (its own units)."""
+    rng = np.random.default_rng(seed)
+    phase_dot = jnp.asarray(rng.normal(size=args[1].shape), dtype=real)
+    delay_dot = jnp.asarray(rng.normal(size=args[2].shape) * np.abs(np.asarray(args[2])).mean(axis=(0, 1, 2)), dtype=real)
+    return phase_dot, delay_dot
+
+
+@pytest.mark.parametrize("shape", SHAPES.values(), ids=SHAPES.keys())
+def test_full_jvp_matches_reference(precision, shape, device):
+    """Tangents on the signal, the phase and the delay together."""
+    real, complex_ = precision
+    args = make_inputs(real, complex_, **shape)
+    amp_dot = make_inputs(real, complex_, seed=1, **shape)[0]
+    phase_dot, delay_dot = _phase_delay_tangents(args, real)
+    a1, a2 = make_baselines(args[0].shape[0], shuffle=True)
+    op = RFIInterpVisOp(args[0].shape[0], a1, a2)
+    f = lambda a, p, d: op.eval(a, p, d, *args[3:])
+    _, tangent = jax.jvp(f, tuple(args[:3]), (amp_dot, phase_dot, delay_dot))
+    ref_args = expected_args(args, real)
+    g = lambda a, p, d: reference(a, p, d, *ref_args[3:], a1, a2)
+    dots = (amp_dot, phase_dot, delay_dot)
+    _, exp_t = jax.jvp(g, tuple(ref_args[:3]), tuple(upcast(x) for x in dots) if real == jnp.float32 else dots)
+    assert_close(tangent, exp_t, real)
+    # And each alone: the phase's and the delay's tangent through the full kernel.
+    for k in (1, 2):
+        only = tuple(d if i == k else jnp.zeros_like(d) for i, d in enumerate(dots))
+        _, tangent = jax.jvp(f, tuple(args[:3]), only)
+        _, exp_t = jax.jvp(g, tuple(ref_args[:3]), tuple(upcast(x) for x in only) if real == jnp.float32 else only)
+        assert_close(tangent, exp_t, real)
+
+
+@pytest.mark.parametrize("shape", SHAPES.values(), ids=SHAPES.keys())
+def test_full_vjp_matches_reference(precision, shape, device):
+    """Cotangents of the signal, the phase and the delay from one pullback."""
+    real, complex_ = precision
+    args = make_inputs(real, complex_, **shape)
+    a1, a2 = make_baselines(args[0].shape[0], shuffle=True)
+    op = RFIInterpVisOp(args[0].shape[0], a1, a2)
+    n_bl, n_freq, n_time = len(a1), args[0].shape[2], args[0].shape[3]
+    rng = np.random.default_rng(2)
+    cotangent = jnp.asarray(
+        rng.normal(size=(n_bl, n_freq, n_time)) + 1j * rng.normal(size=(n_bl, n_freq, n_time)),
+        dtype=complex_,
+    )
+    _, pullback = jax.vjp(lambda a, p, d: op.eval(a, p, d, *args[3:]), *args[:3])
+    amp_bar, phase_bar, delay_bar = pullback(cotangent)
+    ref_args = expected_args(args, real)
+    _, ref_pullback = jax.vjp(lambda a, p, d: reference(a, p, d, *ref_args[3:], a1, a2), *ref_args[:3])
+    exp_amp, exp_phase, exp_delay = ref_pullback(upcast(cotangent) if real == jnp.float32 else cotangent)
+    assert_close(amp_bar, exp_amp, real)
+    assert_close(phase_bar, exp_phase, real)
+    assert_close(delay_bar, exp_delay, real)
+    assert phase_bar.dtype == args[1].dtype and delay_bar.dtype == args[2].dtype
+
+
+def test_the_signal_only_kernels_serve_a_fixed_phase(precision):
+    """A fixed phase and delay bind the signal-only JVP and transpose; a
+    differentiated phase or delay binds the full pair."""
+    real, complex_ = precision
+    args = make_inputs(real, complex_)
+    a1, a2 = make_baselines(args[0].shape[0])
+    op = RFIInterpVisOp(args[0].shape[0], a1, a2)
+    cot = jnp.ones((len(a1),) + args[0].shape[2:], dtype=complex_)
+
+    def primitives(fn, *primals):
+        _, pullback = jax.vjp(fn, *primals)
+        text = str(jax.make_jaxpr(pullback)(cot))
+        return {name for name in ("rfi_interp_jvp_op", "rfi_interp_transpose_op",
+                                  "rfi_interp_full_jvp_op", "rfi_interp_full_transpose_op")
+                if name in text}
+
+    used = primitives(lambda a: op.eval(a, *args[1:]), args[0])
+    assert "rfi_interp_transpose_op" in used and "rfi_interp_full_transpose_op" not in used
+    used = primitives(lambda a, p: op.eval(a, p, *args[2:]), args[0], args[1])
+    assert "rfi_interp_full_transpose_op" in used and "rfi_interp_transpose_op" not in used
+    used = primitives(lambda d: op.eval(*args[:2], d, *args[3:]), args[2])
+    assert "rfi_interp_full_transpose_op" in used
+    # Forward mode likewise.
+    text = str(jax.make_jaxpr(lambda a, t: jax.jvp(lambda x: op.eval(x, *args[1:]), (a,), (t,)))(args[0], args[0]))
+    assert "rfi_interp_jvp_op" in text and "rfi_interp_full_jvp_op" not in text
+    text = str(jax.make_jaxpr(lambda p, t: jax.jvp(lambda x: op.eval(args[0], x, *args[2:]), (p,), (t,)))(args[1], args[1]))
+    assert "rfi_interp_full_jvp_op" in text

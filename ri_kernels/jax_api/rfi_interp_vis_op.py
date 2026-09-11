@@ -15,11 +15,15 @@ source ``r`` and antenna ``a``::
 over every fine sample of the cell (variable sampling per baseline group is a
 matter of calling it per group with tables cut to the group's samples).
 
-Only the signal ``amp`` is differentiated; the phase, the delay and the tables
-are constants of the run, and :meth:`RFIInterpVisOp.eval` stops their
-gradients explicitly. The weights are data: the polynomial through the
-stencil, the conditional mean of a Gaussian process, or any other linear
-interpolant is a different table through the same kernel.
+The signal ``amp``, the phase and the delay are differentiated; the tables and
+the channel centres are constants of the run, and :meth:`RFIInterpVisOp.eval`
+stops their gradients explicitly. Two kernel pairs carry the derivatives: one
+for the signal alone, one for the signal, the phase and the delay together.
+The JVP rule picks the first whenever the phase and delay tangents are
+symbolic zeros -- a fixed orbit, nothing learnable upstream of them -- so a
+run that needs no phase derivative computes none. The weights are data: the
+polynomial through the stencil, the conditional mean of a Gaussian process,
+or any other linear interpolant is a different table through the same kernel.
 """
 
 from functools import partial
@@ -118,7 +122,7 @@ class RFIInterpVisOp:
 
         Args:
             amp: Complex ``(n_ant, n_rfi, n_freq, n_time)``, the signal on the
-                data grid. The only differentiated input.
+                data grid. Differentiated, as are ``phase`` and ``delay_us``.
             phase: Real ``(n_ant, n_rfi, n_freq, n_time)``, the phase at the
                 channel and cell centre, reduced to one turn. Reduce it in
                 float64 before casting: the unreduced phase is ~1e6 turns and
@@ -147,7 +151,7 @@ class RFIInterpVisOp:
         stop = jax.lax.stop_gradient
         return rfi_interp_vis_op.bind(
             *self.indices,
-            amp, stop(phase), stop(delay_us), stop(w_freq), start_freq,
+            amp, phase, delay_us, stop(w_freq), start_freq,
             stop(w_time), start_time, stop(dnu_mhz), stop(dt), stop(freq_mhz),
         )
 
@@ -163,7 +167,7 @@ _TAB_LIB_INTERP_GPU = (
 
 if _TAB_LIB_INTERP:
     for _suffix in ("f32", "f64"):
-        for _kind in ("", "_jvp", "_transpose"):
+        for _kind in ("", "_jvp", "_transpose", "_full_jvp", "_full_transpose"):
             jax.ffi.register_ffi_target(
                 f"calc_rfi_interp{_kind}_{_suffix}",
                 jax.ffi.pycapsule(
@@ -174,7 +178,7 @@ if _TAB_LIB_INTERP:
 
 if _TAB_LIB_INTERP_GPU:
     for _suffix in ("f32", "f64"):
-        for _kind in ("", "_jvp", "_transpose"):
+        for _kind in ("", "_jvp", "_transpose", "_full_jvp", "_full_transpose"):
             jax.ffi.register_ffi_target(
                 f"calc_rfi_interp{_kind}_gpu_{_suffix}",
                 jax.ffi.pycapsule(
@@ -297,6 +301,26 @@ rfi_interp_transpose_op.def_abstract_eval(_transpose_abstract)
 mlir.register_lowering(rfi_interp_transpose_op, _lowering("calc_rfi_interp_transpose", "cpu"), platform="cpu")
 mlir.register_lowering(rfi_interp_transpose_op, _lowering("calc_rfi_interp_transpose", "gpu"), platform="gpu")
 
+# The full transpose: the cotangents of the signal, the phase and the delay.
+rfi_interp_full_transpose_op = core.Primitive("rfi_interp_full_transpose_op")
+rfi_interp_full_transpose_op.multiple_results = True
+rfi_interp_full_transpose_op.def_impl(partial(xla.apply_primitive, rfi_interp_full_transpose_op))
+
+
+def _full_transpose_abstract(*args):
+    a1, arrays, g = args[0], args[N_IDX:N_IDX + 10], args[N_IDX + 10]
+    _validate_indices(args)
+    _validate(*arrays)
+    _validate_like("visibility cotangent", _output_aval(a1, arrays[0]), g)
+    amp, phase, delay = arrays[:3]
+    return (ShapedArray(amp.shape, amp.dtype), ShapedArray(phase.shape, phase.dtype),
+            ShapedArray(delay.shape, delay.dtype))
+
+
+rfi_interp_full_transpose_op.def_abstract_eval(_full_transpose_abstract)
+mlir.register_lowering(rfi_interp_full_transpose_op, _lowering("calc_rfi_interp_full_transpose", "cpu"), platform="cpu")
+mlir.register_lowering(rfi_interp_full_transpose_op, _lowering("calc_rfi_interp_full_transpose", "gpu"), platform="gpu")
+
 
 # --- JVP: linear in the signal tangent -----------------------------------------
 
@@ -340,6 +364,57 @@ def _jvp_transpose(g, *args):
 ad.primitive_transposes[rfi_interp_jvp_op] = _jvp_transpose
 
 
+# --- full JVP: linear in the signal, phase and delay tangents -------------------
+# Arguments: *indices, amp, amp_dot, phase, phase_dot, delay, delay_dot, tables.
+
+rfi_interp_full_jvp_op = core.Primitive("rfi_interp_full_jvp_op")
+rfi_interp_full_jvp_op.def_impl(partial(xla.apply_primitive, rfi_interp_full_jvp_op))
+
+
+def _full_jvp_abstract(*args):
+    a1 = args[0]
+    amp, amp_dot, phase, phase_dot, delay, delay_dot = args[N_IDX:N_IDX + 6]
+    tables = args[N_IDX + 6:]
+    _validate_indices(args)
+    _validate(amp, phase, delay, *tables)
+    _validate_like("signal tangent", amp, amp_dot)
+    _validate_like("phase tangent", phase, phase_dot)
+    _validate_like("delay tangent", delay, delay_dot)
+    return _output_aval(a1, amp)
+
+
+rfi_interp_full_jvp_op.def_abstract_eval(_full_jvp_abstract)
+
+
+def _full_jvp_lowering(platform):
+    def lowering(ctx, *args):
+        _check_interp_lib(platform)
+        suffix = _dtype_suffix(ctx.avals_in[N_IDX].dtype, ctx.avals_in[N_IDX + 2].dtype)
+        target = f"calc_rfi_interp_full_jvp{'_gpu' if platform == 'gpu' else ''}_{suffix}"
+        return jax.ffi.ffi_lowering(target)(ctx, *args)
+
+    return lowering
+
+
+mlir.register_lowering(rfi_interp_full_jvp_op, _full_jvp_lowering("cpu"), platform="cpu")
+mlir.register_lowering(rfi_interp_full_jvp_op, _full_jvp_lowering("gpu"), platform="gpu")
+
+
+def _full_jvp_transpose(g, *args):
+    indices = args[:N_IDX]
+    amp, _, phase, _, delay, _ = args[N_IDX:N_IDX + 6]
+    tables = args[N_IDX + 6:]
+    amp_bar, phase_bar, delay_bar = rfi_interp_full_transpose_op.bind(
+        *indices, amp, phase, delay, *tables, g
+    )
+    # Cotangents for the three linear inputs, at their tangent slots.
+    return ((None,) * N_IDX + (None, amp_bar, None, phase_bar, None, delay_bar)
+            + (None,) * len(tables))
+
+
+ad.primitive_transposes[rfi_interp_full_jvp_op] = _full_jvp_transpose
+
+
 # --- primal ---------------------------------------------------------------------
 
 rfi_interp_vis_op = core.Primitive("rfi_interp_vis_op")
@@ -360,21 +435,32 @@ mlir.register_lowering(rfi_interp_vis_op, _lowering("calc_rfi_interp", "gpu"), p
 
 def _vis_jvp(args, tangents):
     indices, arrays = args[:N_IDX], args[N_IDX:]
-    amp, rest = arrays[0], arrays[1:]
-    amp_dot, rest_dots = tangents[N_IDX], tangents[N_IDX + 1:]
-    # eval() stops the gradient on every input but the signal, so a non-zero
-    # tangent can only reach here through a direct bind. The kernel has no
-    # derivative with respect to them, so refuse rather than drop it.
-    for name, dot in zip(_ARRAY_NAMES[1:], rest_dots):
+    amp, phase, delay, tables = arrays[0], arrays[1], arrays[2], arrays[3:]
+    amp_dot, phase_dot, delay_dot = tangents[N_IDX:N_IDX + 3]
+    table_dots = tangents[N_IDX + 3:]
+    # eval() stops the gradient on the tables and the channel centres, so a
+    # non-zero tangent on them can only reach here through a direct bind. The
+    # kernels have no derivative with respect to them: refuse rather than drop.
+    for name, dot in zip(_ARRAY_NAMES[3:], table_dots):
         if not isinstance(dot, ad.Zero):
             raise TypeError(
-                f"rfi_interp_vis_op differentiates the signal only and provides "
-                f"no derivative with respect to {name}. Use RFIInterpVisOp.eval, "
-                "which applies lax.stop_gradient to the other inputs."
+                f"rfi_interp_vis_op differentiates the signal, the phase and the "
+                f"delay only and provides no derivative with respect to {name}. "
+                "Use RFIInterpVisOp.eval, which applies lax.stop_gradient to the tables."
             )
     if isinstance(amp_dot, ad.Zero):
         amp_dot = jnp.zeros_like(amp)
-    tangent = rfi_interp_jvp_op.bind(*indices, amp, amp_dot, *rest)
+    if isinstance(phase_dot, ad.Zero) and isinstance(delay_dot, ad.Zero):
+        # Nothing learnable feeds the phase: the signal-only kernels.
+        tangent = rfi_interp_jvp_op.bind(*indices, amp, amp_dot, phase, delay, *tables)
+    else:
+        if isinstance(phase_dot, ad.Zero):
+            phase_dot = jnp.zeros_like(phase)
+        if isinstance(delay_dot, ad.Zero):
+            delay_dot = jnp.zeros_like(delay)
+        tangent = rfi_interp_full_jvp_op.bind(
+            *indices, amp, amp_dot, phase, phase_dot, delay, delay_dot, *tables
+        )
     return rfi_interp_vis_op.bind(*args), tangent
 
 
