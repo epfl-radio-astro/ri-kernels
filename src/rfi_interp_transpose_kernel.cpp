@@ -15,13 +15,14 @@
 // and, in the full variant, phi_bar = -Im(S G) per sample, summed over the
 // cell for the phase and weighted by d phi / d delay[j] for the delay.
 //
-// Work is in phases of time cells: a chunk of cells in parallel, one time cell
-// per task, each building the fine samples of every antenna once per channel
-// and source (see rfi_interp_cell_inl.hpp) and scattering every baseline's
-// cotangent onto them; then, in parallel over antennas and sources, the gather
-// of the chunk's H onto the data grid, each output element written by one task
-// in a fixed order. The chunk's H is bounded (256 MB at most) and the result is
-// deterministic.
+// One task owns one source and one run of output time cells. It builds that
+// source's fine samples and stencil cotangents for the cells whose stencils
+// reach its output run -- its own cells plus the n_st - 1 on either side,
+// recomputed rather than shared, which is a few per cent of a run and is what
+// keeps this a single parallel pass -- and then gathers them onto its own slab
+// of the data grid. Tasks write disjoint slabs of every output, so there is no
+// accumulation across tasks and the result is deterministic. The per-task
+// buffer holds one source's cells only, a few MB.
 
 #include <algorithm>
 #include <complex>
@@ -54,37 +55,41 @@ namespace hn = ::hwy::HWY_NAMESPACE;
 
 #include "rfi_interp_cell_inl.hpp"
 
-// H of a chunk of time cells: (n_ant, n_rfi, n_freq, n_tc, n_slots), the
-// n_sf * n_st stencil cotangents and, in the full variant, the phase's and the
-// n_path delay cotangents after them.
+// One task's stencil cotangents: (n_ant, n_freq, n_tc, n_stencil), for one
+// source and the cells the task builds.
 template <typename T>
-HWY_INLINE Cplx<T> &h_at(Cplx<T> *H, std::int64_t a, std::int64_t r, std::int64_t f,
-                         std::int64_t t_local, std::int64_t slot, std::int64_t n_rfi,
-                         std::int64_t n_freq, std::int64_t n_tc, std::int64_t n_slots) {
-  return H[(((a * n_rfi + r) * n_freq + f) * n_tc + t_local) * n_slots + slot];
+HWY_INLINE Cplx<T> &h_at(Cplx<T> *H, std::int64_t a, std::int64_t f, std::int64_t t_local,
+                         std::int64_t kl, std::int64_t n_freq, std::int64_t n_tc,
+                         std::int64_t n_stencil) {
+  return H[((a * n_freq + f) * n_tc + t_local) * n_stencil + kl];
 }
 
+// The stencil cotangents H of source `r` on cells [t_lo, t_hi), laid out
+// (n_ant, n_freq, t_hi - t_lo, n_slots), and, when FULL, the phase's and the
+// delay's cotangents written straight out for the cells in [tp_lo, tp_hi).
 template <typename T, bool FULL>
-HWY_ATTR void transpose_cells_impl(std::int64_t begin, std::int64_t end, TransposeViews<T> v,
-                                   Cplx<T> *H, std::int64_t t0, std::int64_t n_tc) {
+HWY_ATTR void transpose_cells_impl(TransposeViews<T> v, Cplx<T> *H, std::int64_t r,
+                                   std::int64_t t_lo, std::int64_t t_hi,
+                                   std::int64_t tp_lo, std::int64_t tp_hi) {
   using D = TagType<T>;
   const D d_tag;
   const std::int64_t lanes = hn::Lanes(d_tag);
 
-  const std::int64_t n_ant = v.amp.shape[0], n_rfi = v.amp.shape[1];
+  const std::int64_t n_ant = v.amp.shape[0];
   const std::int64_t n_freq = v.amp.shape[2];
   const std::int64_t n_sf = v.w_freq.shape[1], n_int_f = v.w_freq.shape[2];
   const std::int64_t n_st = v.w_time.shape[1], n_int_t = v.w_time.shape[2];
   const std::int64_t n_s = n_int_f * n_int_t, n_bl = v.a1.shape[0];
   const std::int64_t n_stencil = n_sf * n_st, n_path = v.delay.shape[3];
-  const std::int64_t n_slots = FULL ? n_stencil + 1 + n_path : n_stencil;
   const T inv = T(1) / T(n_s);
 
+  const std::int64_t n_tc = t_hi - t_lo;
   CellTables<T> cell;
   SampleBuf<T> S, E, G;
   std::vector<T> pc;
-  for (std::int64_t t_local = begin; t_local < end; ++t_local) {
-    const std::int64_t t = t0 + t_local;
+  for (std::int64_t t = t_lo; t < t_hi; ++t) {
+    const std::int64_t t_local = t - t_lo;
+    const bool own = t >= tp_lo && t < tp_hi;  // the cells this task reports
     const std::int64_t st = v.start_time(t);
     for (std::int64_t f = 0; f < n_freq; ++f) {
       const std::int64_t sf = v.start_freq(f);
@@ -94,7 +99,8 @@ HWY_ATTR void transpose_cells_impl(std::int64_t begin, std::int64_t end, Transpo
       G.resize(n_ant, cell.n_s_padded);
       if constexpr (FULL) pc.assign(cell.n_s_padded, T(0));
 
-      for (std::int64_t r = 0; r < n_rfi; ++r) {
+      {
+        // one source per task
         CellSamples(d_tag, cell, v.amp, v.phase, v.delay, sf, st, n_st, n_ant, r, f, t, S, &E);
         std::fill(G.re.begin(), G.re.end(), T(0));
         std::fill(G.im.begin(), G.im.end(), T(0));
@@ -112,17 +118,20 @@ HWY_ATTR void transpose_cells_impl(std::int64_t begin, std::int64_t end, Transpo
           if constexpr (FULL) {
             CellPhaseCotangent(d_tag, cell.n_s_padded, S.re_at(a), S.im_at(a),
                                G.re_at(a), G.im_at(a), pc.data());
-            h_at(H, a, r, f, t_local, n_stencil, n_rfi, n_freq, n_tc, n_slots) =
-                Cplx<T>{CellSumReal(d_tag, cell.n_s_padded, pc.data()), T(0)};
-            for (std::int64_t j = 0; j < n_path; ++j)
-              h_at(H, a, r, f, t_local, n_stencil + 1 + j, n_rfi, n_freq, n_tc, n_slots) =
-                  Cplx<T>{CellWeightedSumReal(d_tag, cell.n_s_padded,
-                                              cell.dcoef.data() + j * cell.n_s_padded, pc.data()),
-                          T(0)};
+            if (own) {
+              // The phase and delay cotangents need no gather: they are done
+              // with this cell, and the cell is this task's to report.
+              v.phase_bar(a, r, f, t) = CellSumReal(d_tag, cell.n_s_padded, pc.data());
+              if (f == 0)
+                for (std::int64_t j = 0; j < n_path; ++j) v.delay_bar(a, r, t, j) = 0;
+              for (std::int64_t j = 0; j < n_path; ++j)
+                v.delay_bar(a, r, t, j) += CellWeightedSumReal(
+                    d_tag, cell.n_s_padded, cell.dcoef.data() + j * cell.n_s_padded, pc.data());
+            }
           }
           CellMulInPlace(d_tag, cell.n_s_padded, E.re_at(a), E.im_at(a), G.re_at(a), G.im_at(a));
           for (std::int64_t kl = 0; kl < n_stencil; ++kl)
-            h_at(H, a, r, f, t_local, kl, n_rfi, n_freq, n_tc, n_slots) =
+            h_at(H, a, f, t_local, kl, n_freq, n_tc, n_stencil) =
                 CellWeightedSum(d_tag, cell.n_s_padded, cell.weight.data() + kl * cell.n_s_padded,
                                 G.re_at(a), G.im_at(a));
         }
@@ -131,21 +140,18 @@ HWY_ATTR void transpose_cells_impl(std::int64_t begin, std::int64_t end, Transpo
   }
 }
 
-// The gather of a chunk: items are (antenna, source) pairs; each adds the
-// chunk's cells onto every data-grid element their stencils cover, and in
-// the full variant writes the phase's and the delay's cotangents of the
-// chunk's cells.
-template <typename T, bool FULL>
-HWY_ATTR void transpose_gather_impl(std::int64_t begin, std::int64_t end, TransposeViews<T> v,
-                                    Cplx<T> *H, std::int64_t t0, std::int64_t n_tc) {
-  const std::int64_t n_rfi = v.amp.shape[1], n_freq = v.amp.shape[2], n_time = v.amp.shape[3];
+// The gather of one task's cells onto its own slab of the data grid: for each
+// antenna and each output cell in [tp_lo, tp_hi), the cells whose stencils
+// cover it, in a fixed order. Every output element belongs to exactly one
+// task, so nothing accumulates across tasks.
+template <typename T>
+HWY_ATTR void transpose_gather_impl(TransposeViews<T> v, const Cplx<T> *H, std::int64_t r,
+                                    std::int64_t t_lo, std::int64_t t_hi,
+                                    std::int64_t tp_lo, std::int64_t tp_hi) {
+  const std::int64_t n_ant = v.amp.shape[0], n_freq = v.amp.shape[2];
   const std::int64_t n_sf = v.w_freq.shape[1], n_st = v.w_time.shape[1];
-  const std::int64_t n_stencil = n_sf * n_st, n_path = v.delay.shape[3];
-  const std::int64_t n_slots = FULL ? n_stencil + 1 + n_path : n_stencil;
-  const std::int64_t tp_lo = std::max<std::int64_t>(0, t0 - n_st + 1);
-  const std::int64_t tp_hi = std::min<std::int64_t>(n_time, t0 + n_tc + n_st - 1);
-  for (std::int64_t item = begin; item < end; ++item) {
-    const std::int64_t a = item / n_rfi, r = item % n_rfi;
+  const std::int64_t n_stencil = n_sf * n_st, n_tc = t_hi - t_lo;
+  for (std::int64_t a = 0; a < n_ant; ++a) {
     for (std::int64_t fp = 0; fp < n_freq; ++fp) {
       for (std::int64_t tp = tp_lo; tp < tp_hi; ++tp) {
         Cplx<T> sum{0, 0};
@@ -153,24 +159,15 @@ HWY_ATTR void transpose_gather_impl(std::int64_t begin, std::int64_t end, Transp
              f < std::min<std::int64_t>(n_freq, fp + n_sf); ++f) {
           const std::int64_t k = fp - v.start_freq(f);
           if (k < 0 || k >= n_sf) continue;
-          for (std::int64_t t = std::max<std::int64_t>(t0, tp - n_st + 1);
-               t < std::min<std::int64_t>(t0 + n_tc, tp + n_st); ++t) {
+          for (std::int64_t t = std::max<std::int64_t>(t_lo, tp - n_st + 1);
+               t < std::min<std::int64_t>(t_hi, tp + n_st); ++t) {
             const std::int64_t l = tp - v.start_time(t);
             if (l < 0 || l >= n_st) continue;
-            sum = cadd(sum, h_at(H, a, r, f, t - t0, k * n_st + l, n_rfi, n_freq, n_tc, n_slots));
+            sum = cadd(sum, h_at(const_cast<Cplx<T> *>(H), a, f, t - t_lo, k * n_st + l,
+                                 n_freq, n_tc, n_stencil));
           }
         }
-        v.amp_bar(a, r, fp, tp) = cadd(v.amp_bar(a, r, fp, tp), sum);
-      }
-    }
-    if constexpr (FULL) {
-      for (std::int64_t t_local = 0; t_local < n_tc; ++t_local) {
-        for (std::int64_t j = 0; j < n_path; ++j) v.delay_bar(a, r, t0 + t_local, j) = 0;
-        for (std::int64_t f = 0; f < n_freq; ++f) {
-          v.phase_bar(a, r, f, t0 + t_local) = h_at(H, a, r, f, t_local, n_stencil, n_rfi, n_freq, n_tc, n_slots).re;
-          for (std::int64_t j = 0; j < n_path; ++j)
-            v.delay_bar(a, r, t0 + t_local, j) += h_at(H, a, r, f, t_local, n_stencil + 1 + j, n_rfi, n_freq, n_tc, n_slots).re;
-        }
+        v.amp_bar(a, r, fp, tp) = sum;
       }
     }
   }
@@ -179,18 +176,14 @@ HWY_ATTR void transpose_gather_impl(std::int64_t begin, std::int64_t end, Transp
 // Named per-precision entry points, so the per-target dispatch (HWY_EXPORT_*)
 // can target each precision separately. `full` is a runtime argument and the
 // bodies are specialised on it.
-#define RI_INTERP_TRANSPOSE_TARGETS(SUFFIX, T)                                       \
-  HWY_ATTR void transpose_cells_##SUFFIX(std::int64_t begin, std::int64_t end,       \
-                                         bool full, TransposeViews<T> v, Cplx<T> *H, \
-                                         std::int64_t t0, std::int64_t n_tc) {       \
-    if (full) transpose_cells_impl<T, true>(begin, end, v, H, t0, n_tc);             \
-    else transpose_cells_impl<T, false>(begin, end, v, H, t0, n_tc);                 \
-  }                                                                                  \
-  HWY_ATTR void transpose_gather_##SUFFIX(std::int64_t begin, std::int64_t end,      \
-                                          bool full, TransposeViews<T> v, Cplx<T> *H,\
-                                          std::int64_t t0, std::int64_t n_tc) {      \
-    if (full) transpose_gather_impl<T, true>(begin, end, v, H, t0, n_tc);            \
-    else transpose_gather_impl<T, false>(begin, end, v, H, t0, n_tc);                \
+#define RI_INTERP_TRANSPOSE_TARGETS(SUFFIX, T)                                        \
+  HWY_ATTR void transpose_slab_##SUFFIX(bool full, TransposeViews<T> v, Cplx<T> *H,   \
+                                        std::int64_t r, std::int64_t t_lo,            \
+                                        std::int64_t t_hi, std::int64_t tp_lo,        \
+                                        std::int64_t tp_hi) {                         \
+    if (full) transpose_cells_impl<T, true>(v, H, r, t_lo, t_hi, tp_lo, tp_hi);       \
+    else transpose_cells_impl<T, false>(v, H, r, t_lo, t_hi, tp_lo, tp_hi);           \
+    transpose_gather_impl<T>(v, H, r, t_lo, t_hi, tp_lo, tp_hi);                      \
   }
 
 RI_INTERP_TRANSPOSE_TARGETS(f32, float)
@@ -259,36 +252,48 @@ ffi::Future calc_rfi_interp_transpose_cpu_impl_tmpl(
       Tensor4D<T *>(FULL ? (*delay_bar)->typed_data() : nullptr, dd[0], dd[1], dd[2], dd[3]),
   };
   const std::int64_t n_ant = a[0], n_rfi = a[1], n_freq = a[2], n_time = a[3];
-  const std::int64_t n_stencil = w_freq.dimensions()[1] * w_time.dimensions()[1];
-  const std::int64_t n_slots = FULL ? n_stencil + 1 + dd[3] : n_stencil;
-  // Time chunk: as many cells as keep H within 256 MB, at least one.
-  const std::size_t per_cell = sizeof(Cplx<T>) * std::size_t(n_ant) * n_rfi * n_freq * n_slots;
-  std::int64_t n_tc = std::int64_t((256u * 1024 * 1024) / per_cell);
-  n_tc = std::max<std::int64_t>(1, std::min<std::int64_t>(n_tc, n_time));
-  auto H = std::make_shared<std::vector<Cplx<T>>>(std::size_t(n_ant) * n_rfi * n_freq * n_tc * n_slots);
-  Cplx<T> *H_ptr = H->data();
-  std::fill_n(reinterpret_cast<Cplx<T> *>(amp_bar->typed_data()), amp.element_count(), Cplx<T>{0, 0});
+  const std::int64_t n_st = w_time.dimensions()[1];
+  const std::int64_t n_stencil = w_freq.dimensions()[1] * n_st;
 
-  using Body = std::function<void(std::int64_t, std::int64_t)>;
-  std::vector<std::pair<std::int64_t, Body>> phases;
-  for (std::int64_t t0 = 0; t0 < n_time; t0 += n_tc) {
-    const std::int64_t cells = std::min<std::int64_t>(n_tc, n_time - t0);
-    phases.emplace_back(cells, [views, H, H_ptr, t0, cells](std::int64_t b, std::int64_t e) {
-      if constexpr (std::is_same_v<T, float>) {
-        RI_KERNELS_EXPORT_AND_DISPATCH_T(transpose_cells_f32)(b, e, FULL, views, H_ptr, t0, cells);
-      } else {
-        RI_KERNELS_EXPORT_AND_DISPATCH_T(transpose_cells_f64)(b, e, FULL, views, H_ptr, t0, cells);
-      }
-    });
-    phases.emplace_back(n_ant * n_rfi, [views, H, H_ptr, t0, cells](std::int64_t b, std::int64_t e) {
-      if constexpr (std::is_same_v<T, float>) {
-        RI_KERNELS_EXPORT_AND_DISPATCH_T(transpose_gather_f32)(b, e, FULL, views, H_ptr, t0, cells);
-      } else {
-        RI_KERNELS_EXPORT_AND_DISPATCH_T(transpose_gather_f64)(b, e, FULL, views, H_ptr, t0, cells);
-      }
-    });
-  }
-  return parallel_phases(thread_pool, std::move(phases));
+  // Tasks are (source, run of output cells) pairs, each writing a disjoint
+  // slab of every output. A run also builds the n_st - 1 cells on either side
+  // of itself, the only work two tasks repeat, so runs want to be long; its
+  // stencil cotangents are a buffer the worker allocates for itself, so they
+  // also want to fit in a budget shared between the workers. Between the two,
+  // enough runs to keep every worker busy and no more.
+  const std::int64_t workers = std::max<std::int64_t>(thread_pool.num_threads(), 1);
+  const std::size_t per_cell = sizeof(Cplx<T>) * std::size_t(n_ant) * n_freq * n_stencil;
+  const std::size_t budget = std::max<std::size_t>(4u << 20, (256u << 20) / workers);
+  std::int64_t run_len = std::int64_t(budget / per_cell) - 2 * (n_st - 1);
+  run_len = std::min<std::int64_t>(std::max<std::int64_t>(1, run_len), n_time);
+  // No more runs than the workers need: fewer, longer runs repeat less work.
+  const std::int64_t runs_wanted = std::max<std::int64_t>(1, (workers + n_rfi - 1) / n_rfi);
+  run_len = std::max<std::int64_t>(run_len, 1);
+  run_len = std::min<std::int64_t>(run_len, std::max<std::int64_t>(1, (n_time + runs_wanted - 1) / runs_wanted));
+  const std::int64_t n_runs = (n_time + run_len - 1) / run_len;
+  const std::size_t per_task = per_cell * std::size_t(run_len + 2 * (n_st - 1));
+
+  return parallel_for(
+      thread_pool, n_rfi * n_runs,
+      [views, per_task, n_runs, run_len, n_time, n_st](std::int64_t begin,
+                                                       std::int64_t end) mutable {
+        std::vector<Cplx<T>> H(per_task / sizeof(Cplx<T>));
+        for (std::int64_t item = begin; item < end; ++item) {
+          const std::int64_t r = item / n_runs, run = item % n_runs;
+          const std::int64_t tp_lo = run * run_len;
+          const std::int64_t tp_hi = std::min<std::int64_t>(n_time, tp_lo + run_len);
+          if (tp_lo >= tp_hi) continue;
+          const std::int64_t t_lo = std::max<std::int64_t>(0, tp_lo - n_st + 1);
+          const std::int64_t t_hi = std::min<std::int64_t>(n_time, tp_hi + n_st - 1);
+          if constexpr (std::is_same_v<T, float>) {
+            RI_KERNELS_EXPORT_AND_DISPATCH_T(transpose_slab_f32)
+            (FULL, views, H.data(), r, t_lo, t_hi, tp_lo, tp_hi);
+          } else {
+            RI_KERNELS_EXPORT_AND_DISPATCH_T(transpose_slab_f64)
+            (FULL, views, H.data(), r, t_lo, t_hi, tp_lo, tp_hi);
+          }
+        }
+      });
 }
 
 
