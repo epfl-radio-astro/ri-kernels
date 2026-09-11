@@ -30,6 +30,7 @@
 // the two staged tiles and the two Q tiles (the chunk is sized for 16 KB):
 // within the 48 KB every device offers, whatever the stencil.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -120,8 +121,8 @@ __device__ inline INT_T tile_pair_index(INT_T I, INT_T J, INT_T n_tiles) {
 
 template <typename T, typename INT_T, bool FULL>
 __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_pairs(
-    TransposeViews<T, INT_T> v, INT_T n_tiles, INT_T n_tile_pairs, INT_T t0, INT_T n_tc) {
-  constexpr int kChunk = ChunkT<T>::value;
+    TransposeViews<T, INT_T> v, INT_T n_tiles, INT_T n_tile_pairs, INT_T t0, INT_T n_tc,
+    INT_T kChunk) {
   extern __shared__ unsigned char dynamic_shared[];
 
   const INT_T n_ant = v.amp.shape[0], n_rfi = v.amp.shape[1];
@@ -350,10 +351,34 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
   const INT_T n_tiles = (n_ant + kTileT - 1) / kTileT;
   const INT_T n_tile_pairs = n_tiles * (n_tiles + 1) / 2;
 
-  constexpr int kChunk = ChunkT<T>::value;
+  // Shared memory: the cell's weight rows, the tile pair's cotangent weights in
+  // both layouts, and the staged tiles. Only the last is ours to size, so the
+  // chunk halves until the whole fits what the device will give a block -- 48 KB
+  // everywhere, more on a kernel that opts in. The weight rows grow with the
+  // stencil width and the samples per cell, so a long cell in double precision
+  // is what runs this out, and it does so before the tiles do.
   const std::size_t head = (sizeof(T) * (n_sf * n_int_f + n_st * n_int_t) + 15) / 16 * 16;
-  const std::size_t shared = head + sizeof(Cplx<T>) * (2 * std::size_t(kTileT) * kTileT + 4 * std::size_t(kChunk) * kTileT)
-                             + (FULL ? sizeof(T) * 2 * std::size_t(kChunk) * kTileT : 0);
+  const std::size_t fixed = head + sizeof(Cplx<T>) * 2 * std::size_t(kTileT) * kTileT;
+  const std::size_t per_sample =
+      sizeof(Cplx<T>) * 4 * std::size_t(kTileT) + (FULL ? sizeof(T) * 2 * std::size_t(kTileT) : 0);
+  const std::size_t shared_limit = max_dynamic_shared_bytes();
+  std::int64_t kChunk = ChunkT<T>::value;
+  while (kChunk > 1 && fixed + per_sample * std::size_t(kChunk) > shared_limit) kChunk /= 2;
+  if (kChunk > std::int64_t(n_s)) kChunk = std::max<std::int64_t>(1, std::int64_t(n_s));
+  const std::size_t shared = fixed + per_sample * std::size_t(kChunk);
+  if (shared > shared_limit)
+    return ffi::Error::InvalidArgument(
+        "The transpose needs " + std::to_string(shared) + " bytes of shared memory and this device "
+        "offers " + std::to_string(shared_limit) + ". The stencil rows of one cell are " +
+        std::to_string(head) + " of that and grow with the stencil width and the samples per cell, "
+        "so a shorter cell, a narrower stencil or single precision will fit.");
+  if (shared > 48 * 1024) {
+    const auto attr = cudaFuncSetAttribute(rfi_interp_transpose_pairs<T, INT_T, FULL>,
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared));
+    if (attr != cudaSuccess)
+      return ffi::Error::Internal(std::string("Could not raise the shared memory limit to ") +
+                                  std::to_string(shared) + " bytes: " + cudaGetErrorString(attr));
+  }
 
   // Time chunk: as many cells as keep the scratch (the per-tile-pair partials,
   // the samples and the phase factors) within 256 MB, at least one.
@@ -415,7 +440,8 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
     if (status != cudaSuccess)
       return ffi::Error::Internal(std::string("GPU kernel launch error: ") + cudaGetErrorString(status));
     const auto grid = create_clamped_grid(n_freq * cells, n_tile_pairs, 1);
-    rfi_interp_transpose_pairs<T, INT_T, FULL><<<grid, kBlockT, shared, stream>>>(views, n_tiles, n_tile_pairs, t0, cells);
+    rfi_interp_transpose_pairs<T, INT_T, FULL><<<grid, kBlockT, shared, stream>>>(
+        views, n_tiles, n_tile_pairs, t0, cells, INT_T(kChunk));
     status = cudaGetLastError();
     if (status != cudaSuccess)
       return ffi::Error::Internal(std::string("GPU kernel launch error: ") + cudaGetErrorString(status));

@@ -263,6 +263,26 @@ template <typename T> struct TransposeViews {
 // Which derivative a JVP kernel carries.
 enum class JvpMode { kNone = 0, kSignal = 1, kFull = 2 };
 
+#ifdef __CUDACC__
+// The dynamic shared memory a block may have. 48 KB is what every device
+// offers without asking; sm_70 and later will grant more per block, but only
+// for a kernel that opts in, so the caller has to set the attribute as well.
+// Returns 0 if the device cannot be queried.
+inline std::size_t max_dynamic_shared_bytes() {
+  static const std::size_t limit = [] {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return std::size_t(48 * 1024);
+    int optin = 0;
+    if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess)
+      return std::size_t(48 * 1024);
+    return std::size_t(optin > 0 ? optin : 48 * 1024);
+  }();
+
+  return limit;
+}
+
+#endif
+
 // Host-side check of the stencil contract (see the top of this file).
 inline bool stencils_cover_their_cells(const int *start, std::int64_t n_cells,
                                        std::int64_t n_stencil) {

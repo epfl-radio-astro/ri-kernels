@@ -467,3 +467,53 @@ def test_the_signal_only_kernels_serve_a_fixed_phase(precision):
     assert "rfi_interp_jvp_op" in text and "rfi_interp_full_jvp_op" not in text
     text = str(jax.make_jaxpr(lambda p, t: jax.jvp(lambda x: op.eval(args[0], x, *args[2:]), (p,), (t,)))(args[1], args[1]))
     assert "rfi_interp_full_jvp_op" in text
+
+
+@pytest.mark.parametrize("n_int_t", [174, 400])
+def test_a_long_cell_still_fits_shared_memory(precision, n_int_t, device):
+    """The staged tiles shrink until the block fits what the device offers.
+
+    The weight rows of one cell are held in shared memory and grow with the
+    stencil width and the samples per cell, so in double precision a long cell
+    used to ask for more than the 48 KB every device gives a block and the
+    launch failed with a bare "invalid argument". The chunk of samples is the
+    part that is ours to size, and it halves until the whole fits.
+    """
+    real, complex_ = precision
+    args = make_inputs(real, complex_, n_ant=4, n_rfi=1, n_freq=1, n_time=3,
+                       n_int_f=1, n_int_t=n_int_t, half_width=1)
+    a1, a2 = make_baselines(4, autocorr=False)
+    op = RFIInterpVisOp(4, a1, a2)
+
+    expected = reference(*expected_args(args, real), a1, a2)
+    assert_close(op.eval(*args), expected, real)
+
+    cot = jnp.ones((len(a1),) + args[0].shape[2:], dtype=complex_)
+    _, pullback = jax.vjp(lambda a: op.eval(a, *args[1:]), args[0])
+    ref_args = expected_args(args, real)
+    _, ref_pullback = jax.vjp(lambda a: reference(a, *ref_args[1:], a1, a2), ref_args[0])
+    assert_close(pullback(cot)[0],
+                 ref_pullback(upcast(cot) if real == jnp.float32 else cot)[0], real)
+
+
+def test_a_cell_too_long_for_shared_memory_says_so(device):
+    """And when even one sample's worth does not fit, the error names the cause.
+
+    The weight rows are the term that grows; nothing the kernel can shrink will
+    make room for them, so the message has to point at the stencil and the cell
+    rather than leave a bare launch failure.
+    """
+    if device.platform != "gpu":
+        pytest.skip("the shared memory limit is a GPU one")
+    if not jax.config.jax_enable_x64:
+        pytest.skip("single precision fits far longer cells")
+
+    args = make_inputs(jnp.float64, jnp.complex128, n_ant=4, n_rfi=1, n_freq=1,
+                       n_time=3, n_int_f=1, n_int_t=4000, half_width=1)
+    a1, a2 = make_baselines(4, autocorr=False)
+    op = RFIInterpVisOp(4, a1, a2)
+    cot = jnp.ones((len(a1),) + args[0].shape[2:], dtype=jnp.complex128)
+    _, pullback = jax.vjp(lambda a: op.eval(a, *args[1:]), args[0])
+
+    with pytest.raises(Exception, match="shared memory"):
+        jax.block_until_ready(pullback(cot))
