@@ -1,12 +1,14 @@
 // The fine samples of a chunk of time cells, materialised once per cell so
 // that the staged kernels stage them with contiguous loads instead of each
 // rebuilding them, per tile pair the antenna sits in, from a dozen scattered
-// gathers per sample.
+// gathers per sample. When one time cell would exceed the scratch budget,
+// only a range of channels is materialised at once. Stencil reads still use
+// the full input grid, since a channel's stencil can cross that range.
 //
-// For the cells (f, t0 + t_local) of the chunk, source r, fine sample s of
+// For the cells (f0 + f_local, t0 + t_local), source r, fine sample s of
 // the cell (time-major: s = v * n_int_f + u) and antenna a, at
 //
-//   ((((f * n_tc + t_local) * n_rfi + r) * n_s + s) * n_ant + a)
+//   ((((f_local * n_tc + t_local) * n_rfi + r) * n_s + s) * n_ant + a)
 //
 // the buffer holds S = A_interp exp(i phi), the sample the kernels multiply;
 // a second buffer, by mode, holds the phase factor exp(i phi) (the transpose
@@ -19,6 +21,7 @@
 #include <cstdint>
 
 #include "rfi_interp_common.hpp"
+#include "rfi_interp_scratch_gpu.cuh"
 #include "tensor.hpp"
 
 namespace ri_kernels {
@@ -44,16 +47,20 @@ __device__ __host__ inline std::int64_t sample_index(INT_T f, INT_T t_local, INT
 
 constexpr int kSampleBlock = 256;
 
-template <typename T, typename INT_T, int MODE>
+// SPLIT as in the staged kernels: the unsplit instantiation keeps one channel
+// index rather than a local and a global one.
+template <typename T, typename INT_T, int MODE, bool SPLIT>
 __global__ void __launch_bounds__(kSampleBlock) rfi_interp_samples_kernel(
-    SampleViews<T, INT_T> v, Cplx<T> *S, Cplx<T> *S2, INT_T t0, INT_T n_tc) {
-  const INT_T n_ant = v.amp.shape[0], n_rfi = v.amp.shape[1], n_freq = v.amp.shape[2];
+    SampleViews<T, INT_T> v, Cplx<T> *S, Cplx<T> *S2, InterpCellChunk<INT_T> cells) {
+  const INT_T n_ant = v.amp.shape[0], n_rfi = v.amp.shape[1];
+  const INT_T t0 = cells.t0, n_tc = cells.n_tc;
   const INT_T n_sf = v.w_freq.shape[1], n_int_f = v.w_freq.shape[2];
   const INT_T n_st = v.w_time.shape[1], n_int_t = v.w_time.shape[2];
   const INT_T n_s = n_int_f * n_int_t;
-  const INT_T n_blocks = n_freq * n_rfi * n_ant;
+  const INT_T n_blocks = (SPLIT ? cells.n_fc : v.amp.shape[2]) * n_rfi * n_ant;
   for (INT_T b = blockIdx.x; b < n_blocks; b += gridDim.x) {
-    const INT_T a = b % n_ant, r = (b / n_ant) % n_rfi, f = b / (n_ant * n_rfi);
+    const INT_T a = b % n_ant, r = (b / n_ant) % n_rfi, f_local = b / (n_ant * n_rfi);
+    const INT_T f = SPLIT ? cells.f0 + f_local : f_local;
     const INT_T sf = v.start_freq(f);
     const T freq_f = v.freqs(f);
     for (INT_T idx = threadIdx.x; idx < n_tc * n_s; idx += kSampleBlock) {
@@ -78,7 +85,7 @@ __global__ void __launch_bounds__(kSampleBlock) rfi_interp_samples_kernel(
           }
         }
       }
-      const std::int64_t o = sample_index(f, t_local, r, s, a, n_tc, n_rfi, n_s, n_ant);
+      const std::int64_t o = sample_index(f_local, t_local, r, s, a, n_tc, n_rfi, n_s, n_ant);
       const Cplx<T> sample = cmul(amp, e);
       S[o] = sample;
       if constexpr (MODE == kSamplesAndPhase) S2[o] = e;

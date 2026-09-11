@@ -5,9 +5,17 @@ The kernels are held to a plain JAX implementation of the same computation
 tables come from the polynomial (Lagrange) interpolant, which is what
 tabascal's ``rfi_vis:PolyInterpVisFFI`` feeds the operator, but nothing here
 depends on that: the operator takes the tables as data.
+
+Scratch-budget cases run in fresh processes because the GPU kernels cache the
+budget on their first call. They compare a forced frequency split with an
+unsplit run, as well as checking the differentiated JAX reference.
 """
 
 from math import factorial
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -467,6 +475,94 @@ def test_the_signal_only_kernels_serve_a_fixed_phase(precision):
     assert "rfi_interp_jvp_op" in text and "rfi_interp_full_jvp_op" not in text
     text = str(jax.make_jaxpr(lambda p, t: jax.jvp(lambda x: op.eval(args[0], x, *args[2:]), (p,), (t,)))(args[1], args[1]))
     assert "rfi_interp_full_jvp_op" in text
+
+
+def _frequency_chunk_results(precision_name, half_width, output_path, device_id):
+    """Subprocess entry point: exercise all five GPU variants under one budget."""
+    real, complex_ = ((jnp.float32, jnp.complex64) if precision_name == "float32"
+                      else (jnp.float64, jnp.complex128))
+    gpu = next(d for d in jax.devices("gpu") if d.id == int(device_id))
+    half_width = int(half_width)
+    # Both precisions have 128000 bytes of S per channel/time cell. At 1 MiB,
+    # forward uses width 6, JVP width 4 and both transposes width 3, over eleven
+    # channels. Every variant has a short tail; with half_width=3 every chunk
+    # is narrower than the seven-channel stencil. At 3 MiB all frequencies fit
+    # and the transposes still use one time cell, preserving gather grouping.
+    shape = dict(n_ant=5, n_rfi=8 if real == jnp.float32 else 4, n_freq=11,
+                 n_time=3, n_int_f=2, n_int_t=200, half_width=half_width)
+
+    def evaluate(eval_fn, args, dots, cot):
+        primal = jax.jit(eval_fn)(*args)
+        signal_fn = lambda a: eval_fn(a, *args[1:])
+        full_fn = lambda a, p, d: eval_fn(a, p, d, *args[3:])
+        _, signal_dot = jax.jvp(signal_fn, (args[0],), (dots[0],))
+        _, full_dot = jax.jvp(full_fn, tuple(args[:3]), dots)
+        _, signal_pullback = jax.vjp(signal_fn, args[0])
+        _, full_pullback = jax.vjp(full_fn, *args[:3])
+        amp_bar, phase_bar, delay_bar = full_pullback(cot)
+        return dict(primal=primal, signal_dot=signal_dot, full_dot=full_dot,
+                    signal_bar=signal_pullback(cot)[0], amp_bar=amp_bar,
+                    phase_bar=phase_bar, delay_bar=delay_bar)
+
+    with jax.default_device(gpu):
+        args = make_inputs(real, complex_, **shape)
+        a1, a2 = make_baselines(shape["n_ant"], shuffle=True)
+        op = RFIInterpVisOp(shape["n_ant"], a1, a2)
+        phase_dot, delay_dot = _phase_delay_tangents(args, real)
+        dots = (make_inputs(real, complex_, seed=1, **shape)[0], phase_dot, delay_dot)
+        rng = np.random.default_rng(2)
+        vis_shape = (len(a1), shape["n_freq"], shape["n_time"])
+        cot = jnp.asarray(rng.normal(size=vis_shape) + 1j * rng.normal(size=vis_shape), dtype=complex_)
+        actual = evaluate(op.eval, args, dots, cot)
+        actual = {name: np.asarray(value) for name, value in actual.items()}
+
+    if os.environ["RI_KERNELS_INTERP_SCRATCH_MB"] == "1":
+        # Keep the much larger fine-grid reference off the GPU. Double precision
+        # is the existing test convention even for a single-precision kernel.
+        cpu = jax.devices("cpu")[0]
+        with jax.default_device(cpu):
+            ref_args = expected_args([jax.device_put(x, cpu) for x in args], real)
+            ref_dots = tuple(upcast(jax.device_put(x, cpu)) for x in dots)
+            ref_cot = upcast(jax.device_put(cot, cpu))
+            ref_a1, ref_a2 = jax.device_put(a1, cpu), jax.device_put(a2, cpu)
+            expected = evaluate(lambda *xs: reference(*xs, ref_a1, ref_a2),
+                                ref_args, ref_dots, ref_cot)
+            for name in actual:
+                assert_close(actual[name], expected[name], real)
+    np.savez(output_path, **actual)
+
+
+@pytest.mark.parametrize("half_width", [1, 3], ids=["uneven-frequency-tails", "chunk-narrower-than-stencil"])
+def test_frequency_chunks_in_a_small_budget_subprocess(precision, half_width, device, tmp_path):
+    """A real budget forces frequency chunks, including stencil-crossing tails."""
+    if device.platform != "gpu":
+        pytest.skip("the scratch budget is a GPU one")
+    real, _ = precision
+    precision_name = "float32" if real == jnp.float32 else "float64"
+    outputs = []
+    for budget in (1, 3):
+        output_path = tmp_path / f"scratch-{budget}.npz"
+        env = dict(os.environ, RI_KERNELS_INTERP_SCRATCH_MB=str(budget),
+                   JAX_ENABLE_X64="true", XLA_PYTHON_CLIENT_PREALLOCATE="false")
+        # Preserve the parent's import path so the child loads the same checkout
+        # or installed extension, including when pytest supplied a custom path.
+        env["PYTHONPATH"] = os.pathsep.join(str(p) for p in sys.path)
+        child = subprocess.run(
+            [sys.executable, "-c",
+             "import runpy, sys; "
+             "runpy.run_path(sys.argv[1])['_frequency_chunk_results'](*sys.argv[2:])",
+             str(Path(__file__).resolve()), precision_name, str(half_width),
+             str(output_path), str(device.id)],
+            env=env, capture_output=True, text=True, timeout=300,
+        )
+        assert child.returncode == 0, child.stdout + child.stderr
+        with np.load(output_path) as data:
+            outputs.append({name: data[name] for name in data.files})
+    for name in outputs[0]:
+        split, unsplit = outputs[0][name], outputs[1][name]
+        assert split.dtype == unsplit.dtype and split.shape == unsplit.shape, name
+        # Compare bytes, including signed zero, rather than just allclose.
+        assert split.tobytes() == unsplit.tobytes(), name
 
 
 @pytest.mark.parametrize("n_int_t", [174, 400])

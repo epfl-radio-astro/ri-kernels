@@ -6,6 +6,10 @@
 // one cell (f, t): for each source and each chunk of the cell's fine samples
 // it loads the samples of the two tiles, contiguous runs, into shared memory,
 // then forms the baseline products of the tile pair from there.
+// If even one time cell exceeds the scratch budget, channels are materialised
+// in balanced chunks instead. Each channel owns separate output cells, so this
+// preserves the source and sample reductions without intermediate partials.
+// Otherwise the original full-frequency time batching is retained.
 //
 // The pairs a block forms are the ones the baseline list holds in its tile
 // pair, listed by the caller (tile_pairs, see rfi_interp_vis_op.py). The two
@@ -17,7 +21,6 @@
 // 48 KB default allows without opting in.
 
 #include <cstdint>
-#include <cstdlib>
 #include <algorithm>
 #include <limits>
 #include <string>
@@ -35,29 +38,6 @@ namespace ffi = xla::ffi;
 
 namespace ri_kernels {
 namespace gpu {
-
-// How much scratch one call may take for the chunk it works on. The kernels
-// walk the time cells in chunks so that this bounds what they hold whatever
-// the problem size; a smaller budget is more chunks and a smaller peak.
-// RI_INTERP_SCRATCH_MB sets the default at build time and the environment
-// variable overrides it at run time, so a run can be fitted to a card without
-// rebuilding.
-#ifndef RI_INTERP_SCRATCH_MB
-#define RI_INTERP_SCRATCH_MB 256u
-#endif
-
-inline std::size_t interp_scratch_budget() {
-  static const std::size_t budget = [] {
-    std::size_t mb = RI_INTERP_SCRATCH_MB;
-    if (const char *env = std::getenv("RI_KERNELS_INTERP_SCRATCH_MB")) {
-      const long value = std::strtol(env, nullptr, 10);
-      if (value > 0) mb = std::size_t(value);
-    }
-    return mb * 1024u * 1024u;
-  }();
-
-  return budget;
-}
 
 constexpr int kTile = 32;      // antennas per tile
 constexpr int kBlock = 256;    // threads per block
@@ -115,18 +95,22 @@ __device__ inline void tile_pair_of(INT_T tp, INT_T n_tiles, INT_T &I, INT_T &J)
   J = I + rem;
 }
 
-template <typename T, bool JVP, typename INT_T>
+// SPLIT says whether the channels of this call were split into chunks. The
+// unsplit instantiation is the common one and carries a single channel index
+// through the cell loop, as it did before chunking: holding both the local and
+// the global index costs a register in the innermost loop and about 4%.
+template <typename T, bool JVP, typename INT_T, bool SPLIT>
 __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
     InterpViews<T, INT_T> v, const Cplx<T> *S, const Cplx<T> *dS,
     Tensor3D<Cplx<T> *, INT_T> out, INT_T chunk, INT_T n_tiles, INT_T n_tile_pairs,
-    INT_T t0, INT_T n_tc) {
+    InterpCellChunk<INT_T> cells) {
   extern __shared__ unsigned char dynamic_shared[];
 
   const INT_T n_ant = v.amp.shape[0], n_rfi = v.amp.shape[1];
-  const INT_T n_freq = v.amp.shape[2];
+  const INT_T t0 = cells.t0, n_tc = cells.n_tc;
   const INT_T n_int_f = v.w_freq.shape[2], n_int_t = v.w_time.shape[2];
   const INT_T n_s = n_int_f * n_int_t;
-  const INT_T n_cells = n_freq * n_tc;
+  const INT_T n_cells = (SPLIT ? cells.n_fc : v.amp.shape[2]) * n_tc;
 
   // Layout: the staged tiles, sample-major (tile[s * kTile + a]).
   Cplx<T> *tile_I = reinterpret_cast<Cplx<T> *>(dynamic_shared);
@@ -159,7 +143,8 @@ __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
     if (v.tile_pairs(tp, 0) < 0) continue;
 
     for (INT_T cell = blockIdx.x; cell < n_cells; cell += gridDim.x) {
-      const INT_T f = cell / n_tc, t_local = cell % n_tc, t = t0 + t_local;
+      const INT_T f_local = cell / n_tc, t_local = cell % n_tc, t = t0 + t_local;
+      const INT_T f = SPLIT ? cells.f0 + f_local : f_local;
 
       Cplx<T> acc[kPairs];
       for (int k = 0; k < kPairs; ++k) acc[k] = Cplx<T>{0, 0};
@@ -174,12 +159,12 @@ __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
             const INT_T s_local = idx / kTile, a_local = idx % kTile;
             const INT_T s = s0 + s_local;
             const INT_T a = I * kTile + a_local;
-            const std::int64_t o = sample_index(f, t_local, r, s, a, n_tc, n_rfi, n_s, n_ant);
+            const std::int64_t o = sample_index(f_local, t_local, r, s, a, n_tc, n_rfi, n_s, n_ant);
             tile_I[idx] = a < n_ant ? S[o] : Cplx<T>{0, 0};
             if constexpr (JVP) dtile_I[idx] = a < n_ant ? dS[o] : Cplx<T>{0, 0};
             if (!same) {
               const INT_T a2 = J * kTile + a_local;
-              const std::int64_t o2 = sample_index(f, t_local, r, s, a2, n_tc, n_rfi, n_s, n_ant);
+              const std::int64_t o2 = sample_index(f_local, t_local, r, s, a2, n_tc, n_rfi, n_s, n_ant);
               tile_J[idx] = a2 < n_ant ? S[o2] : Cplx<T>{0, 0};
               if constexpr (JVP) dtile_J[idx] = a2 < n_ant ? dS[o2] : Cplx<T>{0, 0};
             }
@@ -254,43 +239,55 @@ ffi::Error calc_rfi_interp_gpu_dispatch(
   Tensor3D<Cplx<T> *, INT_T> out_view(
       reinterpret_cast<Cplx<T> *>(out->typed_data()), out->dimensions()[0],
       out->dimensions()[1], out->dimensions()[2]);
-  const INT_T n_ant = a[0], n_rfi = a[1], n_freq = a[2], n_time = a[3];
-  const INT_T n_int_f = w_freq.dimensions()[2], n_int_t = w_time.dimensions()[2];
-  const INT_T n_s = n_int_f * n_int_t;
-  const INT_T n_tiles = (n_ant + kTile - 1) / kTile;
-  const INT_T n_tile_pairs = n_tiles * (n_tiles + 1) / 2;
+  const std::int64_t n_ant = a[0], n_rfi = a[1], n_freq = a[2], n_time = a[3];
+  const std::int64_t n_int_f = w_freq.dimensions()[2], n_int_t = w_time.dimensions()[2];
+  std::int64_t n_s, sample_per_freq;
+  if (!interp_checked_product({n_int_f, n_int_t}, n_s) ||
+      !interp_checked_product({sizeof(Cplx<T>), n_ant, n_rfi, n_s}, sample_per_freq))
+    return ffi::Error::InvalidArgument("Interpolation sample size exceeds the 64-bit byte range");
+  InterpChunkPlan plan;
+  auto plan_status = make_interp_chunk_plan(n_time, n_freq, sample_per_freq, 0, JVP ? 2 : 1, plan);
+  if (!plan_status.success()) return plan_status;
+  std::int64_t sample_work;
+  if (!interp_checked_product({n_s, plan.n_tc}, sample_work) ||
+      sample_work > std::numeric_limits<INT_T>::max())
+    return ffi::Error::InvalidArgument("Interpolation sample count exceeds the kernel index range");
+  const auto n_tiles = interp_ceil_div(n_ant, kTile);
+  std::int64_t tile_product;
+  if (!interp_checked_product({n_tiles, n_tiles + 1}, tile_product) ||
+      tile_product / 2 > std::numeric_limits<INT_T>::max())
+    return ffi::Error::InvalidArgument("Interpolation tile count exceeds the kernel index range");
+  const auto n_tile_pairs = tile_product / 2;
   const int n_tiles_shared = JVP ? 4 : 2;
   // The staged tiles are all this kernel keeps in shared memory, and the chunk
   // is sized from what the device will give a block rather than from a
   // constant: 32 KB where that is all there is, more where a kernel may opt in.
   const std::size_t shared_limit = max_dynamic_shared_bytes();
   const std::size_t stage_budget = std::min<std::size_t>(shared_limit, 32 * 1024);
-  const INT_T chunk = INT_T(staged_samples<T>(n_int_f * n_int_t, n_tiles_shared, stage_budget));
+  const auto chunk = staged_samples<T>(n_s, n_tiles_shared, stage_budget);
   const std::size_t shared = sizeof(Cplx<T>) * kTile * chunk * n_tiles_shared;
   if (shared > shared_limit)
     return ffi::Error::Internal(
         "One sample of an antenna tile needs " + std::to_string(shared) +
         " bytes of shared memory and this device offers " + std::to_string(shared_limit));
   if (shared > 48 * 1024) {
-    const auto attr = cudaFuncSetAttribute(rfi_interp_staged_kernel<T, JVP, INT_T>,
-                                           cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared));
-    if (attr != cudaSuccess)
-      return ffi::Error::Internal(std::string("Could not raise the shared memory limit to ") +
-                                  std::to_string(shared) + " bytes: " + cudaGetErrorString(attr));
+    for (const auto fn : {reinterpret_cast<const void *>(rfi_interp_staged_kernel<T, JVP, INT_T, false>),
+                          reinterpret_cast<const void *>(rfi_interp_staged_kernel<T, JVP, INT_T, true>)}) {
+      const auto attr =
+          cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, int(shared));
+      if (attr != cudaSuccess)
+        return ffi::Error::Internal(std::string("Could not raise the shared memory limit to ") +
+                                    std::to_string(shared) + " bytes: " + cudaGetErrorString(attr));
+    }
   }
 
-  // The samples of a chunk of time cells: as many cells as keep them within
-  // 256 MB, at least one.
-  // A time cell of the chunk spans every channel: n_freq cells of samples.
-  const std::size_t per_cell = sizeof(Cplx<T>) * std::size_t(n_ant) * n_rfi * n_freq * n_s * (JVP ? 2 : 1);
-  INT_T n_tc = INT_T(interp_scratch_budget() / per_cell);
-  if (n_tc < 1) n_tc = 1;
-  if (n_tc > n_time) n_tc = n_time;
-  auto s_mem = scratch.Allocate(per_cell * n_tc, alignof(Cplx<T>));
+  // One allocation is reused by every time and frequency chunk. The second
+  // buffer starts at its capacity offset even when the last chunk is shorter.
+  auto s_mem = scratch.Allocate(std::size_t(plan.total_bytes), alignof(Cplx<T>));
   if (!s_mem.has_value())
     return ffi::Error::Internal("Could not allocate scratch memory for the fine samples");
   Cplx<T> *S = reinterpret_cast<Cplx<T> *>(*s_mem);
-  Cplx<T> *dS = JVP ? S + std::size_t(n_ant) * n_rfi * n_freq * n_s * n_tc : nullptr;
+  Cplx<T> *dS = JVP ? S + plan.sample_bytes / sizeof(Cplx<T>) : nullptr;
   const auto dd = delay.dimensions();
   const SampleViews<T, INT_T> sample_views{
       views.amp, amp_dot_view, views.phase, views.delay,
@@ -298,21 +295,40 @@ ffi::Error calc_rfi_interp_gpu_dispatch(
       Tensor4D<const T *, INT_T>(delay_dot.typed_data(), dd[0], dd[1], dd[2], dd[3]),
       views.w_freq, views.w_time, views.start_freq, views.start_time, views.dnu, views.dt, views.freqs};
   constexpr int mode = JVP ? (FULL ? kSamplesAndFullTangent : kSamplesAndTangent) : kSamplesOnly;
+  const bool split = plan.n_fc != n_freq;
 
-  for (INT_T t0 = 0; t0 < n_time; t0 += n_tc) {
-    const INT_T cells = n_time - t0 < n_tc ? n_time - t0 : n_tc;
-    const auto sample_grid = create_clamped_grid(int(n_freq * n_rfi * n_ant), 1, 1);
-    rfi_interp_samples_kernel<T, INT_T, mode>
-        <<<sample_grid, kSampleBlock, 0, stream>>>(sample_views, S, dS, t0, cells);
-    auto status = cudaGetLastError();
-    if (status != cudaSuccess)
-      return ffi::Error::Internal(std::string("GPU kernel launch error: ") + cudaGetErrorString(status));
-    const auto grid = create_clamped_grid(n_freq * cells, n_tile_pairs, 1);
-    rfi_interp_staged_kernel<T, JVP, INT_T><<<grid, kBlock, shared, stream>>>(
-        views, S, dS, out_view, chunk, n_tiles, n_tile_pairs, t0, cells);
-    status = cudaGetLastError();
-    if (status != cudaSuccess)
-      return ffi::Error::Internal(std::string("GPU kernel launch error: ") + cudaGetErrorString(status));
+  for (std::int64_t t0 = 0; t0 < n_time;) {
+    const auto nt = std::min<std::int64_t>(n_time - t0, plan.n_tc);
+    for (std::int64_t f0 = 0; f0 < n_freq;) {
+      const auto nf = std::min<std::int64_t>(n_freq - f0, plan.n_fc);
+      std::int64_t sample_blocks, cell_blocks;
+      if (!interp_checked_product({nf, n_rfi, n_ant}, sample_blocks) ||
+          !interp_checked_product({nf, nt}, cell_blocks))
+        return ffi::Error::InvalidArgument("Interpolation launch size exceeds the 64-bit index range");
+      const InterpCellChunk<INT_T> cells{INT_T(t0), INT_T(nt), INT_T(f0), INT_T(nf)};
+      const auto sample_grid = create_clamped_grid(interp_grid_extent(sample_blocks), 1, 1);
+      if (split)
+        rfi_interp_samples_kernel<T, INT_T, mode, true>
+            <<<sample_grid, kSampleBlock, 0, stream>>>(sample_views, S, dS, cells);
+      else
+        rfi_interp_samples_kernel<T, INT_T, mode, false>
+            <<<sample_grid, kSampleBlock, 0, stream>>>(sample_views, S, dS, cells);
+      auto status = cudaGetLastError();
+      if (status != cudaSuccess)
+        return ffi::Error::Internal(std::string("GPU kernel launch error: ") + cudaGetErrorString(status));
+      const auto grid = create_clamped_grid(interp_grid_extent(cell_blocks), interp_grid_extent(n_tile_pairs), 1);
+      if (split)
+        rfi_interp_staged_kernel<T, JVP, INT_T, true><<<grid, kBlock, shared, stream>>>(
+            views, S, dS, out_view, INT_T(chunk), INT_T(n_tiles), INT_T(n_tile_pairs), cells);
+      else
+        rfi_interp_staged_kernel<T, JVP, INT_T, false><<<grid, kBlock, shared, stream>>>(
+            views, S, dS, out_view, INT_T(chunk), INT_T(n_tiles), INT_T(n_tile_pairs), cells);
+      status = cudaGetLastError();
+      if (status != cudaSuccess)
+        return ffi::Error::Internal(std::string("GPU kernel launch error: ") + cudaGetErrorString(status));
+      f0 += nf;
+    }
+    t0 += nt;
   }
   return ffi::Error::Success();
 }
