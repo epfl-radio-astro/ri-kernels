@@ -389,3 +389,37 @@ def test_the_pair_table_indexes_the_baseline_list():
     for bl, (i, j) in enumerate(zip(np.asarray(a1), np.asarray(a2))):
         assert table[i, j] == bl
     assert (table >= 0).sum() == len(a1)
+
+
+def test_the_tile_pair_list_holds_each_pair_once_sorted_by_stride():
+    from ri_kernels.jax_api.rfi_interp_vis_op import TILE, tile_pair_list
+
+    n_ant = 70  # three tiles, the last one partial
+    a1, a2 = (np.asarray(x) for x in make_baselines(n_ant, shuffle=True))
+    stride = np.random.default_rng(5).integers(1, 7, size=len(a1)).astype(np.int32)
+    lst = tile_pair_list(n_ant, a1, a2, stride)
+    n_tiles = 3
+    assert lst.shape == (n_tiles * (n_tiles + 1) // 2, TILE * TILE) and lst.dtype == np.int32
+
+    seen = {}
+    for tp, row in enumerate(lst):
+        entries = row[row >= 0]
+        assert (row[len(entries):] == -1).all(), "padding after the entries"
+        strides = entries >> 10
+        assert (np.diff(strides) <= 0).all(), "sorted by descending stride"
+        I = 0
+        rem = tp
+        while rem >= n_tiles - I:
+            rem -= n_tiles - I
+            I += 1
+        J = I + rem
+        for e in entries:
+            i, j = I * TILE + (e & 1023) // TILE, J * TILE + (e & (TILE - 1))
+            assert i < n_ant and j < n_ant
+            if I == J:
+                assert i <= j
+            seen[(i, j, int(e >> 10))] = seen.get((i, j, int(e >> 10)), 0) + 1
+    assert all(n == 1 for n in seen.values()), "each (pair, stride) once"
+    expected = {(min(p, q), max(p, q), int(s)) if p // TILE == q // TILE else ((p, q, int(s)) if p // TILE < q // TILE else (q, p, int(s)))
+                for p, q, s in zip(a1, a2, stride)}
+    assert set(seen) == expected

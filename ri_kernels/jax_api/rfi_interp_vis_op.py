@@ -45,6 +45,47 @@ from .rfi_vis_op import (
 )
 
 
+#: Antennas per tile in the staged GPU kernels; the tile-pair list is built for it.
+TILE = 32
+
+
+def tile_pair_list(n_ant, a1, a2, stride):
+    """The active antenna pairs of each unordered tile pair, sorted by stride.
+
+    The staged GPU kernels give a block one pair of antenna tiles and its
+    threads the pairs within it; a thread works one pair's own subset of the
+    samples, so neighbouring threads must hold pairs of like stride or a warp
+    idles on the slow ones while it serves the fast. Row ``tp`` of the result,
+    for the unordered tile pair ``(I, J)`` with ``I <= J`` in the order
+    ``(0,0), (0,1), ..., (0,n-1), (1,1), ...``, lists the pairs the baseline
+    list holds in that tile pair as ``i_local * TILE + j_local + stride << 10``
+    (the pair's (I, J) ordering; within a tile paired with itself
+    ``i_local <= j_local``), sorted by descending stride and, within a stride,
+    along the tile's diagonals ``(j_local - i_local) % TILE``, so that the
+    pairs of consecutive threads have distinct antennas on both sides and
+    their scatter-adds do not collide. Padded with -1. Both orderings of a
+    pair share an entry when they share a stride and have one each otherwise.
+    Shape ``(n_tile_pairs, TILE * TILE)`` int32.
+    """
+    n_tiles = (n_ant + TILE - 1) // TILE
+    n_tile_pairs = n_tiles * (n_tiles + 1) // 2
+    rows = [[] for _ in range(n_tile_pairs)]
+    for b in range(len(a1)):
+        p, q = int(a1[b]), int(a2[b])
+        i, j = (p, q) if p // TILE <= q // TILE else (q, p)
+        I, J = i // TILE, j // TILE
+        il, jl = i % TILE, j % TILE
+        if I == J and il > jl:
+            il, jl = jl, il
+        tp = I * n_tiles - I * (I - 1) // 2 + (J - I)
+        rows[tp].append((-int(stride[b]), (jl - il) % TILE, il, jl))
+    out = np.full((n_tile_pairs, TILE * TILE), -1, dtype=np.int32)
+    for tp, row in enumerate(rows):
+        row = sorted(set(row))
+        out[tp, : len(row)] = [il * TILE + jl + (-neg_stride << 10) for neg_stride, _, il, jl in row]
+    return out
+
+
 class RFIInterpVisOp:
     """Compute RFI visibilities from the data grid."""
 
@@ -80,6 +121,7 @@ class RFIInterpVisOp:
         if (stride < 1).any():
             raise ValueError("RFIInterpVisOp strides must be at least 1")
         self.stride = jnp.asarray(stride, dtype=jnp.int32)
+        self.tile_pairs = jnp.asarray(tile_pair_list(n_ant, np.asarray(a1), np.asarray(a2), stride))
 
     @property
     def indices(self):
@@ -87,7 +129,9 @@ class RFIInterpVisOp:
         return (
             self.a1, self.a1_sorter, self.a1_start,
             self.a2, self.a2_sorter, self.a2_start, self.pair_index, self.stride,
+            self.tile_pairs,
         )
+
 
     def eval(self, amp, phase, delay_us, w_freq, start_freq, w_time, start_time, dnu_mhz, dt, freq_mhz):
         """Evaluate the visibilities, ``(n_bl, n_freq, n_time)``.
@@ -171,8 +215,8 @@ def _check_interp_lib(platform):
 
 
 #: Index arrays every primitive takes first: a1, a1_sorter, a1_start, a2,
-#: a2_sorter, a2_start, pair_index, stride.
-N_IDX = 8
+#: a2_sorter, a2_start, pair_index, stride, tile_pairs.
+N_IDX = 9
 
 # The positional layout of the primal arguments after the index arrays.
 _ARRAY_NAMES = (
@@ -238,12 +282,14 @@ def _output_aval(a1, amp):
 
 def _validate_indices(args):
     """The shapes of the index arrays; their values the CPU kernels check."""
-    a1, pair, stride = args[0], args[6], args[7]
+    a1, pair, stride, tile_pairs = args[0], args[6], args[7], args[8]
     n_bl = a1.shape[0]
     if stride.shape != (n_bl,) or jnp.dtype(stride.dtype) != jnp.int32:
         raise ValueError(f"Expected an int32 stride per baseline, ({n_bl},); got {stride.shape} {stride.dtype}")
     if jnp.dtype(pair.dtype) != jnp.int32 or len(pair.shape) != 2:
         raise ValueError(f"Expected an int32 (n_ant, n_ant) pair table; got {pair.shape} {pair.dtype}")
+    if jnp.dtype(tile_pairs.dtype) != jnp.int32 or len(tile_pairs.shape) != 2 or tile_pairs.shape[1] != TILE * TILE:
+        raise ValueError(f"Expected an int32 (n_tile_pairs, {TILE * TILE}) tile-pair list; got {tile_pairs.shape} {tile_pairs.dtype}")
 
 
 def _lowering(prefix, platform):

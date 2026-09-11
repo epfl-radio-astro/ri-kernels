@@ -126,6 +126,11 @@ vis = RFIInterpVisOp(n_ant, a1, a2, stride=None).eval(
 baseline integrates, from sample `stride // 2` (1, the default, is all of
 them): the variable sampling of tabascal's `RiemannVisVariable`, done inside
 the kernel, so the slow baselines of an array cost a fraction of the fast ones.
+The constructor also builds, per pair of 32-antenna tiles, the list of the
+pairs the baselines cover there sorted by stride (`tile_pair_list`); the
+staged GPU kernels work a tile pair per block and walk that list, so that a
+warp's threads hold pairs of like stride and each pair visits only its own
+samples.
 
 - `amp`, complex `(n_ant, n_rfi, n_freq, n_time)`: the signal on the data
   grid, and the only differentiated input.
