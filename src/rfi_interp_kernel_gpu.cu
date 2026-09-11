@@ -308,11 +308,11 @@ ffi::Error calc_rfi_interp_gpu_dispatch(
       const InterpCellChunk<INT_T> cells{INT_T(t0), INT_T(nt), INT_T(f0), INT_T(nf)};
       const auto sample_grid = create_clamped_grid(interp_grid_extent(sample_blocks), 1, 1);
       if (split)
-        rfi_interp_samples_kernel<T, INT_T, mode, true>
+        rfi_interp_samples_chunk_kernel<T, INT_T, mode>
             <<<sample_grid, kSampleBlock, 0, stream>>>(sample_views, S, dS, cells);
       else
-        rfi_interp_samples_kernel<T, INT_T, mode, false>
-            <<<sample_grid, kSampleBlock, 0, stream>>>(sample_views, S, dS, cells);
+        rfi_interp_samples_kernel<T, INT_T, mode>
+            <<<sample_grid, kSampleBlock, 0, stream>>>(sample_views, S, dS, INT_T(t0), INT_T(nt));
       auto status = cudaGetLastError();
       if (status != cudaSuccess)
         return ffi::Error::Internal(std::string("GPU kernel launch error: ") + cudaGetErrorString(status));
