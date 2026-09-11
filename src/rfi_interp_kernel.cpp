@@ -1,10 +1,19 @@
-// CPU forward and JVP of the data-grid RFI visibility. Plain scalar loops,
-// parallel over baselines: the prototype of the operator, written to be read
-// beside rfi_interp_common.hpp rather than to be fast.
+// CPU forward and JVP of the data-grid RFI visibility, vectorised with
+// Highway and parallel over time cells.
+//
+// A task takes a run of time cells. For each cell, channel and source it
+// builds the fine samples of every antenna once -- the interpolation of the
+// cell's stencil and the phase factor, a vector of samples at a time (see
+// rfi_interp_cell_inl.hpp) -- and then every baseline's visibility is the dot
+// product of its two antennas' samples. An antenna's samples are therefore
+// built once per cell rather than once per baseline it is on, which for an
+// array of n_ant antennas is a factor of n_ant / 2 less of the expensive part,
+// and the part that remains is the dot product, which vectorises.
 
 #include <complex>
 #include <cstdint>
 #include <type_traits>
+#include <vector>
 
 #include "parallel_for.hpp"
 #include "rfi_interp_common.hpp"
@@ -13,112 +22,142 @@
 #include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
 
+// Generates code for every target that this compiler can support.
+#undef HWY_TARGET_INCLUDE
+#define HWY_TARGET_INCLUDE "rfi_interp_kernel.cpp" // this file
+
+#include "hwy_dispatch.hpp"
+
 namespace ri_kernels {
 
 namespace ffi = xla::ffi;
 
-// Value-type snapshot of the inputs: parallel_for runs the body after the
-// handler has returned, when the ffi::Buffer arguments are gone.
-template <typename T> struct InterpViews {
-  Tensor1D<const int *> a1, a2;
-  Tensor4D<const Cplx<T> *> amp;
-  Tensor4D<const T *> phase, delay;
-  Tensor3D<const T *> w_freq, w_time;
-  Tensor1D<const int *> start_freq, start_time;
-  Tensor1D<const T *> dnu, dt, freqs;
-};
+namespace HWY_NAMESPACE { // required: unique per target
 
-template <typename T, ffi::DataType AMP_DT, ffi::DataType REAL_DT>
-InterpViews<T> make_views(interp_index_t a1, interp_index_t a2,
-                          ffi::Buffer<AMP_DT, 4> amp,
-                          ffi::Buffer<REAL_DT, 4> phase,
-                          ffi::Buffer<REAL_DT, 4> delay,
-                          ffi::Buffer<REAL_DT, 3> w_freq,
-                          interp_index_t start_freq,
-                          ffi::Buffer<REAL_DT, 3> w_time,
-                          interp_index_t start_time,
-                          ffi::Buffer<REAL_DT, 1> dnu, ffi::Buffer<REAL_DT, 1> dt,
-                          ffi::Buffer<REAL_DT, 1> freqs) {
-  const auto a = amp.dimensions();
-  return InterpViews<T>{
-      Tensor1D<const int *>(a1.typed_data(), a1.dimensions()[0]),
-      Tensor1D<const int *>(a2.typed_data(), a2.dimensions()[0]),
-      Tensor4D<const Cplx<T> *>(
-          reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1],
-          a[2], a[3]),
-      Tensor4D<const T *>(phase.typed_data(), a[0], a[1], a[2], a[3]),
-      Tensor4D<const T *>(delay.typed_data(), delay.dimensions()[0],
-                          delay.dimensions()[1], delay.dimensions()[2],
-                          delay.dimensions()[3]),
-      Tensor3D<const T *>(w_freq.typed_data(), w_freq.dimensions()[0],
-                          w_freq.dimensions()[1], w_freq.dimensions()[2]),
-      Tensor3D<const T *>(w_time.typed_data(), w_time.dimensions()[0],
-                          w_time.dimensions()[1], w_time.dimensions()[2]),
-      Tensor1D<const int *>(start_freq.typed_data(), start_freq.dimensions()[0]),
-      Tensor1D<const int *>(start_time.typed_data(), start_time.dimensions()[0]),
-      Tensor1D<const T *>(dnu.typed_data(), dnu.dimensions()[0]),
-      Tensor1D<const T *>(dt.typed_data(), dt.dimensions()[0]),
-      Tensor1D<const T *>(freqs.typed_data(), freqs.dimensions()[0]),
-  };
-}
+namespace hn = ::hwy::HWY_NAMESPACE;
 
-// The tangents of the JVP: the signal's, and for the full JVP the phase's
-// and the delay's (views over the primal buffers otherwise, never read).
-template <typename T> struct TangentViews {
-  Tensor4D<const Cplx<T> *> amp_dot;
-  Tensor4D<const T *> phase_dot, delay_dot;
-};
+#include "rfi_interp_cell_inl.hpp"
 
-// The forward for JVP = false; for JVP = true the tangent
-// B(dS, S) + B(S, dS), with dS interpolated from amp_dot and, when FULL,
-// plus i dphi S for the phase and delay tangents.
-template <typename T, bool JVP, bool FULL>
-void interp_rows(std::int64_t bl_begin, std::int64_t bl_end,
-                 InterpViews<T> v, TangentViews<T> d,
-                 Tensor3D<Cplx<T> *> out) {
-  const std::int64_t n_rfi = v.amp.shape[1], n_freq = v.amp.shape[2];
-  const std::int64_t n_time = v.amp.shape[3];
-  const std::int64_t n_sf = v.w_freq.shape[1], n_int_f = v.w_freq.shape[2];
+// The forward for MODE = kNone; otherwise the tangent B(dS, S) + B(S, dS),
+// with dS interpolated from amp_dot and, for kFull, plus i dphi S from the
+// phase and delay tangents.
+template <typename T, JvpMode MODE>
+HWY_ATTR void interp_cells_impl(std::int64_t t_begin, std::int64_t t_end,
+                                InterpViews<T> v, TangentViews<T> d,
+                                Tensor3D<Cplx<T> *> out) {
+  constexpr bool JVP = MODE != JvpMode::kNone;
+  constexpr bool FULL = MODE == JvpMode::kFull;
+  using D = TagType<T>;
+  const D d_tag;
+  const std::int64_t lanes = hn::Lanes(d_tag);
+
+  const std::int64_t n_ant = v.amp.shape[0], n_rfi = v.amp.shape[1];
+  const std::int64_t n_freq = v.amp.shape[2];
   const std::int64_t n_st = v.w_time.shape[1], n_int_t = v.w_time.shape[2];
+  const std::int64_t n_int_f = v.w_freq.shape[2];
+  const std::int64_t n_s = n_int_f * n_int_t, n_bl = v.a1.shape[0];
+  const std::int64_t n_path = v.delay.shape[3];
+  const T scale = T(1) / T(n_s);
 
-  for (std::int64_t bl = bl_begin; bl < bl_end; ++bl) {
-    const std::int64_t ant1 = v.a1(bl), ant2 = v.a2(bl);
-    const T scale = T(1) / T(n_int_f * n_int_t);
+  CellTables<T> cell;
+  SampleBuf<T> S, dS, e_tan;
+  std::vector<Cplx<T>> acc(n_bl);
+  for (std::int64_t t = t_begin; t < t_end; ++t) {
+    const std::int64_t st = v.start_time(t);
     for (std::int64_t f = 0; f < n_freq; ++f) {
-      const T *wf = &v.w_freq(f, 0, 0);
       const std::int64_t sf = v.start_freq(f);
-      const T freq_f = v.freqs(f);
-      for (std::int64_t t = 0; t < n_time; ++t) {
-        const T *wt = &v.w_time(t, 0, 0);
-        const std::int64_t st = v.start_time(t);
-        Cplx<T> sum{0, 0};
-        for (std::int64_t r = 0; r < n_rfi; ++r) {
-          for (std::int64_t u = 0; u < n_int_f; ++u) {
-            for (std::int64_t vv = 0; vv < n_int_t; ++vv) {
-              const T dnu_u = v.dnu(u), dt_v = v.dt(vv);
-              const auto e1 = phase_factor(v.phase, v.delay, freq_f, dnu_u, dt_v, ant1, r, f, t);
-              const auto e2 = phase_factor(v.phase, v.delay, freq_f, dnu_u, dt_v, ant2, r, f, t);
-              const auto s1 = cmul(interp_amp(v.amp, wf, wt, sf, st, n_sf, n_st, n_int_f, n_int_t, ant1, r, u, vv), e1);
-              const auto s2 = cmul(interp_amp(v.amp, wf, wt, sf, st, n_sf, n_st, n_int_f, n_int_t, ant2, r, u, vv), e2);
-              if constexpr (JVP) {
-                auto d1 = cmul(interp_amp(d.amp_dot, wf, wt, sf, st, n_sf, n_st, n_int_f, n_int_t, ant1, r, u, vv), e1);
-                auto d2 = cmul(interp_amp(d.amp_dot, wf, wt, sf, st, n_sf, n_st, n_int_f, n_int_t, ant2, r, u, vv), e2);
-                if constexpr (FULL) {
-                  d1 = cadd(d1, cscale(phase_value(d.phase_dot, d.delay_dot, freq_f, dnu_u, dt_v, ant1, r, f, t), ctimes_i(s1)));
-                  d2 = cadd(d2, cscale(phase_value(d.phase_dot, d.delay_dot, freq_f, dnu_u, dt_v, ant2, r, f, t), ctimes_i(s2)));
-                }
-                sum = cadd(sum, cadd(cmul(d1, cconj(s2)), cmul(s1, cconj(d2))));
-              } else {
-                sum = cadd(sum, cmul(s1, cconj(s2)));
+      cell.build(v.w_freq, v.w_time, v.dnu, v.dt, v.freqs(f), f, t, n_path, lanes, false);
+      S.resize(n_ant, cell.n_s_padded);
+      if constexpr (JVP) {
+        // The tangent needs the phase factors kept beside the samples.
+        dS.resize(n_ant, cell.n_s_padded);
+        e_tan.resize(n_ant, cell.n_s_padded);
+      }
+      for (auto &x : acc) x = Cplx<T>{0, 0};
+
+      for (std::int64_t r = 0; r < n_rfi; ++r) {
+        CellSamples(d_tag, cell, v.amp, v.phase, v.delay, sf, st, n_st, n_ant, r, f, t,
+                    S, JVP ? &e_tan : nullptr);
+        if constexpr (JVP) {
+          // dS = interpolate(amp_dot) exp(i phi), plus i dphi S when FULL.
+          std::vector<T> a_re(cell.n_s_padded), a_im(cell.n_s_padded);
+          std::vector<T> p_re(FULL ? cell.n_s_padded : 0), p_im(FULL ? cell.n_s_padded : 0);
+          for (std::int64_t a = 0; a < n_ant; ++a) {
+            CellInterpAmp(d_tag, cell, d.amp_dot, sf, st, n_st, a, r, a_re.data(), a_im.data());
+            const T *er = e_tan.re_at(a), *ei = e_tan.im_at(a);
+            if constexpr (FULL) {
+              // dphi, the phase formula on the tangents, needs no centre-phase
+              // reduction: CellPhaseFactor gives exp(i phi), so take the phase
+              // itself here through the same Horner order.
+              CellPhaseValue(d_tag, cell, d.phase_dot, d.delay_dot, a, r, f, t, p_re.data());
+            }
+            T *ds_re = dS.re_at(a), *ds_im = dS.im_at(a);
+            const T *s_re = S.re_at(a), *s_im = S.im_at(a);
+            for (std::int64_t k = 0; k < cell.n_s_padded; k += lanes) {
+              const auto ar = hn::LoadU(d_tag, a_re.data() + k), ai = hn::LoadU(d_tag, a_im.data() + k);
+              const auto br = hn::LoadU(d_tag, er + k), bi = hn::LoadU(d_tag, ei + k);
+              auto re = hn::NegMulAdd(ai, bi, hn::Mul(ar, br));
+              auto im = hn::MulAdd(ar, bi, hn::Mul(ai, br));
+              if constexpr (FULL) {
+                // i dphi S = dphi (-Im S, Re S)
+                const auto dphi = hn::LoadU(d_tag, p_re.data() + k);
+                const auto sr = hn::LoadU(d_tag, s_re + k), si = hn::LoadU(d_tag, s_im + k);
+                re = hn::NegMulAdd(dphi, si, re);
+                im = hn::MulAdd(dphi, sr, im);
               }
+              hn::StoreU(re, d_tag, ds_re + k);
+              hn::StoreU(im, d_tag, ds_im + k);
             }
           }
         }
-        out(bl, f, t) = cscale(scale, sum);
+        // Every baseline: a dot product over the cell's samples.
+        for (std::int64_t bl = 0; bl < n_bl; ++bl) {
+          const std::int64_t a1 = v.a1(bl), a2 = v.a2(bl);
+          Cplx<T> term;
+          if constexpr (JVP) {
+            const Cplx<T> x = CellDotConj(d_tag, cell.n_s_padded, dS.re_at(a1), dS.im_at(a1),
+                                          S.re_at(a2), S.im_at(a2));
+            const Cplx<T> y = CellDotConj(d_tag, cell.n_s_padded, S.re_at(a1), S.im_at(a1),
+                                          dS.re_at(a2), dS.im_at(a2));
+            term = cadd(x, y);
+          } else {
+            term = CellDotConj(d_tag, cell.n_s_padded, S.re_at(a1), S.im_at(a1),
+                               S.re_at(a2), S.im_at(a2));
+          }
+          acc[bl] = cadd(acc[bl], term);
+        }
       }
+      for (std::int64_t bl = 0; bl < n_bl; ++bl) out(bl, f, t) = cscale(scale, acc[bl]);
     }
   }
 }
+
+// Named per-precision entry points, so the per-target dispatch (HWY_EXPORT_*)
+// can target each precision separately. The mode is a runtime argument and the
+// bodies are specialised on it.
+HWY_ATTR void interp_cells_f32(std::int64_t t_begin, std::int64_t t_end, JvpMode mode,
+                               InterpViews<float> v, TangentViews<float> d,
+                               Tensor3D<Cplx<float> *> out) {
+  switch (mode) {
+    case JvpMode::kNone: return interp_cells_impl<float, JvpMode::kNone>(t_begin, t_end, v, d, out);
+    case JvpMode::kSignal: return interp_cells_impl<float, JvpMode::kSignal>(t_begin, t_end, v, d, out);
+    case JvpMode::kFull: return interp_cells_impl<float, JvpMode::kFull>(t_begin, t_end, v, d, out);
+  }
+}
+
+HWY_ATTR void interp_cells_f64(std::int64_t t_begin, std::int64_t t_end, JvpMode mode,
+                               InterpViews<double> v, TangentViews<double> d,
+                               Tensor3D<Cplx<double> *> out) {
+  switch (mode) {
+    case JvpMode::kNone: return interp_cells_impl<double, JvpMode::kNone>(t_begin, t_end, v, d, out);
+    case JvpMode::kSignal: return interp_cells_impl<double, JvpMode::kSignal>(t_begin, t_end, v, d, out);
+    case JvpMode::kFull: return interp_cells_impl<double, JvpMode::kFull>(t_begin, t_end, v, d, out);
+  }
+}
+
+} // namespace HWY_NAMESPACE
+
+#if HWY_ONCE
 
 template <typename T, ffi::DataType AMP_DT, ffi::DataType REAL_DT>
 ffi::Error check_inputs(interp_index_t a1, interp_index_t a2,
@@ -163,10 +202,26 @@ ffi::Future calc_rfi_interp_cpu_impl_tmpl(
     return completed_future(ffi::Error::InvalidArgument(
         "Expected the phase and delay tangents to match the phase and delay"));
 
-  auto views = make_views<T>(a1, a2, amp, phase, delay, w_freq, start_freq,
-                             w_time, start_time, dnu, dt, freqs);
+  // Snapshot of everything the chunks need. These views own their extents by
+  // value, so they stay valid after the handler returns - unlike the
+  // ffi::Buffer arguments, which point into the FFI call frame. See
+  // parallel_for().
   const auto a = amp.dimensions();
   const auto dd = delay.dimensions();
+  const InterpViews<T> views{
+      Tensor1D<const int *>(a1.typed_data(), a1.dimensions()[0]),
+      Tensor1D<const int *>(a2.typed_data(), a2.dimensions()[0]),
+      Tensor4D<const Cplx<T> *>(reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1], a[2], a[3]),
+      Tensor4D<const T *>(phase.typed_data(), a[0], a[1], a[2], a[3]),
+      Tensor4D<const T *>(delay.typed_data(), dd[0], dd[1], dd[2], dd[3]),
+      Tensor3D<const T *>(w_freq.typed_data(), w_freq.dimensions()[0], w_freq.dimensions()[1], w_freq.dimensions()[2]),
+      Tensor3D<const T *>(w_time.typed_data(), w_time.dimensions()[0], w_time.dimensions()[1], w_time.dimensions()[2]),
+      Tensor1D<const int *>(start_freq.typed_data(), start_freq.dimensions()[0]),
+      Tensor1D<const int *>(start_time.typed_data(), start_time.dimensions()[0]),
+      Tensor1D<const T *>(dnu.typed_data(), dnu.dimensions()[0]),
+      Tensor1D<const T *>(dt.typed_data(), dt.dimensions()[0]),
+      Tensor1D<const T *>(freqs.typed_data(), freqs.dimensions()[0]),
+  };
   const TangentViews<T> tangents{
       Tensor4D<const Cplx<T> *>(reinterpret_cast<const Cplx<T> *>(amp_dot.typed_data()), a[0], a[1], a[2], a[3]),
       Tensor4D<const T *>(phase_dot.typed_data(), a[0], a[1], a[2], a[3]),
@@ -175,12 +230,19 @@ ffi::Future calc_rfi_interp_cpu_impl_tmpl(
   Tensor3D<Cplx<T> *> out_view(reinterpret_cast<Cplx<T> *>(out->typed_data()),
                                out->dimensions()[0], out->dimensions()[1],
                                out->dimensions()[2]);
-  const std::int64_t n_bl = a1.dimensions()[0];
+  const std::int64_t n_time = a[3];
+  constexpr JvpMode mode = FULL ? JvpMode::kFull : (JVP ? JvpMode::kSignal : JvpMode::kNone);
 
-  return parallel_for(thread_pool, n_bl,
+  return parallel_for(thread_pool, n_time,
                       [views, tangents, out_view](
                           std::int64_t begin, std::int64_t end) mutable {
-                        interp_rows<T, JVP, FULL>(begin, end, views, tangents, out_view);
+                        if constexpr (std::is_same_v<T, float>) {
+                          RI_KERNELS_EXPORT_AND_DISPATCH_T(interp_cells_f32)
+                          (begin, end, mode, views, tangents, out_view);
+                        } else {
+                          RI_KERNELS_EXPORT_AND_DISPATCH_T(interp_cells_f64)
+                          (begin, end, mode, views, tangents, out_view);
+                        }
                       });
 }
 
@@ -331,5 +393,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(calc_rfi_interp_full_jvp_cpu_f64, calc_rfi_interp_
                                   .Arg<interp_amp_f64_t>()
                                   RI_INTERP_FULL_TABLE_ARGS(f64)
                                   .Ret<ffi::BufferR3<ffi::C128>>());
+
+#endif // HWY_ONCE
 
 } // namespace ri_kernels

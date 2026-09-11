@@ -227,6 +227,42 @@ bool interp_same_shape(const LHS &lhs, const RHS &rhs) {
   return true;
 }
 
+// The inputs of the forward and JVP, as value-type views: parallel_for runs
+// the body after the handler has returned, when the ffi::Buffer arguments are
+// gone.
+template <typename T> struct InterpViews {
+  Tensor1D<const int *> a1, a2;
+  Tensor4D<const Cplx<T> *> amp;
+  Tensor4D<const T *> phase, delay;
+  Tensor3D<const T *> w_freq, w_time;
+  Tensor1D<const int *> start_freq, start_time;
+  Tensor1D<const T *> dnu, dt, freqs;
+};
+
+// The tangents of the JVP: the signal's, and for the full JVP the phase's and
+// the delay's (views over the primal buffers otherwise, never read).
+template <typename T> struct TangentViews {
+  Tensor4D<const Cplx<T> *> amp_dot;
+  Tensor4D<const T *> phase_dot, delay_dot;
+};
+
+// The inputs and outputs of the transpose, as value-type views.
+template <typename T> struct TransposeViews {
+  Tensor1D<const int *> a1, a2;
+  Tensor4D<const Cplx<T> *> amp;
+  Tensor4D<const T *> phase, delay;
+  Tensor3D<const T *> w_freq, w_time;
+  Tensor1D<const int *> start_freq, start_time;
+  Tensor1D<const T *> dnu, dt, freqs;
+  Tensor3D<const Cplx<T> *> vis_bar;
+  Tensor4D<Cplx<T> *> amp_bar;
+  // The full transpose's extra outputs; unset views otherwise.
+  Tensor4D<T *> phase_bar, delay_bar;
+};
+
+// Which derivative a JVP kernel carries.
+enum class JvpMode { kNone = 0, kSignal = 1, kFull = 2 };
+
 // Host-side check of the stencil contract (see the top of this file).
 inline bool stencils_cover_their_cells(const int *start, std::int64_t n_cells,
                                        std::int64_t n_stencil) {
