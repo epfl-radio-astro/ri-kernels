@@ -61,14 +61,34 @@ class RFIAnalyticVisOp(RFIInterpVisOp):
         the reference's more conservative configuration. Coefficient counts
         up to 9, terms up to 32 and cubic_terms up to 8 are supported.
         """
-        _validate_options(segments=segments, terms=terms, cubic_terms=cubic_terms)
-        stop = jax.lax.stop_gradient
-        int_time = jnp.asarray(int_time, dtype=None if hasattr(int_time, "dtype") else phase.dtype)
-        return rfi_analytic_vis_op.bind(
-            *self.indices, amp, stop(phase), stop(delay_us), stop(w_freq),
-            start_freq, stop(g_time), start_time, stop(dnu_mhz), stop(int_time),
-            stop(freq_mhz), segments=segments, terms=terms, cubic_terms=cubic_terms,
+        return analytic_eval_with_indices(
+            self.indices, amp, phase, delay_us, w_freq, start_freq, g_time,
+            start_time, dnu_mhz, int_time, freq_mhz,
+            segments=segments, terms=terms, cubic_terms=cubic_terms,
         )
+
+
+def analytic_eval_with_indices(
+    indices, amp, phase, delay_us, w_freq, start_freq, g_time, start_time,
+    dnu_mhz, int_time, freq_mhz, *, segments=2, terms=6, cubic_terms=3,
+):
+    """:meth:`RFIAnalyticVisOp.eval` with the index arrays given rather than held.
+
+    The closed-form counterpart of
+    :func:`~ri_kernels.jax_api.rfi_interp_vis_op.eval_with_indices`, and needed
+    for the same reason: a caller that shards the baseline axis has to hand
+    each device the indices for its own rows, which an instance built once on
+    the host cannot do. ``RFIAnalyticVisOp`` shares ``indices`` with the
+    quadrature operator, so the two seams take the same tuple.
+    """
+    _validate_options(segments=segments, terms=terms, cubic_terms=cubic_terms)
+    stop = jax.lax.stop_gradient
+    int_time = jnp.asarray(int_time, dtype=None if hasattr(int_time, "dtype") else phase.dtype)
+    return rfi_analytic_vis_op.bind(
+        *indices, amp, stop(phase), stop(delay_us), stop(w_freq),
+        start_freq, stop(g_time), start_time, stop(dnu_mhz), stop(int_time),
+        stop(freq_mhz), segments=segments, terms=terms, cubic_terms=cubic_terms,
+    )
 
 
 _TAB_LIB_ANALYTIC = (
