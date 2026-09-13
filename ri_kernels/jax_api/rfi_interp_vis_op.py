@@ -148,12 +148,36 @@ class RFIInterpVisOp:
         ``0 <= start[c] <= c < start[c] + n_stencil <= n_cells``. Precision has
         to match: complex64 with float32 or complex128 with float64.
         """
-        stop = jax.lax.stop_gradient
-        return rfi_interp_vis_op.bind(
-            *self.indices,
-            amp, phase, delay_us, stop(w_freq), start_freq,
-            stop(w_time), start_time, stop(dnu_mhz), stop(dt), stop(freq_mhz),
+        return eval_with_indices(
+            self.indices, amp, phase, delay_us, w_freq, start_freq,
+            w_time, start_time, dnu_mhz, dt, freq_mhz,
         )
+
+
+def eval_with_indices(
+    indices, amp, phase, delay_us, w_freq, start_freq, w_time, start_time,
+    dnu_mhz, dt, freq_mhz,
+):
+    """:meth:`RFIInterpVisOp.eval` with the index arrays given rather than held.
+
+    The op derives its indices once, on the host, from a fixed baseline list.
+    That is the wrong shape for a caller that shards the baseline axis: under
+    ``shard_map`` every device runs one program over its own slice, so the
+    indices have to arrive as arguments that the map has already divided, not
+    as arrays captured per instance. They are traced operands either way -- the
+    op has always passed them to ``bind`` rather than closing over them -- so
+    this only exposes the seam.
+
+    ``indices`` is what :attr:`RFIInterpVisOp.indices` returns, in that order.
+    The output's baseline count follows ``a1``, so a device that is handed a
+    slice of the baselines produces exactly that slice of the visibilities.
+    """
+    stop = jax.lax.stop_gradient
+    return rfi_interp_vis_op.bind(
+        *indices,
+        amp, phase, delay_us, stop(w_freq), start_freq,
+        stop(w_time), start_time, stop(dnu_mhz), stop(dt), stop(freq_mhz),
+    )
 
 
 _TAB_LIB_INTERP = (

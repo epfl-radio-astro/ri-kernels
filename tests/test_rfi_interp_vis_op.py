@@ -613,3 +613,47 @@ def test_a_cell_too_long_for_shared_memory_says_so(device):
 
     with pytest.raises(Exception, match="shared memory"):
         jax.block_until_ready(pullback(cot))
+
+
+class TestEvalWithGivenIndices:
+    """The seam that lets a caller shard the baseline axis.
+
+    ``eval`` derives its index arrays once from a fixed baseline list, which is
+    the wrong shape for ``shard_map``: there every device runs one program over
+    its own slice, so the indices must arrive as arguments the map has already
+    divided. They were always traced operands, so exposing them changes nothing
+    about what is computed -- which is what these pin.
+    """
+
+    def test_it_matches_eval_exactly(self, precision, device):
+        from ri_kernels.jax_api import eval_with_indices
+        real, complex_ = precision
+        args = make_inputs(real, complex_)
+        a1, a2 = make_baselines(args[0].shape[0])
+        op = RFIInterpVisOp(args[0].shape[0], a1, a2)
+        # Bit for bit: the refactor must not even reassociate anything.
+        assert np.array_equal(
+            np.asarray(eval_with_indices(op.indices, *args)),
+            np.asarray(op.eval(*args)),
+        )
+
+    def test_a_baseline_slice_produces_that_slice(self, precision, device):
+        """What sharding relies on: the output follows ``a1``, not the array.
+
+        A device handed a subset of the baselines must produce exactly those
+        visibilities, in that order, knowing nothing of the others. The output
+        aval takes its baseline count from ``a1``, so this holds without the
+        kernel being told anything about sharding.
+        """
+        from ri_kernels.jax_api import eval_with_indices
+        real, complex_ = precision
+        args = make_inputs(real, complex_)
+        n_ant = args[0].shape[0]
+        a1, a2 = make_baselines(n_ant)
+        whole = np.asarray(RFIInterpVisOp(n_ant, a1, a2).eval(*args))
+
+        take = np.arange(3, 9)                 # an arbitrary contiguous slice
+        part = RFIInterpVisOp(n_ant, a1[take], a2[take])
+        got = np.asarray(eval_with_indices(part.indices, *args))
+        assert got.shape[0] == len(take)
+        assert_close(got, whole[take], real)
