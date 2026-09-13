@@ -32,10 +32,35 @@ __global__ void analytic_materialise(AnalyticViews<T> v, Cplx<T> *s, Cplx<T> *ds
   }
 }
 
+__device__ inline void analytic_add(float *dest, float value) {
+  atomicAdd(dest, value);
+}
+
+// Double-precision atomicAdd arrived with Pascal, and the x86_64 CUDA 12 wheel
+// still carries an SM 5.2 cubin, so the f64 kernel has to be compilable without
+// it. The compare-and-swap loop is NVIDIA's documented stand-in. Only the
+// pre-Pascal device passes take it; the host pass and every target this kernel
+// is actually run on take the instruction.
+__device__ inline void analytic_add(double *dest, double value) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
+  atomicAdd(dest, value);
+#else
+  auto *bits = reinterpret_cast<unsigned long long *>(dest);
+  unsigned long long old = *bits, assumed;
+  do {
+    assumed = old;
+    old = atomicCAS(bits, assumed,
+        __double_as_longlong(value + __longlong_as_double(assumed)));
+    // The NaN-payload comparison is deliberate: a repeat means another thread
+    // won, not that the sum is unrepresentable.
+  } while (assumed != old);
+#endif
+}
+
 template <typename T>
 __device__ inline void analytic_atomic(Cplx<T> *dest, Cplx<T> value) {
-  atomicAdd(&dest->re, value.re);
-  atomicAdd(&dest->im, value.im);
+  analytic_add(&dest->re, value.re);
+  analytic_add(&dest->im, value.im);
 }
 
 // The transpose reduces within each tile in shared memory, then writes one
