@@ -99,6 +99,7 @@ set(RI_KERNELS_CPU_SOURCES
   ./src/rfi_delay_kernel.cpp
   ./src/rfi_delay_jvp_kernel.cpp
   ./src/rfi_delay_transpose_kernel.cpp
+  ./src/rfi_analytic_kernel.cpp
   ./src/rfi_interp_kernel.cpp
   ./src/rfi_interp_transpose_kernel.cpp
 )
@@ -110,6 +111,7 @@ set(RI_KERNELS_GPU_SOURCES
   ./src/rfi_delay_kernel_gpu.cu
   ./src/rfi_delay_jvp_kernel_gpu.cu
   ./src/rfi_delay_transpose_kernel_gpu.cu
+  ./src/rfi_analytic_kernel_gpu.cu
   ./src/rfi_interp_kernel_gpu.cu
   ./src/rfi_interp_transpose_kernel_gpu.cu
   ./src/util_gpu.cu
@@ -217,4 +219,27 @@ if(TARGET ri_kernels_hip)
   install(TARGETS ri_kernels_hip
 	LIBRARY DESTINATION ${RI_KERNELS_GPU_INSTALL_DIR}
 	RUNTIME DESTINATION ${RI_KERNELS_GPU_INSTALL_DIR})
+endif()
+
+# Native bounds checks use separate allocations, while the Python suite must
+# also run against the instrumented extension to exercise XLA's buffer views.
+option(RI_KERNELS_BUILD_TESTS "Build native CPU kernel tests" OFF)
+option(RI_KERNELS_SANITIZE "Instrument CPU kernels and native tests with ASan/UBSan" OFF)
+if(RI_KERNELS_BUILD_TESTS)
+  enable_testing()
+  add_executable(rfi_analytic_bounds tests/test_rfi_analytic_bounds.cpp)
+  target_include_directories(rfi_analytic_bounds PRIVATE ${JAXLIB_HOME}/include ./src)
+  add_test(NAME rfi_analytic_bounds COMMAND rfi_analytic_bounds)
+endif()
+if(RI_KERNELS_SANITIZE)
+  if(NOT RI_KERNELS_CPU OR NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    message(FATAL_ERROR "RI_KERNELS_SANITIZE requires CPU kernels and a GCC or Clang compiler")
+  endif()
+  foreach(target ri_kernels rfi_analytic_bounds)
+    if(TARGET ${target})
+      target_compile_options(${target} PRIVATE -fsanitize=address,undefined
+        -fno-omit-frame-pointer -fno-sanitize-recover=all -UNDEBUG)
+      target_link_options(${target} PRIVATE -fsanitize=address,undefined)
+    endif()
+  endforeach()
 endif()
