@@ -477,3 +477,27 @@ def test_ffi_rejects_excess_coefficients(device):
     with pytest.raises(Exception, match="capacity"):
         call(*op.indices, *args, segments=np.int64(2), terms=np.int64(6),
              cubic_terms=np.int64(3)).block_until_ready()
+
+
+@pytest.mark.parametrize("n_ant", [5, 33])
+def test_analytic_given_indices_match_values_and_derivatives(precision, device, n_ant):
+    from ri_kernels.jax_api import analytic_eval_with_indices
+    real, complex_ = precision
+    args = make_inputs(real, complex_, n_ant=n_ant, n_rfi=1, n_freq=1, n_time=3)
+    a1, a2 = make_baselines(n_ant, shuffle=True, autocorr=False)
+    whole = RFIAnalyticVisOp(n_ant, a1, a2)
+    take = np.arange(0, len(a1), 3)
+    part = RFIAnalyticVisOp(n_ant, a1[take], a2[take])
+    options = dict(segments=3, terms=8, cubic_terms=2)
+    reference = lambda amp: whole.eval(amp, *args[1:], **options)[take]
+    given = lambda amp: analytic_eval_with_indices(part.indices, amp, *args[1:], **options)
+    tangent = jnp.conj(args[0]) * 0.17
+    cot = jnp.arange(len(take) * args[0].shape[3], dtype=real).reshape(len(take), 1, -1) / 10
+    outputs = []
+    for fn in (reference, given):
+        value, dot = jax.jit(lambda a, da: jax.jvp(fn, (a,), (da,)))(args[0], tangent)
+        grad = jax.jit(jax.grad(lambda a: jnp.real(jnp.sum(fn(a) * cot))))(args[0])
+        outputs.append((value, dot, grad))
+    for expected, actual in zip(*outputs):
+        np.testing.assert_allclose(actual, expected, rtol=3e-5 if real == jnp.float32 else 1e-10,
+                                   atol=3e-5 if real == jnp.float32 else 1e-10)
