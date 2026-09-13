@@ -1,1 +1,4 @@
 **/__pycache__
+
+# Local FFI builds are platform-specific artifacts, never source changes.
+/ri_kernels/*.so

@@ -177,3 +177,114 @@ implementation: each baseline rebuilds both of its antennas' fine samples
 itself, so an antenna's samples are recomputed once per baseline it is on. A
 kernel meant to be fast would stage each antenna's samples once per cell and
 reuse them across its baselines.
+
+## Analytic RFI visibilities
+
+`RFIAnalyticVisOp` integrates the time polynomial against phase moments, with
+frequency quadrature unchanged. It stages amplitude coefficients per antenna
+and cell, then contracts pairs of antenna tiles. The default time scratch axis
+has three coefficients, independent of fringe winding.
+
+```python
+from ri_kernels.jax_api import RFIAnalyticVisOp
+
+vis = RFIAnalyticVisOp(n_ant, a1, a2).eval(
+    amp, phase, delay_us, w_freq, start_freq, g_time, start_time,
+    dnu_mhz, int_time, freq_mhz,
+    segments=2, terms=6, cubic_terms=3,
+)
+```
+
+The operands follow `RFIInterpVisOp`'s axis order and precision contract.
+`g_time[t,l,m]` contains monomial coefficients in `x = 2*tau/int_time`, as
+`tabascal.poly_interp.monomial_tables` produces them, including the shifted edge
+stencils. `int_time` is a positive scalar in seconds. Channel centres and
+frequency offsets are in **MHz**; divide `config.freqs` in Hz by `1e6`.
+Only `amp` is differentiated. The compiled JVP and transpose follow JAX's
+complex cotangent convention; `eval` stops gradients on the remaining inputs.
+
+The moment branches, segmentation and cubic translation follow
+`tabascal.coarse_rfi_vis.analytic_rfi_vis`. `segments`, `terms`, and
+`cubic_terms` are static options: close over them or mark them static when
+jitting. The defaults use two pieces, six curvature terms and three cubic
+terms. `segments=4, terms=16` selects the reference's conservative settings.
+Zero cubic terms deliberately omits cubic phase; delay derivatives above
+order three are always omitted. Coefficient counts 1–9, segments 1–1024,
+curvature terms 1–32 and cubic terms 0–8 are supported. These limits bound
+local storage; convergence still depends on the supplied delay and interval.
+
+The phase and moments use double intermediates for both input precisions.
+Fresnel seeds use a small-argument series and rational auxiliary functions:
+a two-term asymptotic near 2.5 is insufficient for the higher moments. The
+common three-coefficient, six-term, three-cubic-term path has unrolled moment
+orders so its CUDA recurrence can stay in registers. Wider configurations
+use a bounded general implementation.
+
+GPU scratch uses `RI_KERNELS_INTERP_SCRATCH_MB` (256 MiB by default), with time
+chunks and, when necessary, frequency chunks. The transpose reduces coefficient
+cotangents within each tile in shared memory, writes separate partials for
+partner tiles, and gathers through the interpolation stencils. Shared-memory
+atomics mean the last bits of the GPU transpose can vary between runs.
+
+After building on the GPU host, run:
+
+```bash
+python -m pytest tests/test_rfi_analytic_vis_op.py tests/test_rfi_interp_vis_op.py
+python tests/benchmark_rfi_analytic_vis_op.py --antennas 256 512 --iterations 100
+```
+
+The analytic tests compare both precisions and both amplitude derivatives
+against a frozen float64 JAX reference. They cover zero winding, both recurrence
+branches, the Fresnel boundary, cubic translation, wider coefficient counts,
+sparse/reversed/autocorrelation baselines, partial antenna tiles and forced
+scratch splitting. The benchmark reports synchronised forward, JVP and VJP
+times after compilation and warmup, alongside 6571-sample quadrature. It uses
+synthetic inputs; repeat the scientific accuracy check and the 100-iteration
+optimisation with the production SKA-Low data. Inspect ptxas register/spill
+reports and Nsight local-memory traffic for the default specialisation before
+interpreting its speedup. CUDA compilation, device tests and performance need
+the GPU host; CPU tests do not establish those results.
+
+### Analytic memory diagnostics
+
+Build the CPU extension with both sanitizers and debug assertions, then run
+**the whole Python file against that extension**. The native bounds test uses
+independent allocations and is useful alongside this run, but it does not
+exercise XLA's FFI buffer handling.
+
+```bash
+cmake -S . -B /tmp/ri-analytic-asan \
+  -DRI_KERNELS_CPU=ON -DRI_KERNELS_CUDA=OFF \
+  -DRI_KERNELS_SANITIZE=ON -DRI_KERNELS_BUILD_TESTS=ON \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build /tmp/ri-analytic-asan -j 4
+ctest --test-dir /tmp/ri-analytic-asan --output-on-failure
+```
+
+Preload the ASan runtime belonging to the compiler used for that build before
+starting the Python test runner. For a Linux GCC build:
+
+```bash
+LD_PRELOAD="$(c++ -print-file-name=libasan.so)" \
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+python -u tests/run_analytic_sanitizers.py /tmp/ri-analytic-asan/libri_kernels.so
+```
+
+On macOS with Apple Clang, use
+`DYLD_INSERT_LIBRARIES="$(clang -print-file-name=libclang_rt.asan_osx_dynamic.dylib)"`
+in place of `LD_PRELOAD`. If Command Line Tools cannot find C++ headers such
+as `<atomic>`, add
+`-DCMAKE_CXX_FLAGS="-nostdinc++ -isystem $(xcrun --show-sdk-path)/usr/include/c++/v1"`
+to the configure command. The runner forces the CPU backend, prints the JAX
+versions and the loaded library path, and disables pytest output capture. It
+stages the wrapper and shared object in a temporary package to prevent an
+editable install from substituting another build. No library is placed in the
+checkout. Additional pytest arguments, such as `-k general_degree_bounds`,
+can narrow a follow-up run after the full sequence has been investigated.
+
+All analytic stack capacities now come from `rfi_analytic_limits.hpp`'s
+parameter limits and a single size calculation. Compile-time checks tie the
+largest convolution, cubic and curvature indices to those capacities; the FFI
+handlers reject unsupported configurations before staging or scheduling work.
+The sizes remain exact: bounds protection does not rely on spare elements.
