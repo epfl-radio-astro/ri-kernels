@@ -2,6 +2,14 @@
 // as in the interpolation sample buffer. A block stages two antenna tiles
 // once per source and frequency offset. Each pair's moment recurrence stays
 // within its thread; no array of moments crosses a kernel boundary.
+//
+// Those recurrences run at the operator's own precision, not in double: they
+// are what the kernel spends its time on, and a GeForce part issues one
+// double-precision instruction per sixty-four single-precision ones, so a
+// complex64 call that computed its weights in double pays better than an
+// order of magnitude over for digits its coefficient buffers cannot hold. The
+// angles the recurrences are seeded from stay in double either way; see the
+// working precision W in rfi_analytic_math.hpp for what that division rests on.
 #include "gpu_compat.h"
 #include "rfi_analytic_common.hpp"
 #include "rfi_interp_scratch_gpu.cuh"
@@ -13,6 +21,9 @@ namespace gpu {
 
 constexpr int kAnalyticTile = 32;
 constexpr int kAnalyticBlock = 128;
+// The delay orders the closed form carries: tau and its first three
+// derivatives, whatever longer path the caller hands in.
+constexpr int kAnalyticOrders = 4;
 
 template <bool JVP, typename T>
 __global__ void analytic_materialise(AnalyticViews<T> v, Cplx<T> *s, Cplx<T> *ds,
@@ -79,6 +90,13 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
   Cplx<T> *si = reinterpret_cast<Cplx<T> *>(shared), *sj = si + 32 * nm;
   Cplx<T> *xi = Mode ? sj + 32 * nm : si;
   Cplx<T> *xj = Mode ? xi + 32 * nm : sj;
+  // The two tiles' own delay orders and centre phases, order-major over the
+  // pair's antennas so that a warp walking a tile diagonal reads one bank
+  // each. Tile I occupies the first kAnalyticTile slots of a row, tile J the
+  // rest; a tile paired with itself simply stages its antennas twice.
+  constexpr int span = 2 * kAnalyticTile;
+  T *sd = reinterpret_cast<T *>(Mode ? xj + 32 * nm : sj + 32 * nm);
+  T *sp = sd + kAnalyticOrders * span;
   for (std::int64_t tp = blockIdx.y; tp < v.tile_pairs.shape[0]; tp += gridDim.y) {
     std::int64_t I = 0, rem = tp;
     while (rem >= ntiles - I) { rem -= ntiles - I; ++I; }
@@ -87,6 +105,19 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
       const auto t = chunk.t0 + cell % chunk.n_tc, f = chunk.f0 + cell / chunk.n_tc;
       Cplx<T> acc[pairs_per_thread] = {};
       for (std::int64_t r = 0; r < nr; ++r) {
+        // Every pair this block forms draws on 64 antennas, and the whole
+        // cell reuses them. Read them once here rather than twice per pair:
+        // the gather is by antenna, so each warp would otherwise pull a
+        // separate sector per lane, and that cost more than the closed form.
+        for (int z = threadIdx.x; z < span; z += blockDim.x) {
+          const std::int64_t ant = (z < kAnalyticTile ? I : J) * kAnalyticTile +
+                                   (z % kAnalyticTile);
+          const bool live = ant < na;
+          for (int k = 0; k < kAnalyticOrders; ++k)
+            sd[k * span + z] = live && k < v.delay.shape[3] ? v.delay(ant, r, t, k) : T(0);
+          sp[z] = live ? v.phase(ant, r, f, t) : T(0);
+        }
+        __syncthreads();
         for (std::int64_t u = 0; u < nu; ++u) {
           for (std::int64_t z = threadIdx.x; z < nm * 32; z += blockDim.x) {
             const auto m = z / 32, il = z % 32;
@@ -106,10 +137,17 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
             if (pair < 0) continue;
             const auto il = pair / 32, jl = pair % 32;
             const std::int64_t p = I * 32 + il, q = J * 32 + jl;
-            Cplx<double> h[AnalyticStorage<Default>::product];
-            analytic_pair_weights<Default>(v, p, q, r, f, t, u, h);
+            const auto ip = il, iq = kAnalyticTile + jl;
+            const AnalyticPair d{
+                double(sd[ip]) - double(sd[iq]),
+                double(sd[span + ip]) - double(sd[span + iq]),
+                double(sd[2 * span + ip]) - double(sd[2 * span + iq]),
+                double(sd[3 * span + ip]) - double(sd[3 * span + iq]),
+                double(sp[ip]) - double(sp[iq])};
+            Cplx<T> h[AnalyticStorage<Default>::product];
+            analytic_pair_weights<Default, T>(v, d, f, u, h);
             if constexpr (!Transpose) {
-              acc[k] = cadd(acc[k], analytic_contract<Default>(si + il, sj + jl,
+              acc[k] = cadd(acc[k], analytic_contract<Default, T>(si + il, sj + jl,
                                xi + il, xj + jl, h, int(nm), 32, JVP));
             } else {
               Cplx<T> g{0, 0};
@@ -122,7 +160,7 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
                 Cplx<T> gp{0, 0}, gq{0, 0};
                 RI_ANALYTIC_UNROLL
                 for (int l = 0; l < (Default ? AnalyticStorage<Default>::coefficients : nm); ++l) {
-                  const auto w = cmul(g, analytic_cast<T>(h[j + l]));
+                  const auto w = cmul(g, h[j + l]);
                   gp = cadd(gp, cmul(w, cconj(sj[l * 32 + jl])));
                   gq = cadd(gq, cconj(cmul(w, si[l * 32 + il])));
                 }
@@ -213,7 +251,8 @@ ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scrat
   if (!mem.has_value()) return ffi::Error::Internal("Could not allocate analytic coefficient scratch");
   Cplx<T> *s = reinterpret_cast<Cplx<T> *>(*mem);
   Cplx<T> *extra = Mode ? s + plan.sample_bytes / sizeof(Cplx<T>) : nullptr;
-  const std::size_t shared = sizeof(Cplx<T>) * nm * 32 * (Mode ? 4 : 2);
+  const std::size_t shared = sizeof(Cplx<T>) * nm * 32 * (Mode ? 4 : 2) +
+                            sizeof(T) * 2 * kAnalyticTile * (kAnalyticOrders + 1);
   if (shared > get_device_prop().sharedMemPerBlock) return ffi::Error::Internal("Analytic tiles exceed shared memory limit");
   Tensor3D<Cplx<T> *> out(output, v.a1.shape[0], nf, nt);
   Tensor3D<const Cplx<T> *> cot(cotangent, v.a1.shape[0], nf, nt);

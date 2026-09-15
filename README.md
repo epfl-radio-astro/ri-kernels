@@ -213,12 +213,20 @@ order three are always omitted. Coefficient counts 1–9, segments 1–1024,
 curvature terms 1–32 and cubic terms 0–8 are supported. These limits bound
 local storage; convergence still depends on the supplied delay and interval.
 
-The phase and moments use double intermediates for both input precisions.
-Fresnel seeds use a small-argument series and rational auxiliary functions:
-a two-term asymptotic near 2.5 is insufficient for the higher moments. The
-common three-coefficient, six-term, three-cubic-term path has unrolled moment
-orders so its CUDA recurrence can stay in registers. Wider configurations
-use a bounded general implementation.
+Every angle -- the centre phase, the winding and the segment translations --
+is formed and reduced in double for both input precisions: a single-precision
+angle has no fractional turn left at the magnitudes the delay reaches. The
+moment recurrences that follow only multiply the coefficient buffers, so the
+CPU kernels keep them in double, where it is free, while the GPU kernels run
+them at the operator's own precision: a consumer card retires one
+double-precision instruction per sixty-four single-precision ones, and a
+complex64 weight costs well over an order of magnitude more in its double form
+there. Fresnel seeds stay in double either way, and use a
+small-argument series and rational auxiliary functions: a two-term asymptotic
+near 2.5 is insufficient for the higher moments. The common three-coefficient,
+six-term, three-cubic-term path has unrolled moment orders so its CUDA
+recurrence can stay in registers. Wider configurations use a bounded general
+implementation.
 
 GPU scratch uses `RI_KERNELS_INTERP_SCRATCH_MB` (256 MiB by default), with time
 chunks and, when necessary, frequency chunks. The transpose reduces coefficient

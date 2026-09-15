@@ -24,27 +24,50 @@ TAB_H_D inline std::int64_t analytic_index(std::int64_t cell, std::int64_t r,
   return ((((cell * nr + r) * nu + u) * nm + m) * na + ant);
 }
 
-template <bool Default, typename T>
-RI_ANALYTIC_INLINE void analytic_pair_weights(AnalyticViews<T> v, std::int64_t p,
-    std::int64_t q, std::int64_t r, std::int64_t f, std::int64_t t,
-    std::int64_t u, Cplx<double> *h) {
+// What a baseline contributes to its weights beyond the tables: the two
+// antennas' delay difference in the four orders the closed form carries, and
+// the difference of their centre phases. Named scalars, not an array indexed
+// by a run-time path count -- that array lands in local memory, and this is
+// the innermost thing the kernels do.
+struct AnalyticPair {
+  double tau, rate, curvature, jerk, phase;
+};
+
+template <typename T>
+RI_ANALYTIC_INLINE double analytic_order(Tensor4D<const T *> delay, std::int64_t ant,
+    std::int64_t r, std::int64_t t, int k) {
+  return k < delay.shape[3] ? double(delay(ant, r, t, k)) : 0.;
+}
+
+// Straight from the data grid. A GPU block covers two antenna tiles and one
+// cell, so it stages these instead (see the kernel); the CPU kernels and the
+// bounds tests read them here.
+template <typename T>
+RI_ANALYTIC_INLINE AnalyticPair analytic_pair_of(AnalyticViews<T> v, std::int64_t p,
+    std::int64_t q, std::int64_t r, std::int64_t f, std::int64_t t) {
+  return {analytic_order(v.delay, p, r, t, 0) - analytic_order(v.delay, q, r, t, 0),
+          analytic_order(v.delay, p, r, t, 1) - analytic_order(v.delay, q, r, t, 1),
+          analytic_order(v.delay, p, r, t, 2) - analytic_order(v.delay, q, r, t, 2),
+          analytic_order(v.delay, p, r, t, 3) - analytic_order(v.delay, q, r, t, 3),
+          double(v.phase(p, r, f, t)) - double(v.phase(q, r, f, t))};
+}
+
+template <bool Default, typename W, typename T>
+RI_ANALYTIC_INLINE void analytic_pair_weights(AnalyticViews<T> v, AnalyticPair d,
+    std::int64_t f, std::int64_t u, Cplx<W> *h) {
   const double half = double(*v.int_time) / 2;
   const double nu = double(v.freqs(f)) + double(v.dnu(u));
-  double d[4] = {0, 0, 0, 0};
-  for (int k = 0; k < 4 && k < v.delay.shape[3]; ++k)
-    d[k] = double(v.delay(p, r, t, k)) - double(v.delay(q, r, t, k));
-  const double phi = double(v.phase(p, r, f, t)) - double(v.phase(q, r, f, t)) +
-                    two_pi_c<double>() * double(v.dnu(u)) * d[0];
-  const double a = two_pi_c<double>() * nu * d[1] * half;
-  const double b = (two_pi_c<double>() / 2) * nu * d[2] * half * half;
+  const double phi = d.phase + two_pi_c<double>() * double(v.dnu(u)) * d.tau;
+  const double a = two_pi_c<double>() * nu * d.rate * half;
+  const double b = (two_pi_c<double>() / 2) * nu * d.curvature * half * half;
   const double c = v.options.cubic_terms ?
-      (two_pi_c<double>() / 6) * nu * d[3] * half * half * half : 0;
-  analytic_weights<Default>(int(v.gt.shape[2]), int(v.options.segments),
+      (two_pi_c<double>() / 6) * nu * d.jerk * half * half * half : 0;
+  analytic_weights<Default, W>(int(v.gt.shape[2]), int(v.options.segments),
       int(v.options.terms), int(v.options.cubic_terms), a, b, c, phi, h);
 }
 
-template <typename T>
-TAB_H_D inline Cplx<T> analytic_cast(Cplx<double> z) { return {T(z.re), T(z.im)}; }
+template <typename T, typename W>
+TAB_H_D inline Cplx<T> analytic_cast(Cplx<W> z) { return {T(z.re), T(z.im)}; }
 
 template <typename T>
 TAB_H_D inline Cplx<T> analytic_coefficient(AnalyticViews<T> v,
@@ -58,9 +81,9 @@ TAB_H_D inline Cplx<T> analytic_coefficient(AnalyticViews<T> v,
 
 // JAX's complex transpose pairs without conjugating the cotangent. For
 // V = H p conj(q), p_bar = g H conj(q), q_bar = conj(g H p).
-template <bool Default, typename T>
+template <bool Default, typename W, typename T>
 RI_ANALYTIC_INLINE Cplx<T> analytic_contract(const Cplx<T> *p, const Cplx<T> *q,
-    const Cplx<T> *dp, const Cplx<T> *dq, const Cplx<double> *h,
+    const Cplx<T> *dp, const Cplx<T> *dq, const Cplx<W> *h,
     int count, std::int64_t stride, bool jvp) {
   const int n = Default ? AnalyticStorage<Default>::coefficients : count;
   assert(n == count && n >= 1 && n <= AnalyticStorage<Default>::coefficients);
@@ -78,7 +101,7 @@ RI_ANALYTIC_INLINE Cplx<T> analytic_contract(const Cplx<T> *p, const Cplx<T> *q,
           cmul(p[j * stride], cconj(q[k * stride]));
       product = cadd(product, value);
     }
-    total = cadd(total, cmul(product, analytic_cast<T>(h[m])));
+    total = cadd(total, cmul(product, analytic_cast<T, W>(h[m])));
   }
   return total;
 }

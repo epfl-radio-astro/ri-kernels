@@ -29,8 +29,8 @@ void analytic_cpu_cells(std::int64_t begin, std::int64_t end,
         for (std::int64_t bl = 0; bl < nb; ++bl) {
           const auto p = v.a1(bl), q = v.a2(bl);
           Cplx<double> h[AnalyticStorage<Default>::product];
-          analytic_pair_weights<Default>(v, p, q, r, f, t, u, h);
-          const auto z = analytic_contract<Default>(coefficients.data() + p, coefficients.data() + q,
+          analytic_pair_weights<Default, double>(v, analytic_pair_of(v, p, q, r, f, t), f, u, h);
+          const auto z = analytic_contract<Default, double>(coefficients.data() + p, coefficients.data() + q,
               JVP ? dots.data() + p : nullptr, JVP ? dots.data() + q : nullptr, h, int(nm), na, JVP);
           out(bl, f, t) = cadd(out(bl, f, t), cscale(T(1) / T(nu), z));
         }
@@ -60,11 +60,11 @@ void analytic_cpu_transpose(std::int64_t begin, std::int64_t end,
           for (std::int64_t bl = 0; bl < v.a1.shape[0]; ++bl) {
             const auto p = v.a1(bl), q = v.a2(bl);
             Cplx<double> h[AnalyticStorage<Default>::product];
-            analytic_pair_weights<Default>(v, p, q, r, f, t, u, h);
+            analytic_pair_weights<Default, double>(v, analytic_pair_of(v, p, q, r, f, t), f, u, h);
             const auto g = cscale(T(1) / T(nu), cot(bl, f, t));
             for (std::int64_t j = 0; j < nm; ++j)
               for (std::int64_t k = 0; k < nm; ++k) {
-                const auto w = cmul(g, analytic_cast<T>(h[j + k]));
+                const auto w = cmul(g, analytic_cast<T, double>(h[j + k]));
                 bars[j * na + p] = cadd(bars[j * na + p], cmul(w, cconj(coefficients[k * na + q])));
                 bars[k * na + q] = cadd(bars[k * na + q], cconj(cmul(w, coefficients[j * na + p])));
               }
