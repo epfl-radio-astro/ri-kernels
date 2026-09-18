@@ -8,7 +8,7 @@ template <typename T> struct AnalyticViews {
   Tensor1D<const int *> a1, a2;
   Tensor2D<const int *> pair, tile_pairs;
   Tensor4D<const Cplx<T> *> amp, amp_dot;
-  Tensor4D<const T *> phase, delay;
+  Tensor4D<const T *> phase, phase_dot, delay;
   Tensor3D<const T *> wf, gt;
   Tensor1D<const int *> sf, st;
   Tensor1D<const T *> dnu, freqs;
@@ -81,28 +81,36 @@ TAB_H_D inline Cplx<T> analytic_coefficient(AnalyticViews<T> v,
 
 // JAX's complex transpose pairs without conjugating the cotangent. For
 // V = H p conj(q), p_bar = g H conj(q), q_bar = conj(g H p).
+//
+// The phase enters every weight as the one factor exp(i (phase_p - phase_q)),
+// so its derivative is the pair's own product turned by i. A JVP that carries
+// the phase asks for that product through `primal` and gets it from the same
+// pass over the weights as the tangent's.
 template <bool Default, typename W, typename T>
 RI_ANALYTIC_INLINE Cplx<T> analytic_contract(const Cplx<T> *p, const Cplx<T> *q,
     const Cplx<T> *dp, const Cplx<T> *dq, const Cplx<W> *h,
-    int count, std::int64_t stride, bool jvp) {
+    int count, std::int64_t stride, bool jvp, Cplx<T> *primal = nullptr) {
   const int n = Default ? AnalyticStorage<Default>::coefficients : count;
   assert(n == count && n >= 1 && n <= AnalyticStorage<Default>::coefficients);
-  Cplx<T> total{0, 0};
+  Cplx<T> total{0, 0}, base{0, 0};
   RI_ANALYTIC_UNROLL
   for (int m = 0; m < 2 * n - 1; ++m) {
-    Cplx<T> product{0, 0};
+    Cplx<T> product{0, 0}, tangent{0, 0};
     RI_ANALYTIC_UNROLL
     for (int j = 0; j < n; ++j) {
       const int k = m - j;
       if (k < 0 || k >= n) continue;
-      const auto value = jvp ?
-          cadd(cmul(dp[j * stride], cconj(q[k * stride])),
-               cmul(p[j * stride], cconj(dq[k * stride]))) :
-          cmul(p[j * stride], cconj(q[k * stride]));
-      product = cadd(product, value);
+      if (!jvp || primal)
+        product = cadd(product, cmul(p[j * stride], cconj(q[k * stride])));
+      if (jvp)
+        tangent = cadd(tangent, cadd(cmul(dp[j * stride], cconj(q[k * stride])),
+                                     cmul(p[j * stride], cconj(dq[k * stride]))));
     }
-    total = cadd(total, cmul(product, analytic_cast<T, W>(h[m])));
+    const auto hm = analytic_cast<T, W>(h[m]);
+    total = cadd(total, cmul(jvp ? tangent : product, hm));
+    if (primal) base = cadd(base, cmul(product, hm));
   }
+  if (primal) *primal = base;
   return total;
 }
 
@@ -110,7 +118,7 @@ template <ffi::DataType A, ffi::DataType R>
 ffi::Error analytic_validate(interp_index_t a1, interp_index_t a2,
     ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tiles,
     ffi::Buffer<A, 4> amp, ffi::Buffer<A, 4> dot,
-    ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> delay,
+    ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> phase_dot, ffi::Buffer<R, 4> delay,
     ffi::Buffer<R, 3> wf, interp_index_t sf, ffi::Buffer<R, 3> gt,
     interp_index_t st, ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration,
     ffi::Buffer<R, 1> freq, AnalyticOptions opt, bool cpu) {
@@ -120,6 +128,7 @@ ffi::Error analytic_validate(interp_index_t a1, interp_index_t a2,
   const auto ntiles = (na + 31) / 32;
   if (na < 1 || nr < 1 || nf < 1 || nt < 1 || a2.dimensions()[0] != nb ||
       !interp_same_shape(amp, dot) || !interp_same_shape(amp, phase) ||
+      !interp_same_shape(phase, phase_dot) ||
       d[0] != na || d[1] != nr || d[2] != nt || d[3] < 1 ||
       w[0] != nf || w[1] < 1 || w[1] > nf || w[2] < 1 ||
       g[0] != nt || g[1] < 1 || g[1] > nt || g[2] < 1 ||
@@ -156,7 +165,7 @@ template <typename T, ffi::DataType A, ffi::DataType R>
 AnalyticViews<T> analytic_views(interp_index_t a1, interp_index_t a2,
     ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tiles,
     ffi::Buffer<A, 4> amp, ffi::Buffer<A, 4> dot,
-    ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> delay,
+    ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> phase_dot, ffi::Buffer<R, 4> delay,
     ffi::Buffer<R, 3> wf, interp_index_t sf, ffi::Buffer<R, 3> gt,
     interp_index_t st, ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration,
     ffi::Buffer<R, 1> freq, AnalyticOptions opt) {
@@ -167,6 +176,7 @@ AnalyticViews<T> analytic_views(interp_index_t a1, interp_index_t a2,
     {reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1], a[2], a[3]},
     {reinterpret_cast<const Cplx<T> *>(dot.typed_data()), a[0], a[1], a[2], a[3]},
     {phase.typed_data(), a[0], a[1], a[2], a[3]},
+    {phase_dot.typed_data(), a[0], a[1], a[2], a[3]},
     {delay.typed_data(), d[0], d[1], d[2], d[3]},
     {wf.typed_data(), wf.dimensions()[0], wf.dimensions()[1], wf.dimensions()[2]},
     {gt.typed_data(), gt.dimensions()[0], gt.dimensions()[1], gt.dimensions()[2]},

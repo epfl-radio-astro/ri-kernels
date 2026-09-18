@@ -1,4 +1,4 @@
-"""Time compiled forward, JVP and VJP with synchronised GPU execution.
+"""Time compiled forward, JVP and VJP, signal-only and full, with synchronised GPU execution.
 
 Run from a built checkout with, for example:
   python tests/benchmark_rfi_analytic_vis_op.py --antennas 256 512 --iterations 100
@@ -56,26 +56,35 @@ def main():
                 if op is None:
                     ref = partial(reference, a1=a1, a2=a2, segments=2, terms=6, cubic_terms=3)
                     fn = lambda a: ref(a, *args[1:])
+                    fn2 = lambda a, p: ref(a, p, *args[2:])
                 else:
                     fn = lambda a: op.eval(a, *args[1:])
+                    fn2 = lambda a, p: op.eval(a, p, *args[2:])
                 tangent = jnp.full_like(args[0], .3 + .7j)
+                phase_tangent = jnp.full_like(args[1], .1)
                 cotangent = jnp.full((len(a1), options.channels, options.cells), .7 - .2j, complex_)
+                amp, phase = args[0], args[1]
+                # The full pair carries the phase derivative as well; the
+                # interp operator names them the same way.
                 calls = {
                     "forward": jax.jit(fn),
                     "jvp": jax.jit(lambda a: jax.jvp(fn, (a,), (tangent,))[1]),
                     "vjp": jax.jit(lambda a: jax.vjp(fn, a)[1](cotangent)[0]),
+                    "full-jvp": jax.jit(lambda a, p: jax.jvp(fn2, (a, p), (tangent, phase_tangent))[1]),
+                    "full-vjp": jax.jit(lambda a, p: jax.vjp(fn2, a, p)[1](cotangent)),
                 }
                 for kind, call in calls.items():
+                    inputs = (amp, phase) if kind.startswith("full") else (amp,)
                     # A case that cannot run -- the quadrature transpose needs
                     # more shared memory than a small card offers at this
                     # sampling -- is a result, not a reason to lose the sweep.
                     try:
                         for _ in range(3):
-                            call(args[0]).block_until_ready()
+                            jax.block_until_ready(call(*inputs))
                         timings = []
                         for _ in range(options.iterations):
                             start = time.perf_counter()
-                            call(args[0]).block_until_ready()
+                            jax.block_until_ready(call(*inputs))
                             timings.append(time.perf_counter() - start)
                     except Exception as exc:
                         print(json.dumps(dict(operator=name, derivative=kind, antennas=na,

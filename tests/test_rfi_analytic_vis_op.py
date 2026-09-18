@@ -1,4 +1,4 @@
-"""Analytic CPU/CUDA values and amplitude derivatives against the JAX specification."""
+"""Analytic CPU/CUDA values and amplitude and phase derivatives against the JAX specification."""
 from functools import partial
 import os
 from pathlib import Path
@@ -14,6 +14,7 @@ from analytic_reference import analytic_rfi_vis
 from ri_kernels.jax_api.rfi_analytic_vis_op import (
     RFIAnalyticVisOp, _TAB_LIB_ANALYTIC, _TAB_LIB_ANALYTIC_GPU,
     rfi_analytic_vis_op, rfi_analytic_jvp_op, rfi_analytic_transpose_op,
+    rfi_analytic_full_jvp_op, rfi_analytic_full_transpose_op,
 )
 
 
@@ -257,9 +258,10 @@ def test_phase_regimes(precision, device, a, b, c):
     expected = ref(*ref_args)
     assert_close(op.eval(*args, **options), expected, real)
     g = jnp.full(expected.shape, .3 + .7j, complex_)
-    actual_bar = jax.vjp(lambda amp: op.eval(amp, *args[1:], **options), args[0])[1](g)[0]
-    expected_bar = jax.vjp(lambda amp: ref(amp, *ref_args[1:]), ref_args[0])[1](upcast(g))[0]
-    assert_close(actual_bar, expected_bar, real)
+    actual_bars = jax.vjp(lambda amp, phase: op.eval(amp, phase, *args[2:], **options), *args[:2])[1](g)
+    expected_bars = jax.vjp(lambda amp, phase: ref(amp, phase, *ref_args[2:]), *ref_args[:2])[1](upcast(g))
+    for actual_bar, expected_bar in zip(actual_bars, expected_bars):
+        assert_close(actual_bar, expected_bar, real)
 
 
 @pytest.mark.parametrize("n_ant", [1, 33, 65])
@@ -274,12 +276,17 @@ def test_sparse_reversed_and_auto_baselines(precision, device, n_ant):
     ref = partial(reference, a1=a1, a2=a2, segments=2, terms=6, cubic_terms=3)
     assert_close(op.eval(*args), ref(*ref_args), real)
     g = jnp.full((len(a1), 1, 3), .4 + .7j, complex_)
-    actual = jax.vjp(lambda a: op.eval(a, *args[1:]), args[0])[1](g)[0]
-    expected = jax.vjp(lambda a: ref(a, *ref_args[1:]), ref_args[0])[1](upcast(g))[0]
-    assert_close(actual, expected, real)
+    # The phase cotangent exercises the same tile edges, reversed orderings
+    # and autocorrelations; an autocorrelation's contributions cancel.
+    actual = jax.vjp(lambda a, p: op.eval(a, p, *args[2:]), *args[:2])[1](g)
+    expected = jax.vjp(lambda a, p: ref(a, p, *ref_args[2:]), *ref_args[:2])[1](upcast(g))
+    for actual_bar, expected_bar in zip(actual, expected):
+        assert_close(actual_bar, expected_bar, real)
 
 
 def test_constants_and_zero_tangent(precision, device):
+    """eval() stops the gradient on the delay, the interval and the tables;
+    the signal and the phase get cotangents."""
     real, complex_ = precision
     args = make_inputs(real, complex_)
     a1, a2 = make_baselines(args[0].shape[0])
@@ -287,10 +294,97 @@ def test_constants_and_zero_tangent(precision, device):
     value, pullback = jax.vjp(op.eval, *args)
     bars = pullback(jnp.ones_like(value))
     assert np.max(np.abs(bars[0])) > 0
-    for i in [1, 2, 3, 5, 7, 8, 9]:
+    assert np.max(np.abs(bars[1])) > 0
+    for i in [2, 3, 5, 7, 8, 9]:
         np.testing.assert_array_equal(bars[i], jnp.zeros_like(args[i]))
-    _, dot = jax.jvp(lambda p: op.eval(args[0], p, *args[2:]), (args[1],), (jnp.ones_like(args[1]),))
+    _, dot = jax.jvp(lambda d: op.eval(args[0], args[1], d, *args[3:]), (args[2],), (jnp.ones_like(args[2]),))
     np.testing.assert_array_equal(dot, jnp.zeros_like(value))
+
+
+# --- the phase derivative -------------------------------------------------------
+
+def _phase_tangent(args, real, seed=7):
+    """A random tangent on the phase, in radians."""
+    rng = np.random.default_rng(seed)
+    return jnp.asarray(rng.normal(size=args[1].shape), dtype=real)
+
+
+@pytest.mark.parametrize("shape", SHAPES.values(), ids=SHAPES.keys())
+@pytest.mark.parametrize("options", OPTIONS)
+def test_phase_jvp_matches_reference(precision, device, shape, options):
+    """Tangents on the signal and the phase together, and on the phase alone."""
+    real, complex_ = precision
+    args = make_inputs(real, complex_, **shape)
+    amp_dot = make_inputs(real, complex_, seed=1, **shape)[0]
+    phase_dot = _phase_tangent(args, real)
+    a1, a2 = make_baselines(args[0].shape[0], shuffle=True)
+    op = RFIAnalyticVisOp(args[0].shape[0], a1, a2)
+    fn = jax.jit(lambda a, p, da, dp: jax.jvp(lambda x, y: op.eval(x, y, *args[2:], **options),
+                                              (a, p), (da, dp))[1])
+    ref_args = [upcast(x) for x in args]
+    ref = partial(reference, a1=a1, a2=a2, **options)
+    for dots in ((amp_dot, phase_dot), (jnp.zeros_like(amp_dot), phase_dot)):
+        actual = fn(args[0], args[1], *dots)
+        expected = jax.jvp(lambda a, p: ref(a, p, *ref_args[2:]), tuple(ref_args[:2]),
+                           tuple(upcast(d) for d in dots))[1]
+        assert_close(actual, expected, real)
+        assert actual.dtype == complex_
+
+
+@pytest.mark.parametrize("shape", SHAPES.values(), ids=SHAPES.keys())
+@pytest.mark.parametrize("options", OPTIONS)
+def test_phase_vjp_matches_reference(precision, device, shape, options):
+    """Cotangents of the signal and the phase from one pullback."""
+    real, complex_ = precision
+    args = make_inputs(real, complex_, **shape)
+    a1, a2 = make_baselines(args[0].shape[0], shuffle=True)
+    op = RFIAnalyticVisOp(args[0].shape[0], a1, a2)
+    n_bl, n_freq, n_time = len(a1), args[0].shape[2], args[0].shape[3]
+    rng = np.random.default_rng(22)
+    g = jnp.asarray(rng.normal(size=(n_bl, n_freq, n_time)) + 1j * rng.normal(size=(n_bl, n_freq, n_time)), complex_)
+    pullback = jax.jit(lambda a, p, g: jax.vjp(lambda x, y: op.eval(x, y, *args[2:], **options), a, p)[1](g))
+    amp_bar, phase_bar = pullback(args[0], args[1], g)
+    ref_args = [upcast(x) for x in args]
+    ref = partial(reference, a1=a1, a2=a2, **options)
+    exp_amp, exp_phase = jax.vjp(lambda a, p: ref(a, p, *ref_args[2:]), *ref_args[:2])[1](upcast(g))
+    assert_close(amp_bar, exp_amp, real)
+    assert_close(phase_bar, exp_phase, real)
+    assert phase_bar.dtype == args[1].dtype
+    # The pairing is real and bilinear under JAX's complex cotangent convention.
+    amp_dot = make_inputs(real, complex_, seed=1, **shape)[0]
+    phase_dot = _phase_tangent(args, real)
+    dot = jax.jvp(lambda a, p: op.eval(a, p, *args[2:], **options), (args[0], args[1]), (amp_dot, phase_dot))[1]
+    assert_close(jnp.real(jnp.sum(g * dot)),
+                 jnp.real(jnp.sum(amp_bar * amp_dot)) + jnp.sum(phase_bar * phase_dot), real)
+
+
+def test_the_signal_only_kernels_serve_a_fixed_phase(precision):
+    """A fixed phase binds the signal-only JVP and transpose; a differentiated
+    phase binds the full pair."""
+    real, complex_ = precision
+    args = make_inputs(real, complex_)
+    a1, a2 = make_baselines(args[0].shape[0])
+    op = RFIAnalyticVisOp(args[0].shape[0], a1, a2)
+    cot = jnp.ones((len(a1),) + args[0].shape[2:], dtype=complex_)
+    names = ("rfi_analytic_jvp_op", "rfi_analytic_transpose_op",
+             "rfi_analytic_full_jvp_op", "rfi_analytic_full_transpose_op")
+
+    def primitives(fn, *primals):
+        _, pullback = jax.vjp(fn, *primals)
+        text = str(jax.make_jaxpr(pullback)(cot))
+        return {name for name in names if name in text}
+
+    used = primitives(lambda a: op.eval(a, *args[1:]), args[0])
+    assert "rfi_analytic_transpose_op" in used and "rfi_analytic_full_transpose_op" not in used
+    used = primitives(lambda a, p: op.eval(a, p, *args[2:]), args[0], args[1])
+    assert "rfi_analytic_full_transpose_op" in used and "rfi_analytic_transpose_op" not in used
+    used = primitives(lambda p: op.eval(args[0], p, *args[2:]), args[1])
+    assert "rfi_analytic_full_transpose_op" in used
+    # Forward mode likewise.
+    text = str(jax.make_jaxpr(lambda a, t: jax.jvp(lambda x: op.eval(x, *args[1:]), (a,), (t,)))(args[0], args[0]))
+    assert "rfi_analytic_jvp_op" in text and "rfi_analytic_full_jvp_op" not in text
+    text = str(jax.make_jaxpr(lambda p, t: jax.jvp(lambda x: op.eval(args[0], x, *args[2:]), (p,), (t,)))(args[1], args[1]))
+    assert "rfi_analytic_full_jvp_op" in text and "rfi_analytic_jvp_op" not in text
 
 
 def test_cubic_translation_matters(device):
@@ -331,13 +425,17 @@ def test_direct_bind_derivatives_and_shapes(device):
     a1, a2 = make_baselines(5)
     op = RFIAnalyticVisOp(5, a1, a2)
     options = dict(segments=2, terms=6, cubic_terms=3)
-    with pytest.raises(TypeError, match="amp only"):
-        jax.jvp(lambda phase: rfi_analytic_vis_op.bind(*op.indices, args[0], phase, *args[2:], **options),
-                (args[1],), (jnp.ones_like(args[1]),))
+    with pytest.raises(TypeError, match="amp and phase only"):
+        jax.jvp(lambda delay: rfi_analytic_vis_op.bind(*op.indices, *args[:2], delay, *args[3:], **options),
+                (args[2],), (jnp.ones_like(args[2]),))
     with pytest.raises(ValueError, match="signal tangent"):
         rfi_analytic_jvp_op.bind(*op.indices, args[0], args[0][:-1], *args[1:], **options)
     with pytest.raises(ValueError, match="visibility cotangent"):
         rfi_analytic_transpose_op.bind(*op.indices, *args, jnp.ones((1, 1, 1), jnp.complex128), **options)
+    with pytest.raises(ValueError, match="phase tangent"):
+        rfi_analytic_full_jvp_op.bind(*op.indices, args[0], args[0], args[1], args[1][:-1], *args[2:], **options)
+    with pytest.raises(ValueError, match="visibility cotangent"):
+        rfi_analytic_full_transpose_op.bind(*op.indices, *args, jnp.ones((1, 1, 1), jnp.complex128), **options)
 
 
 def test_invalid_cpu_values(device):
@@ -384,9 +482,10 @@ def test_general_degree_bounds(precision, device, shape, options):
     ref = partial(reference, a1=a1, a2=a2, **options)
     assert_close(op.eval(*args, **options), ref(*ref_args), real)
     g = jnp.full((len(a1), 1, shape["n_time"]), .5 + .2j, complex_)
-    bar = jax.vjp(lambda a: op.eval(a, *args[1:], **options), args[0])[1](g)[0]
-    expected = jax.vjp(lambda a: ref(a, *ref_args[1:]), ref_args[0])[1](upcast(g))[0]
-    assert_close(bar, expected, real)
+    bars = jax.vjp(lambda a, p: op.eval(a, p, *args[2:], **options), *args[:2])[1](g)
+    expected = jax.vjp(lambda a, p: ref(a, p, *ref_args[2:]), *ref_args[:2])[1](upcast(g))
+    for bar, expected_bar in zip(bars, expected):
+        assert_close(bar, expected_bar, real)
 
 
 @pytest.mark.parametrize("slot", [1, 2, 3, 5, 7, 8, 9])
@@ -425,14 +524,23 @@ with jax.default_device(device):
     ref = partial(reference, a1=a1, a2=a2, segments=2, terms=6, cubic_terms=3)
     da = jnp.full_like(args[0], .3 + .7j)
     g = jnp.full((len(a1), 13, 5), .7 - .2j, complex_)
+    dp = jnp.full_like(args[1], .1)
     fn = lambda a: op.eval(a, *args[1:])
     rf = lambda a: ref(a, *ref_args[1:])
+    fn2 = lambda a, p: op.eval(a, p, *args[2:])
+    rf2 = lambda a, p: ref(a, p, *ref_args[2:])
     y, dy = jax.jit(lambda a, d: jax.jvp(fn, (a,), (d,)))(args[0], da)
     bar = jax.jit(lambda a, g: jax.vjp(fn, a)[1](g)[0])(args[0], g)
+    dy2 = jax.jit(lambda a, p, da, dp: jax.jvp(fn2, (a, p), (da, dp))[1])(args[0], args[1], da, dp)
+    bar2, pbar = jax.jit(lambda a, p, g: jax.vjp(fn2, a, p)[1](g))(args[0], args[1], g)
     ry, rd = jax.jit(lambda a, d: jax.jvp(rf, (a,), (d,)))(ref_args[0], upcast(da))
     rb = jax.jit(lambda a, g: jax.vjp(rf, a)[1](g)[0])(ref_args[0], upcast(g))
-    for actual, expected in [(y,ry), (dy,rd), (bar,rb)]: assert_close(actual, expected, real)
-    np.savez(sys.argv[2], value=np.asarray(y), jvp=np.asarray(dy), vjp=np.asarray(bar))
+    rd2 = jax.jit(lambda a, p, da, dp: jax.jvp(rf2, (a, p), (da, dp))[1])(ref_args[0], ref_args[1], upcast(da), upcast(dp))
+    rb2, rpbar = jax.jit(lambda a, p, g: jax.vjp(rf2, a, p)[1](g))(ref_args[0], ref_args[1], upcast(g))
+    for actual, expected in [(y,ry), (dy,rd), (bar,rb), (dy2,rd2), (bar2,rb2), (pbar,rpbar)]:
+        assert_close(actual, expected, real)
+    np.savez(sys.argv[2], value=np.asarray(y), jvp=np.asarray(dy), vjp=np.asarray(bar),
+             full_jvp=np.asarray(dy2), full_vjp=np.asarray(bar2), phase_vjp=np.asarray(pbar))
 '''
     root = Path(__file__).resolve().parents[1]
     results = []

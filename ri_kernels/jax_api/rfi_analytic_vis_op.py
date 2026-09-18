@@ -1,4 +1,14 @@
-"""Compiled analytic RFI visibility and its amplitude JVP and transpose."""
+"""Compiled analytic RFI visibility and its JVPs and transposes.
+
+The signal and the phase are differentiated. The phase enters every cell's
+weights as the one factor ``exp(i (phase[a1] - phase[a2]))``, so its tangent
+turns the pair's product by ``i`` and its cotangent is ``-Im(g V)`` on ``a1``
+and ``+Im(g V)`` on ``a2``, summed over the sources and fine channels. As in
+:mod:`rfi_interp_vis_op`, two kernel pairs carry the derivatives: the signal
+alone, and the signal with the phase; the JVP rule binds the first whenever
+the phase tangent is a symbolic zero. The delay, the integration interval and
+the tables are constants: :meth:`RFIAnalyticVisOp.eval` stops their gradients.
+"""
 
 from functools import partial
 
@@ -25,8 +35,9 @@ class RFIAnalyticVisOp(RFIInterpVisOp):
     """RFI visibility from amplitude coefficients and analytic phase moments.
 
     The baseline staging and input axis order are those of RFIInterpVisOp.
-    Only amp is differentiated; the orbit, integration interval and tables
-    are constants. The recurrence has no time sample axis or Nyquist floor.
+    amp and phase are differentiated; the delay, integration interval and
+    tables are constants. The recurrence has no time sample axis or Nyquist
+    floor.
     """
 
     def __init__(self, n_ant, a1, a2):
@@ -46,7 +57,8 @@ class RFIAnalyticVisOp(RFIInterpVisOp):
         amp and phase have shape (n_ant, n_rfi, n_freq, n_time); delay_us
         is (n_ant, n_rfi, n_time, n_path), with delay derivatives in us/s^k.
         phase holds the reduced centre phase, computed in float64 before
-        casting. freq_mhz and dnu_mhz are in MHz, not config.freqs' Hz.
+        casting. Both are differentiated; delay_us and everything after it
+        are constants. freq_mhz and dnu_mhz are in MHz, not config.freqs' Hz.
 
         g_time[t,l,m] holds monomial coefficients in x = 2*tau/int_time,
         including shifted edge stencils. w_freq and the stencil starts are
@@ -65,24 +77,26 @@ class RFIAnalyticVisOp(RFIInterpVisOp):
         stop = jax.lax.stop_gradient
         int_time = jnp.asarray(int_time, dtype=None if hasattr(int_time, "dtype") else phase.dtype)
         return rfi_analytic_vis_op.bind(
-            *self.indices, amp, stop(phase), stop(delay_us), stop(w_freq),
+            *self.indices, amp, phase, stop(delay_us), stop(w_freq),
             start_freq, stop(g_time), start_time, stop(dnu_mhz), stop(int_time),
             stop(freq_mhz), segments=segments, terms=terms, cubic_terms=cubic_terms,
         )
 
 
+# Keyed on the newest handler so an older library reads as having no analytic
+# kernels rather than failing part way through the registration below.
 _TAB_LIB_ANALYTIC = (
-    _TAB_LIB if _TAB_LIB and hasattr(_TAB_LIB, "calc_rfi_analytic_cpu_f32") else None
+    _TAB_LIB if _TAB_LIB and hasattr(_TAB_LIB, "calc_rfi_analytic_full_transpose_cpu_f32") else None
 )
 _TAB_LIB_ANALYTIC_GPU = (
     _TAB_LIB_GPU
-    if _TAB_LIB_GPU and hasattr(_TAB_LIB_GPU, "calc_rfi_analytic_gpu_f32")
+    if _TAB_LIB_GPU and hasattr(_TAB_LIB_GPU, "calc_rfi_analytic_full_transpose_gpu_f32")
     else None
 )
 
 if _TAB_LIB_ANALYTIC:
     for _suffix in ("f32", "f64"):
-        for _kind in ("", "_jvp", "_transpose"):
+        for _kind in ("", "_jvp", "_transpose", "_full_jvp", "_full_transpose"):
             jax.ffi.register_ffi_target(
                 f"calc_rfi_analytic{_kind}_{_suffix}",
                 jax.ffi.pycapsule(
@@ -93,7 +107,7 @@ if _TAB_LIB_ANALYTIC:
 
 if _TAB_LIB_ANALYTIC_GPU:
     for _suffix in ("f32", "f64"):
-        for _kind in ("", "_jvp", "_transpose"):
+        for _kind in ("", "_jvp", "_transpose", "_full_jvp", "_full_transpose"):
             jax.ffi.register_ffi_target(
                 f"calc_rfi_analytic{_kind}_gpu_{_suffix}",
                 jax.ffi.pycapsule(
@@ -237,6 +251,26 @@ rfi_analytic_transpose_op.def_abstract_eval(_transpose_abstract)
 mlir.register_lowering(rfi_analytic_transpose_op, _lowering("calc_rfi_analytic_transpose", "cpu"), platform="cpu")
 mlir.register_lowering(rfi_analytic_transpose_op, _lowering("calc_rfi_analytic_transpose", "gpu"), platform="gpu")
 
+# The full transpose: the cotangents of the signal and the phase.
+rfi_analytic_full_transpose_op = core.Primitive("rfi_analytic_full_transpose_op")
+rfi_analytic_full_transpose_op.multiple_results = True
+rfi_analytic_full_transpose_op.def_impl(partial(xla.apply_primitive, rfi_analytic_full_transpose_op))
+
+
+def _full_transpose_abstract(*args, **options):
+    _validate_options(**options)
+    a1, arrays, g = args[0], args[N_IDX:N_IDX + 10], args[N_IDX + 10]
+    _validate(*arrays)
+    _validate_indices(args)
+    _validate_like("visibility cotangent", _output_aval(a1, arrays[0]), g)
+    amp, phase = arrays[:2]
+    return (ShapedArray(amp.shape, amp.dtype), ShapedArray(phase.shape, phase.dtype))
+
+
+rfi_analytic_full_transpose_op.def_abstract_eval(_full_transpose_abstract)
+mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("calc_rfi_analytic_full_transpose", "cpu"), platform="cpu")
+mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("calc_rfi_analytic_full_transpose", "gpu"), platform="gpu")
+
 # --- JVP: linear in the signal tangent -----------------------------------------
 
 rfi_analytic_jvp_op = core.Primitive("rfi_analytic_jvp_op")
@@ -255,18 +289,19 @@ def _jvp_abstract(*args, **options):
 rfi_analytic_jvp_op.def_abstract_eval(_jvp_abstract)
 
 
-def _jvp_lowering(platform):
+def _jvp_lowering(prefix, platform):
+    # The signal tangent follows the signal, so the phase is one slot later.
     def lowering(ctx, *args, **options):
         _check_analytic_lib(platform)
         suffix = _dtype_suffix(ctx.avals_in[N_IDX].dtype, ctx.avals_in[N_IDX + 2].dtype)
-        target = f"calc_rfi_analytic_jvp{'_gpu' if platform == 'gpu' else ''}_{suffix}"
+        target = f"{prefix}{'_gpu' if platform == 'gpu' else ''}_{suffix}"
         return jax.ffi.ffi_lowering(target)(ctx, *args, **{k: np.int64(v) for k, v in options.items()})
 
     return lowering
 
 
-mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("cpu"), platform="cpu")
-mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("gpu"), platform="gpu")
+mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("calc_rfi_analytic_jvp", "cpu"), platform="cpu")
+mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("calc_rfi_analytic_jvp", "gpu"), platform="gpu")
 
 
 def _jvp_transpose(g, *args, **options):
@@ -278,6 +313,44 @@ def _jvp_transpose(g, *args, **options):
 
 
 ad.primitive_transposes[rfi_analytic_jvp_op] = _jvp_transpose
+
+
+# --- full JVP: linear in the signal and phase tangents --------------------------
+# Arguments: *indices, amp, amp_dot, phase, phase_dot, delay, tables.
+
+rfi_analytic_full_jvp_op = core.Primitive("rfi_analytic_full_jvp_op")
+rfi_analytic_full_jvp_op.def_impl(partial(xla.apply_primitive, rfi_analytic_full_jvp_op))
+
+
+def _full_jvp_abstract(*args, **options):
+    _validate_options(**options)
+    a1 = args[0]
+    amp, amp_dot, phase, phase_dot, delay = args[N_IDX:N_IDX + 5]
+    tables = args[N_IDX + 5:]
+    _validate(amp, phase, delay, *tables)
+    _validate_indices(args)
+    _validate_like("signal tangent", amp, amp_dot)
+    _validate_like("phase tangent", phase, phase_dot)
+    return _output_aval(a1, amp)
+
+
+rfi_analytic_full_jvp_op.def_abstract_eval(_full_jvp_abstract)
+mlir.register_lowering(rfi_analytic_full_jvp_op, _jvp_lowering("calc_rfi_analytic_full_jvp", "cpu"), platform="cpu")
+mlir.register_lowering(rfi_analytic_full_jvp_op, _jvp_lowering("calc_rfi_analytic_full_jvp", "gpu"), platform="gpu")
+
+
+def _full_jvp_transpose(g, *args, **options):
+    indices = args[:N_IDX]
+    amp, _, phase, _, delay = args[N_IDX:N_IDX + 5]
+    tables = args[N_IDX + 5:]
+    amp_bar, phase_bar = rfi_analytic_full_transpose_op.bind(
+        *indices, amp, phase, delay, *tables, g, **options
+    )
+    # Cotangents for the two linear inputs, at their tangent slots.
+    return (None,) * N_IDX + (None, amp_bar, None, phase_bar, None) + (None,) * len(tables)
+
+
+ad.primitive_transposes[rfi_analytic_full_jvp_op] = _full_jvp_transpose
 
 
 # --- primal ---------------------------------------------------------------------
@@ -301,14 +374,27 @@ mlir.register_lowering(rfi_analytic_vis_op, _lowering("calc_rfi_analytic", "gpu"
 
 def _vis_jvp(args, tangents, **options):
     indices, arrays = args[:N_IDX], args[N_IDX:]
-    for name, dot in zip(_ARRAY_NAMES[1:], tangents[N_IDX + 1:]):
+    amp, phase, rest = arrays[0], arrays[1], arrays[2:]
+    amp_dot, phase_dot = tangents[N_IDX], tangents[N_IDX + 1]
+    # eval() stops the gradient on the delay, the interval and the tables, so
+    # a tangent on them can only reach here through a direct bind. The kernels
+    # have no derivative with respect to them: refuse rather than drop.
+    for name, dot in zip(_ARRAY_NAMES[2:], tangents[N_IDX + 2:]):
         if not isinstance(dot, ad.Zero):
-            raise TypeError(f"rfi_analytic_vis_op differentiates amp only; got a tangent for {name}")
+            raise TypeError(
+                f"rfi_analytic_vis_op differentiates amp and phase only; got a tangent for {name}"
+            )
     primal = rfi_analytic_vis_op.bind(*args, **options)
-    dot = tangents[N_IDX]
-    if isinstance(dot, ad.Zero):
-        return primal, ad.Zero.from_primal_value(primal)
-    return primal, rfi_analytic_jvp_op.bind(*indices, arrays[0], dot, *arrays[1:], **options)
+    if isinstance(phase_dot, ad.Zero):
+        # Nothing learnable feeds the phase: the signal-only kernels.
+        if isinstance(amp_dot, ad.Zero):
+            return primal, ad.Zero.from_primal_value(primal)
+        return primal, rfi_analytic_jvp_op.bind(*indices, amp, amp_dot, phase, *rest, **options)
+    if isinstance(amp_dot, ad.Zero):
+        amp_dot = jnp.zeros_like(amp)
+    return primal, rfi_analytic_full_jvp_op.bind(
+        *indices, amp, amp_dot, phase, phase_dot, *rest, **options
+    )
 
 
 ad.primitive_jvps[rfi_analytic_vis_op] = _vis_jvp

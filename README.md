@@ -200,8 +200,20 @@ The operands follow `RFIInterpVisOp`'s axis order and precision contract.
 `tabascal.poly_interp.monomial_tables` produces them, including the shifted edge
 stencils. `int_time` is a positive scalar in seconds. Channel centres and
 frequency offsets are in **MHz**; divide `config.freqs` in Hz by `1e6`.
-Only `amp` is differentiated. The compiled JVP and transpose follow JAX's
-complex cotangent convention; `eval` stops gradients on the remaining inputs.
+
+`amp` and `phase` are differentiated; `delay_us`, `int_time` and the tables
+are constants whose gradients `eval` stops. As for `RFIInterpVisOp`, two
+kernel pairs carry the derivatives: a JVP and transpose for the signal alone,
+and a full pair that takes the phase tangent as well and returns its
+cotangent. The phase enters every cell's weights as the one factor
+`exp(i (phase[a1] - phase[a2]))`, so the phase tangent turns the pair's
+product by `i` (`dV = i (dphase[a1] - dphase[a2]) V` per source and fine
+channel) and the cotangent is `-Im(g V)` on `a1` and `+Im(g V)` on `a2`,
+summed over the baseline's sources and fine channels; both cost one extra
+contraction against weights the kernel has already formed. The JVP rule binds
+the signal-only pair whenever the phase tangent is a symbolic zero, so a
+fixed orbit computes no phase derivative. The compiled JVPs and transposes
+follow JAX's complex cotangent convention.
 
 The moment branches, segmentation and cubic translation follow
 `tabascal.coarse_rfi_vis.analytic_rfi_vis`. `segments`, `terms`, and
@@ -241,12 +253,13 @@ python -m pytest tests/test_rfi_analytic_vis_op.py tests/test_rfi_interp_vis_op.
 python tests/benchmark_rfi_analytic_vis_op.py --antennas 256 512 --iterations 100
 ```
 
-The analytic tests compare both precisions and both amplitude derivatives
-against a frozen float64 JAX reference. They cover zero winding, both recurrence
+The analytic tests compare both precisions and the amplitude and phase
+derivatives against a frozen float64 JAX reference. They cover zero winding, both recurrence
 branches, the Fresnel boundary, cubic translation, wider coefficient counts,
 sparse/reversed/autocorrelation baselines, partial antenna tiles and forced
 scratch splitting. The benchmark reports synchronised forward, JVP and VJP
-times after compilation and warmup, alongside 6571-sample quadrature. It uses
+times, signal-only and with the phase, after compilation and warmup, alongside
+6571-sample quadrature. It uses
 synthetic inputs; repeat the scientific accuracy check and the 100-iteration
 optimisation with the production SKA-Low data. Inspect ptxas register/spill
 reports and Nsight local-memory traffic for the default specialisation before

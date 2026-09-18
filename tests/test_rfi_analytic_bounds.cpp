@@ -15,7 +15,8 @@ void check_cells(int count, AnalyticOptions options) {
   std::vector<Cplx<T>> amp(na * nr * nf * nt, {T(1), T(.2)});
   std::vector<Cplx<T>> dot(amp.size(), {T(.3), T(.7)}), bar(amp.size());
   std::vector<Cplx<T>> vis(nb * nf * nt), tangent(vis.size()), cot(vis.size(), {T(.5), T(.2)});
-  std::vector<T> phase(amp.size(), T(.1)), delay(na * nr * nt * 4, T(0));
+  std::vector<T> phase(amp.size(), T(.1)), phase_dot(amp.size(), T(.05)), phase_bar(amp.size());
+  std::vector<T> delay(na * nr * nt * 4, T(0));
   std::vector<T> wf(nf * nu, T(1)), gt(nt * count * count, T(0));
   std::vector<T> dnu{T(-.0025), T(0)}, freqs{T(150)};
   T duration = T(2);
@@ -30,15 +31,24 @@ void check_cells(int count, AnalyticOptions options) {
   AnalyticViews<T> v{
       {a1.data(), nb}, {a2.data(), nb}, {pair.data(), na, na}, {tiles.data(), 1, 1024},
       {amp.data(), na, nr, nf, nt}, {dot.data(), na, nr, nf, nt},
-      {phase.data(), na, nr, nf, nt}, {delay.data(), na, nr, nt, 4},
+      {phase.data(), na, nr, nf, nt}, {phase_dot.data(), na, nr, nf, nt},
+      {delay.data(), na, nr, nt, 4},
       {wf.data(), nf, 1, nu}, {gt.data(), nt, count, count},
       {sf.data(), nf}, {st.data(), nt}, {dnu.data(), nu}, {freqs.data(), nf}, &duration, options};
-  analytic_cpu_cells<false, false>(0, nf * nt, v, {vis.data(), nb, nf, nt});
-  analytic_cpu_cells<false, true>(0, nf * nt, v, {tangent.data(), nb, nf, nt});
-  analytic_cpu_transpose<false>(0, nr, v, {cot.data(), nb, nf, nt}, {bar.data(), na, nr, nf, nt});
+  analytic_cpu_cells<false, false, false>(0, nf * nt, v, {vis.data(), nb, nf, nt});
+  analytic_cpu_cells<false, true, false>(0, nf * nt, v, {tangent.data(), nb, nf, nt});
+  analytic_cpu_transpose<false, false>(0, nr, v, {cot.data(), nb, nf, nt}, {bar.data(), na, nr, nf, nt},
+                                       {nullptr, na, nr, nf, nt});
+  // The full pair once more: the phase tangent rides on the JVP, and the
+  // transpose writes the phase cotangent beside the signal's.
+  analytic_cpu_cells<false, true, true>(0, nf * nt, v, {tangent.data(), nb, nf, nt});
+  analytic_cpu_transpose<false, true>(0, nr, v, {cot.data(), nb, nf, nt}, {bar.data(), na, nr, nf, nt},
+                                      {phase_bar.data(), na, nr, nf, nt});
   for (const auto *values : {&vis, &tangent, &bar})
     for (const auto z : *values)
       if (!std::isfinite(z.re) || !std::isfinite(z.im)) throw std::runtime_error("Nonfinite cell result");
+  for (const auto x : phase_bar)
+    if (!std::isfinite(x)) throw std::runtime_error("Nonfinite phase cotangent");
 }
 
 void check_moments() {
