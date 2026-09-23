@@ -63,20 +63,20 @@ def linear_phase_moments(a: Array, degree: int) -> Array:
     # branch a benign argument keeps masked overflows out of differentiation.
     down_a = jnp.where(jnp.abs(a) <= degree, a, 0)
     ep, em = jnp.exp(1j * down_a), jnp.exp(-1j * down_a)
-    values = jnp.zeros(a.shape + (degree + 1,), dtype=positive.dtype)
 
-    def step(carry, m):
-        last, values = carry
+    def step(last, m):
         # A floating base raised to an integer scan index adopts the default
         # real dtype under x64. Parity and recurrence factors instead follow a.
         sign = jnp.where(m % 2 == 0, 1, -1).astype(a.dtype)
         previous = ((ep - sign * em) / 2 - 1j * down_a * last) / m.astype(a.dtype)
-        values = lax.cond(m <= degree + 1, lambda v: v.at[..., m - 1].set(previous), lambda v: v, values)
-        return (previous, values), None
+        return previous, previous
 
-    (_, downward), _ = lax.scan(
-        step, (jnp.zeros_like(positive), values), jnp.arange(degree + 64, 0, -1, dtype=jnp.int32), unroll=1,
+    # The scan runs m = degree+64 .. 1; reversed, output k holds order m = k+1
+    # and the requested moments are the first degree+1 of them.
+    _, downward = lax.scan(
+        step, jnp.zeros_like(positive), jnp.arange(degree + 64, 0, -1, dtype=jnp.int32), unroll=1,
     )
+    downward = jnp.moveaxis(downward[::-1][:degree + 1], 0, -1)
     return jnp.where(jnp.arange(degree + 1) <= jnp.abs(a)[..., None], upward, downward)
 
 
