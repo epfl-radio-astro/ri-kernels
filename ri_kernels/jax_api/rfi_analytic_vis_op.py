@@ -36,6 +36,13 @@ from .rfi_vis_op import (
 #: the two have to be changed together.
 TILE = 32
 
+#: The default bound, in MiB, on the GPU coefficient scratch; see ``scratch_mb``
+#: in :meth:`RFIAnalyticVisOp.eval`.
+SCRATCH_MB = 256
+
+# The largest scratch_mb whose byte count fits in int64.
+_MAX_SCRATCH_MB = np.iinfo(np.int64).max // (1024 * 1024)
+
 
 def tile_pair_list(n_ant, a1, a2):
     """The antenna pairs the baseline list covers, per unordered tile pair.
@@ -115,7 +122,7 @@ class RFIAnalyticVisOp:
 
     def eval(self, amp, phase, delay_us, w_freq, start_freq, g_time,
              start_time, dnu_mhz, int_time, freq_mhz, *, segments=2, terms=6,
-             cubic_terms=3):
+             cubic_terms=3, scratch_mb=SCRATCH_MB):
         """Return complex (n_bl, n_freq, n_time) visibilities.
 
         amp and phase have shape (n_ant, n_rfi, n_freq, n_time); delay_us
@@ -137,14 +144,22 @@ class RFIAnalyticVisOp:
         The defaults are the measured two-piece configuration; 4,16,3 gives
         the reference's more conservative configuration. Coefficient counts
         up to 9, terms up to 32 and cubic_terms up to 8 are supported.
+
+        scratch_mb bounds the GPU coefficient scratch in MiB; the CPU ignores
+        it. The GPU kernels chunk over time, and over frequency when one time
+        cell does not fit, so a smaller budget costs more launches and, in the
+        transposes, more passes over the cotangent. A budget below one cell and
+        channel fails at run time.
         """
-        _validate_options(segments=segments, terms=terms, cubic_terms=cubic_terms)
+        _validate_options(segments=segments, terms=terms, cubic_terms=cubic_terms,
+                          scratch_mb=scratch_mb)
         stop = jax.lax.stop_gradient
         int_time = jnp.asarray(int_time, dtype=None if hasattr(int_time, "dtype") else phase.dtype)
         return rfi_analytic_vis_op.bind(
             *self.indices, amp, phase, stop(delay_us), stop(w_freq),
             start_freq, stop(g_time), start_time, stop(dnu_mhz), stop(int_time),
             stop(freq_mhz), segments=segments, terms=terms, cubic_terms=cubic_terms,
+            scratch_mb=scratch_mb,
         )
 
 
@@ -280,9 +295,10 @@ def _validate_indices(args):
             raise ValueError(f"Expected int32 index array of shape {shape}; got {x.shape} {x.dtype}")
 
 
-def _validate_options(*, segments, terms, cubic_terms):
+def _validate_options(*, segments, terms, cubic_terms, scratch_mb):
     for name, value, lo, hi in (("segments", segments, 1, 1024),
-                               ("terms", terms, 1, 32), ("cubic_terms", cubic_terms, 0, 8)):
+                               ("terms", terms, 1, 32), ("cubic_terms", cubic_terms, 0, 8),
+                               ("scratch_mb", scratch_mb, 1, _MAX_SCRATCH_MB)):
         if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or not lo <= value <= hi:
             raise ValueError(f"{name} must be a static integer in [{lo}, {hi}]")
 

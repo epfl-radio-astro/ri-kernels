@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <string>
@@ -19,24 +18,13 @@
 namespace ri_kernels {
 namespace gpu {
 
-#ifndef RI_ANALYTIC_SCRATCH_MB
-#define RI_ANALYTIC_SCRATCH_MB 256u
-#endif
-
-// The build-time default can be overridden once per process, before the first
-// call. Nonpositive environment values leave the build-time default in place.
-inline std::int64_t analytic_scratch_budget() {
-  static const std::int64_t budget = [] {
-    std::int64_t mb = RI_ANALYTIC_SCRATCH_MB;
-    if (const char *env = std::getenv("RI_KERNELS_ANALYTIC_SCRATCH_MB")) {
-      const long value = std::strtol(env, nullptr, 10);
-      if (value > 0) mb = value;
-    }
-    constexpr std::int64_t mib = 1024 * 1024;
-    constexpr auto limit = std::numeric_limits<std::int64_t>::max();
-    return mb > limit / mib ? limit : mb * mib;
-  }();
-  return budget;
+// The budget is the operator's static scratch_mb attribute, in MiB. Returns
+// false for a nonpositive budget or one past the 64-bit byte range.
+inline bool analytic_scratch_bytes(std::int64_t scratch_mb, std::int64_t &bytes) {
+  constexpr std::int64_t mib = 1024 * 1024;
+  if (scratch_mb < 1 || scratch_mb > std::numeric_limits<std::int64_t>::max() / mib) return false;
+  bytes = scratch_mb * mib;
+  return true;
 }
 
 inline bool analytic_checked_product(std::initializer_list<std::int64_t> factors,
@@ -73,7 +61,8 @@ template <typename INT_T> struct AnalyticCellChunk {
 // one channel and time cell. All byte arithmetic stays checked and in 64 bits.
 inline ffi::Error make_analytic_chunk_plan(
     std::int64_t n_time, std::int64_t n_freq, std::int64_t sample_per_freq,
-    std::int64_t h_per_time, std::int64_t n_sample_buffers, AnalyticChunkPlan &plan) {
+    std::int64_t h_per_time, std::int64_t n_sample_buffers, std::int64_t budget,
+    AnalyticChunkPlan &plan) {
   if (n_time < 1 || n_freq < 1 || sample_per_freq < 1 || h_per_time < 0 || n_sample_buffers < 1)
     return ffi::Error::InvalidArgument("Expected nonempty analytic cells and coefficients");
   const auto overflow = [] {
@@ -85,12 +74,11 @@ inline ffi::Error make_analytic_chunk_plan(
       !analytic_checked_product({per_freq, n_freq}, full_samples) ||
       !analytic_checked_sum(h_per_time, full_samples, per_time)) return overflow();
 
-  const auto budget = analytic_scratch_budget();
   if (minimum > budget)
     return ffi::Error::InvalidArgument(
         "Analytic scratch needs at least " + std::to_string(minimum) +
         " bytes for one frequency and time cell (including frequency-complete partials), "
-        "but RI_KERNELS_ANALYTIC_SCRATCH_MB allows " + std::to_string(budget) + " bytes");
+        "but scratch_mb allows " + std::to_string(budget) + " bytes");
 
   plan.n_tc = 1;
   plan.n_fc = n_freq;

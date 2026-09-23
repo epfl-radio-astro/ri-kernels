@@ -187,11 +187,13 @@ six-term, three-cubic-term path has unrolled moment orders so its CUDA
 recurrence can stay in registers. Wider configurations use a bounded general
 implementation.
 
-GPU scratch uses `RI_KERNELS_ANALYTIC_SCRATCH_MB` (256 MiB by default), with time
-chunks and, when necessary, frequency chunks. The transpose reduces coefficient
-cotangents within each tile in shared memory, writes separate partials for
-partner tiles, and gathers through the interpolation stencils. Shared-memory
-atomics mean the last bits of the GPU transpose can vary between runs.
+GPU scratch is bounded by the `scratch_mb` argument of `eval` (256 MiB by
+default), with time chunks and, when necessary, frequency chunks. A smaller
+budget means more chunks, and each chunk of a transpose passes over the whole
+signal cotangent. The transpose reduces coefficient cotangents within each tile
+in shared memory, writes separate partials for partner tiles, and gathers
+through the interpolation stencils. Shared-memory atomics mean the last bits of
+the GPU transpose can vary between runs.
 
 After building on the GPU host, run:
 

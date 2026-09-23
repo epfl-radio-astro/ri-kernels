@@ -1,10 +1,6 @@
 """Analytic CPU/CUDA values and amplitude and phase derivatives against the JAX specification."""
 from collections import namedtuple
 from functools import partial
-import os
-from pathlib import Path
-import subprocess
-import sys
 
 import jax
 import jax.numpy as jnp
@@ -412,7 +408,8 @@ def test_bad_shapes(slot, value, match):
         RFIAnalyticVisOp(5, a1, a2).eval(*args)
 
 
-@pytest.mark.parametrize("options", [dict(segments=0), dict(terms=33), dict(cubic_terms=-1), dict(terms=2.5)])
+@pytest.mark.parametrize("options", [dict(segments=0), dict(terms=33), dict(cubic_terms=-1), dict(terms=2.5),
+                                     dict(scratch_mb=0), dict(scratch_mb=2**43)])
 def test_bad_options(options):
     args = make_inputs(jnp.float64, jnp.complex128)
     a1, a2 = make_baselines(5)
@@ -424,7 +421,7 @@ def test_direct_bind_derivatives_and_shapes():
     args = make_inputs(jnp.float64, jnp.complex128)
     a1, a2 = make_baselines(5)
     op = RFIAnalyticVisOp(5, a1, a2)
-    options = dict(segments=2, terms=6, cubic_terms=3)
+    options = dict(segments=2, terms=6, cubic_terms=3, scratch_mb=256)
     with pytest.raises(TypeError, match="amp and phase only"):
         jax.jvp(lambda delay: rfi_analytic_vis_op.bind(*op.indices, *args[:2], delay, *args[3:], **options),
                 (args[2],), (jnp.ones_like(args[2]),))
@@ -490,43 +487,24 @@ def test_mixed_real_precision(slot):
 
 
 @pytest.mark.parametrize("real_name", ["float32", "float64"])
-def test_gpu_scratch_chunks(real_name, tmp_path, device):
+def test_gpu_scratch_chunks(real_name, device):
     if device.platform == "cpu":
         pytest.skip("Scratch chunking is a GPU path")
     # This shape forces a frequency split at 1 MiB even for complex64. The
     # final chunks are short on both axes, and edge stencils cross chunks.
-    # The budget is read once per process, so each one runs in its own.
-    code = r'''
-import sys
-sys.meta_path[:] = [f for f in sys.meta_path if "ScikitBuild" not in type(f).__name__]
-import jax
-jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
-import numpy as np
-from test_rfi_analytic_vis_op import make_inputs, check, RFIAnalyticVisOp
-real = getattr(jnp, sys.argv[1])
-complex_ = jnp.complex64 if real == jnp.float32 else jnp.complex128
-device = next(d for d in jax.devices() if d.platform != "cpu")
-with jax.default_device(device):
+    real = getattr(jnp, real_name)
+    complex_ = jnp.complex64 if real == jnp.float32 else jnp.complex128
     args = make_inputs(real, complex_, n_ant=65, n_rfi=2, n_freq=13, n_time=5, n_int_f=9)
-    a1 = jnp.array([0,64,31,32,0,32,64], jnp.int32)
-    a2 = jnp.array([64,0,32,31,0,32,64], jnp.int32)
-    results = check(RFIAnalyticVisOp(65, a1, a2), args, a1, a2)
-    np.savez(sys.argv[2], **{k: np.asarray(v) for k, v in results._asdict().items()})
-'''
-    root = Path(__file__).resolve().parents[1]
-    results = []
-    for budget in (1, 256):
-        dest = tmp_path / f"scratch-{budget}.npz"
-        env = dict(os.environ, RI_KERNELS_ANALYTIC_SCRATCH_MB=str(budget),
-                   PYTHONPATH=os.pathsep.join([str(root), str(root / "tests"), os.environ.get("PYTHONPATH", "")]))
-        run = subprocess.run([sys.executable, "-c", code, real_name, str(dest)],
-                             env=env, capture_output=True, text=True, timeout=240)
-        assert run.returncode == 0, run.stdout + run.stderr
-        with np.load(dest) as saved:
-            results.append({key: saved[key] for key in saved})
-    for key in results[0]:
-        assert_close(results[0][key], results[1][key], getattr(jnp, real_name))
+    a1 = jnp.array([0, 64, 31, 32, 0, 32, 64], jnp.int32)
+    a2 = jnp.array([64, 0, 32, 31, 0, 32, 64], jnp.int32)
+    op = RFIAnalyticVisOp(65, a1, a2)
+    whole = check(op, args, a1, a2)
+    split = kernel_results(op, args, *perturbations(args, len(a1)), scratch_mb=1)
+    for name, a, b in zip(Results._fields, whole, split):
+        try:
+            assert_close(a, b, real)
+        except AssertionError as error:
+            raise AssertionError(f"{name}: {error}") from None
 
 
 @pytest.mark.parametrize("option,value", [
@@ -539,7 +517,8 @@ def test_ffi_rejects_excess_capacity(option, value, device):
     args = make_inputs(jnp.float64, jnp.complex128)
     a1, a2 = make_baselines(5)
     op = RFIAnalyticVisOp(5, a1, a2)
-    options = dict(segments=np.int64(2), terms=np.int64(6), cubic_terms=np.int64(3))
+    options = dict(segments=np.int64(2), terms=np.int64(6), cubic_terms=np.int64(3),
+                   scratch_mb=np.int64(256))
     options[option] = np.int64(value)
     target = "calc_rfi_analytic" + ("_gpu" if device.platform != "cpu" else "") + "_f64"
     call = jax.ffi.ffi_call(target, jax.ShapeDtypeStruct((len(a1), 3, 6), jnp.complex128))
@@ -556,4 +535,4 @@ def test_ffi_rejects_excess_coefficients(device):
     call = jax.ffi.ffi_call(target, jax.ShapeDtypeStruct((len(a1), 3, 6), jnp.complex128))
     with pytest.raises(Exception, match="capacity"):
         call(*op.indices, *args, segments=np.int64(2), terms=np.int64(6),
-             cubic_terms=np.int64(3)).block_until_ready()
+             cubic_terms=np.int64(3), scratch_mb=np.int64(256)).block_until_ready()

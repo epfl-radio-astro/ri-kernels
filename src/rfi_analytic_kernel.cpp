@@ -118,7 +118,7 @@ ffi::Future analytic_cpu_dispatch(ffi::ThreadPool pool,
     ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration, ffi::Buffer<R, 1> freq,
     ffi::Buffer<A, 3> cot, ffi::Result<ffi::Buffer<A, (Mode == 2 || Mode == 4) ? 4 : 3>> out,
     ffi::Result<ffi::Buffer<R, 4>> *phase_bar,
-    std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms) {
+    std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms, std::int64_t) {
   constexpr bool Transpose = Mode == 2 || Mode == 4, Phase = Mode >= 3;
   const AnalyticOptions options{segments, terms, cubic_terms};
   auto status = analytic_validate(a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,

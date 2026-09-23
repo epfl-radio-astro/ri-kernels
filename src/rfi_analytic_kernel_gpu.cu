@@ -298,7 +298,8 @@ __global__ void analytic_gather_phase(AnalyticViews<T> v, const T *partials,
 
 template <bool Default, int Mode, typename T>
 ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scratch,
-    AnalyticViews<T> v, Cplx<T> *output, const Cplx<T> *cotangent, T *phase_output) {
+    std::int64_t scratch_budget, AnalyticViews<T> v, Cplx<T> *output,
+    const Cplx<T> *cotangent, T *phase_output) {
   constexpr bool JVP = Mode == 1 || Mode == 3, Transpose = Mode == 2 || Mode == 4;
   constexpr bool Phase = Mode >= 3;
   const auto na = v.amp.shape[0], nr = v.amp.shape[1], nf = v.amp.shape[2], nt = v.amp.shape[3];
@@ -312,7 +313,7 @@ ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scrat
     return ffi::Error::InvalidArgument("Analytic phase cotangent size exceeds the 64-bit byte range");
   const std::int64_t buffers = Transpose ? 1 + ntiles : JVP ? 2 : 1;
   AnalyticChunkPlan plan;
-  auto status = make_analytic_chunk_plan(nt, nf, per_cell, phase_per_time, buffers, plan);
+  auto status = make_analytic_chunk_plan(nt, nf, per_cell, phase_per_time, buffers, scratch_budget, plan);
   if (!status.success()) return status;
   auto mem = scratch.Allocate(std::size_t(plan.total_bytes), 16);
   if (!mem.has_value()) return ffi::Error::Internal("Could not allocate analytic coefficient scratch");
@@ -368,11 +369,15 @@ ffi::Error analytic_gpu_dispatch(cudaStream_t stream, ffi::ScratchAllocator &scr
     ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration, ffi::Buffer<R, 1> freq,
     ffi::Buffer<A, 3> cot, ffi::Result<ffi::Buffer<A, (Mode == 2 || Mode == 4) ? 4 : 3>> out,
     ffi::Result<ffi::Buffer<R, 4>> *phase_bar,
-    std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms) {
+    std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
+    std::int64_t scratch_mb) {
   const AnalyticOptions options{segments, terms, cubic_terms};
   auto status = analytic_validate(a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,
                                  wf, sf, gt, st, dnu, duration, freq, options, false);
   if (!status.success()) return status;
+  std::int64_t scratch_budget;
+  if (!analytic_scratch_bytes(scratch_mb, scratch_budget))
+    return ffi::Error::InvalidArgument("Expected scratch_mb to be a positive size in MiB");
   const auto a = amp.dimensions();
   if constexpr (Mode == 2 || Mode == 4) {
     if (!analytic_same_shape(amp, *out) || cot.dimensions()[0] != a1.element_count() ||
@@ -390,8 +395,8 @@ ffi::Error analytic_gpu_dispatch(cudaStream_t stream, ffi::ScratchAllocator &scr
   auto cotangent = reinterpret_cast<const Cplx<T> *>(cot.typed_data());
   T *phase_output = Mode == 4 ? (*phase_bar)->typed_data() : nullptr;
   if (analytic_is_default(gt.dimensions()[2], options))
-    return analytic_gpu_launch<true, Mode>(stream, scratch, v, output, cotangent, phase_output);
-  return analytic_gpu_launch<false, Mode>(stream, scratch, v, output, cotangent, phase_output);
+    return analytic_gpu_launch<true, Mode>(stream, scratch, scratch_budget, v, output, cotangent, phase_output);
+  return analytic_gpu_launch<false, Mode>(stream, scratch, scratch_budget, v, output, cotangent, phase_output);
 }
 
 #define RI_ANALYTIC_CONTEXT cudaStream_t stream, ffi::ScratchAllocator scratch
