@@ -48,7 +48,7 @@ python -m pytest tests
 
 ## RFI visibilities
 
-Two operators compute the same quantity, the per-baseline RFI visibility
+`RFIVisOp` computes the per-baseline RFI visibility
 
 ```
 vis[bl, f, t] = mean over (n_int_freq, n_int_time) of
@@ -56,53 +56,20 @@ vis[bl, f, t] = mean over (n_int_freq, n_int_time) of
 ```
 
 for amplitudes `A` shaped `(n_ant, n_freq, n_time, n_rfi, n_int_freq,
-n_int_time)`, giving an output of shape `(n_baselines, n_freq, n_time)`. They
-differ only in how the phase `φ` is supplied. Both are constructed from the
-baseline layout and evaluated through `eval`:
+n_int_time)` and phases `φ` in radians of the same shape, giving an output of
+shape `(n_baselines, n_freq, n_time)`. It is constructed from the baseline
+layout and evaluated through `eval`:
 
 ```python
-from ri_kernels.jax_api import RFIVisOp, RFIDelayVisOp
+from ri_kernels.jax_api import RFIVisOp
 
 vis = RFIVisOp(n_ant, a1, a2).eval(rfi_amp_fine, rfi_phase)
-vis = RFIDelayVisOp(n_ant, a1, a2).eval(rfi_amp_fine, rfi_delay_us, freq_mhz)
 ```
 
-Each operator has native primal, JVP, and transpose kernels for CPU, CUDA, and
+The operator has native primal, JVP, and transpose kernels for CPU, CUDA, and
 ROCm, so both forward- and reverse-mode differentiation stay inside the
 kernels. Precision has to match across the inputs: complex64 with float32, or
-complex128 with float64.
-
-### Explicit phases
-
-`RFIVisOp` takes the phase in radians as a full array with the same shape as
-the amplitudes. Both amplitudes and phases are differentiated.
-
-### Delay-based phases
-
-`RFIDelayVisOp` avoids expanding geometric delays over every frequency sample.
-Instead of the phase array it accepts:
-
-- delays in μs shaped `(n_ant, n_time, n_rfi, n_int_time)`; and
-- absolute frequencies in MHz shaped `(n_freq, n_int_freq)`.
-
-Since MHz × μs is cycles, the baseline phase is `2π f_MHz Δτ_μs`. The delay
-input is smaller than an expanded phase array by `n_freq × n_int_freq`; the
-frequency input contains only `n_freq × n_int_freq` elements. JVP and VJP rules
-differentiate amplitudes and delays. Frequencies are fixed coordinates and
-receive a zero cotangent.
-
-Absolute satellite delays are about `116,747 μs` and must not be converted
-directly to float32. Before calling the kernel, subtract a common delay across
-antennas for each time/source/sub-time sample while still in float64, then cast
-the centred result. This is exactly visibility-invariant because only `Δτ`
-enters a baseline.
-
-Float32 is intended for ordinary arrays with maximum antenna separations of
-about 10 km, corresponding to `|Δτ| ≲ 33.4 μs`. At 1 GHz the worst-case phase
-resolution is about `0.025 rad`. Use float64 for exceptional arrays approaching
-100 km. Around 1 GHz, float32 frequency resolution is about `61 Hz`, comfortably
-below both the expected minimum `10 kHz` spacing (`0.01 MHz`) and the more
-typical `0.2 MHz` spacing.
+complex128 with float64. Both amplitudes and phases are differentiated.
 
 ## Analytic RFI visibilities
 
@@ -126,10 +93,10 @@ vis = RFIAnalyticVisOp(n_ant, a1, a2).eval(
 - `phase`, real `(n_ant, n_rfi, n_freq, n_time)`: the phase at the channel and
   cell centre, reduced to one turn (in float64, before casting).
 - `delay_us`, real `(n_ant, n_rfi, n_time, n_path)`: the geometric delay in
-  microseconds, with the sign that makes the phase `2π f τ` as `RFIDelayVisOp`
-  has it, and its first `n_path - 1` time derivatives at the cell centre,
-  relative to the array mean (a common term cancels in every baseline; the
-  full delay's change across a cell is ~1e4 wavelengths, beyond float32).
+  microseconds, with the sign that makes the phase `2π f τ`, and its first
+  `n_path - 1` time derivatives at the cell centre, relative to the array mean
+  (a common term cancels in every baseline; the full delay's change across a
+  cell is ~1e4 wavelengths, beyond float32).
 - `w_freq`, `start_freq`: per channel, the weights that turn its stencil of
   `n_sf` neighbouring channels into its fine channels, and the first channel
   of the stencil.
