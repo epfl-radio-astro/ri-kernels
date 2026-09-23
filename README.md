@@ -104,80 +104,6 @@ resolution is about `0.025 rad`. Use float64 for exceptional arrays approaching
 below both the expected minimum `10 kHz` spacing (`0.01 MHz`) and the more
 typical `0.2 MHz` spacing.
 
-## RFI visibilities from the data grid
-
-`RFIInterpVisOp` computes the same visibility as the two operators above from
-inputs that live on the *data grid* only. The RFI signal comes in per data
-cell, the phase as its value at the cell centre plus the time derivatives of
-the path there, and the fine samples inside each cell are rebuilt inside the
-kernel from the cell's stencil of neighbouring cells and interpolation tables
-the caller supplies. Nothing of the fine grid is ever read from or written to
-memory.
-
-```python
-from ri_kernels.jax_api import RFIInterpVisOp
-
-vis = RFIInterpVisOp(n_ant, a1, a2).eval(
-    amp, phase, delay_us, w_freq, start_freq, w_time, start_time, dnu_mhz, dt, freq_mhz
-)
-```
-
-The constructor builds, per pair of 32-antenna tiles, the list of the pairs
-the baselines cover there (`tile_pair_list`); the staged GPU kernels work a
-tile pair per block from the fine samples materialised once per cell.
-Variable sampling per baseline group is a matter of calling the operator per
-group with the time tables cut to the group's samples.
-
-The operator differentiates the signal, the phase and the delay polynomial,
-and carries two kernel pairs for it: a JVP and transpose for the signal
-alone, and a full pair that takes the phase and delay tangents as well
-(`dS = i dphi S`) and returns their cotangents (per fine sample
-`-Im(S G)`, `G` the cotangent factor before the phase; summed over the
-cell's samples for the phase, weighted by `d phi / d delay[k]` for the
-delay). The JVP rule binds the signal-only pair whenever the phase and delay
-tangents are symbolic zeros, a fixed orbit with nothing learnable upstream
-of them, so such a run computes no phase derivative; a fitted trajectory
-gets the full pair without a switch.
-
-- `amp`, complex `(n_ant, n_rfi, n_freq, n_time)`: the signal on the data
-  grid. Differentiated, as are `phase` and `delay_us`.
-- `phase`, real `(n_ant, n_rfi, n_freq, n_time)`: the phase at the channel and
-  cell centre, reduced to one turn (in float64, before casting).
-- `delay_us`, real `(n_ant, n_rfi, n_time, n_path)`: the geometric delay in
-  microseconds, with the sign that makes the phase `2π f τ` as `RFIDelayVisOp`
-  has it, and its first `n_path - 1` time derivatives at the cell centre,
-  relative to the array mean (a common term cancels in every baseline; the
-  full delay's change across a cell is ~1e4 wavelengths, beyond float32).
-- `w_freq`, `start_freq` and `w_time`, `start_time`: per cell, the weights
-  that turn its stencil of `n_sf` (`n_st`) neighbouring cells into its
-  `n_int_freq` (`n_int_time`) fine samples, and the first cell of the stencil.
-  Each stencil must lie inside its axis and contain its cell.
-- `dnu_mhz`, `dt`: the fine offsets from the channel centre (MHz) and the
-  cell centre (s); `freq_mhz`: the channel centres (MHz). MHz × μs is cycles.
-
-For one cell `(f, t)`, fine sample `(u, v)`, source `r` and antenna `a`:
-
-```
-A[a]   = sum_k sum_l w_freq[f, k, u] w_time[t, l, v] amp[a, r, start_freq[f] + k, start_time[t] + l]
-dtau[a] = sum_{k >= 1} delay_us[a, r, t, k] dt[v]^k / k!
-phi[a]  = phase[a, r, f, t] + 2 pi ((freq_mhz[f] + dnu_mhz[u]) dtau[a] + dnu_mhz[u] delay_us[a, r, t, 0])
-vis[bl, f, t] = mean_{u, v} sum_r A[a1] exp(i phi[a1]) conj(A[a2] exp(i phi[a2]))
-```
-
-The weights are data. The polynomial through the stencil, the conditional mean
-of a Gaussian process prior, or any other linear interpolant is a different
-table through the same kernel. The phase, delay and tables are constants of a
-run: `eval` stops their gradients, and the JVP and transpose kernels
-differentiate the signal alone. The transpose is deterministic -- every output
-element is written by exactly one thread -- at the cost of a scratch buffer of
-`n_sf * n_st` times the signal on the GPU.
-
-These kernels are a prototype of the operator rather than a fast
-implementation: each baseline rebuilds both of its antennas' fine samples
-itself, so an antenna's samples are recomputed once per baseline it is on. A
-kernel meant to be fast would stage each antenna's samples once per cell and
-reuse them across its baselines.
-
 ## Analytic RFI visibilities
 
 `RFIAnalyticVisOp` integrates the time polynomial against phase moments, with
@@ -195,15 +121,36 @@ vis = RFIAnalyticVisOp(n_ant, a1, a2).eval(
 )
 ```
 
-The operands follow `RFIInterpVisOp`'s axis order and precision contract.
-`g_time[t,l,m]` contains monomial coefficients in `x = 2*tau/int_time`, as
-`tabascal.poly_interp.monomial_tables` produces them, including the shifted edge
-stencils. `int_time` is a positive scalar in seconds. Channel centres and
-frequency offsets are in **MHz**; divide `config.freqs` in Hz by `1e6`.
+- `amp`, complex `(n_ant, n_rfi, n_freq, n_time)`: the signal on the data
+  grid.
+- `phase`, real `(n_ant, n_rfi, n_freq, n_time)`: the phase at the channel and
+  cell centre, reduced to one turn (in float64, before casting).
+- `delay_us`, real `(n_ant, n_rfi, n_time, n_path)`: the geometric delay in
+  microseconds, with the sign that makes the phase `2π f τ` as `RFIDelayVisOp`
+  has it, and its first `n_path - 1` time derivatives at the cell centre,
+  relative to the array mean (a common term cancels in every baseline; the
+  full delay's change across a cell is ~1e4 wavelengths, beyond float32).
+- `w_freq`, `start_freq`: per channel, the weights that turn its stencil of
+  `n_sf` neighbouring channels into its fine channels, and the first channel
+  of the stencil.
+- `g_time`, `start_time`: per cell, monomial coefficients in
+  `x = 2*tau/int_time`, as `tabascal.poly_interp.monomial_tables` produces
+  them, including the shifted edge stencils, and the first cell of the
+  stencil. Each stencil must lie inside its axis and contain its cell.
+- `dnu_mhz`: the fine offsets from the channel centre; `freq_mhz`: the channel
+  centres. Both are in **MHz**; divide `config.freqs` in Hz by `1e6`. MHz × μs
+  is cycles.
+- `int_time`: a positive scalar in seconds.
+
+Every real operand shares the precision of `phase`; the stencil starts are
+int32. The constructor builds, per pair of 32-antenna tiles, the list of the
+pairs the baselines cover there (`tile_pair_list`), which the staged GPU
+kernels work through a tile pair per block; each `(a1, a2)` baseline may
+appear at most once.
 
 `amp` and `phase` are differentiated; `delay_us`, `int_time` and the tables
-are constants whose gradients `eval` stops. As for `RFIInterpVisOp`, two
-kernel pairs carry the derivatives: a JVP and transpose for the signal alone,
+are constants whose gradients `eval` stops. Two kernel pairs carry the
+derivatives: a JVP and transpose for the signal alone,
 and a full pair that takes the phase tangent as well and returns its
 cotangent. The phase enters every cell's weights as the one factor
 `exp(i (phase[a1] - phase[a2]))`, so the phase tangent turns the pair's
@@ -240,7 +187,7 @@ six-term, three-cubic-term path has unrolled moment orders so its CUDA
 recurrence can stay in registers. Wider configurations use a bounded general
 implementation.
 
-GPU scratch uses `RI_KERNELS_INTERP_SCRATCH_MB` (256 MiB by default), with time
+GPU scratch uses `RI_KERNELS_ANALYTIC_SCRATCH_MB` (256 MiB by default), with time
 chunks and, when necessary, frequency chunks. The transpose reduces coefficient
 cotangents within each tile in shared memory, writes separate partials for
 partner tiles, and gathers through the interpolation stencils. Shared-memory
@@ -249,7 +196,7 @@ atomics mean the last bits of the GPU transpose can vary between runs.
 After building on the GPU host, run:
 
 ```bash
-python -m pytest tests/test_rfi_analytic_vis_op.py tests/test_rfi_interp_vis_op.py
+python -m pytest tests/test_rfi_analytic_vis_op.py
 python tests/benchmark_rfi_analytic_vis_op.py --antennas 256 512 --iterations 100
 ```
 
@@ -258,8 +205,7 @@ derivatives against a frozen float64 JAX reference. They cover zero winding, bot
 branches, the Fresnel boundary, cubic translation, wider coefficient counts,
 sparse/reversed/autocorrelation baselines, partial antenna tiles and forced
 scratch splitting. The benchmark reports synchronised forward, JVP and VJP
-times, signal-only and with the phase, after compilation and warmup, alongside
-6571-sample quadrature. It uses
+times, signal-only and with the phase, after compilation and warmup. It uses
 synthetic inputs; repeat the scientific accuracy check and the 100-iteration
 optimisation with the production SKA-Low data. Inspect ptxas register/spill
 reports and Nsight local-memory traffic for the default specialisation before

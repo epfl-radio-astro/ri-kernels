@@ -111,10 +111,10 @@ void analytic_cpu_transpose(std::int64_t begin, std::int64_t end,
 // frame no longer exists when an asynchronous pool task runs.
 template <int Mode, typename T, ffi::DataType A, ffi::DataType R>
 ffi::Future analytic_cpu_dispatch(ffi::ThreadPool pool,
-    interp_index_t a1, interp_index_t a2, ffi::BufferR2<ffi::S32> pair,
+    analytic_index_t a1, analytic_index_t a2, ffi::BufferR2<ffi::S32> pair,
     ffi::BufferR2<ffi::S32> tiles, ffi::Buffer<A, 4> amp, ffi::Buffer<A, 4> dot,
     ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> phase_dot, ffi::Buffer<R, 4> delay,
-    ffi::Buffer<R, 3> wf, interp_index_t sf, ffi::Buffer<R, 3> gt, interp_index_t st,
+    ffi::Buffer<R, 3> wf, analytic_index_t sf, ffi::Buffer<R, 3> gt, analytic_index_t st,
     ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration, ffi::Buffer<R, 1> freq,
     ffi::Buffer<A, 3> cot, ffi::Result<ffi::Buffer<A, (Mode == 2 || Mode == 4) ? 4 : 3>> out,
     ffi::Result<ffi::Buffer<R, 4>> *phase_bar,
@@ -129,10 +129,10 @@ ffi::Future analytic_cpu_dispatch(ffi::ThreadPool pool,
   const auto v = analytic_views<T>(a1, a2, pair, tiles, amp, dot, phase, phase_dot, delay,
                                   wf, sf, gt, st, dnu, duration, freq, options);
   if constexpr (Transpose) {
-    if (!interp_same_shape(amp, *out) || cot.dimensions()[0] != a1.element_count() ||
+    if (!analytic_same_shape(amp, *out) || cot.dimensions()[0] != a1.element_count() ||
         cot.dimensions()[1] != a[2] || cot.dimensions()[2] != a[3])
       return completed_future(ffi::Error::InvalidArgument("Invalid analytic transpose output or cotangent shape"));
-    if (Phase && !interp_same_shape(phase, **phase_bar))
+    if (Phase && !analytic_same_shape(phase, **phase_bar))
       return completed_future(ffi::Error::InvalidArgument("Expected the phase cotangent to match the phase"));
     Tensor4D<Cplx<T> *> output(reinterpret_cast<Cplx<T> *>(out->typed_data()), a[0], a[1], a[2], a[3]);
     Tensor4D<T *> pb(Phase ? (*phase_bar)->typed_data() : nullptr, a[0], a[1], a[2], a[3]);

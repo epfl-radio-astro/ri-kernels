@@ -3,10 +3,10 @@
 The signal and the phase are differentiated. The phase enters every cell's
 weights as the one factor ``exp(i (phase[a1] - phase[a2]))``, so its tangent
 turns the pair's product by ``i`` and its cotangent is ``-Im(g V)`` on ``a1``
-and ``+Im(g V)`` on ``a2``, summed over the sources and fine channels. As in
-:mod:`rfi_interp_vis_op`, two kernel pairs carry the derivatives: the signal
-alone, and the signal with the phase; the JVP rule binds the first whenever
-the phase tangent is a symbolic zero. The delay, the integration interval and
+and ``+Im(g V)`` on ``a2``, summed over the sources and fine channels. Two
+kernel pairs carry the derivatives: the signal alone, and the signal with the
+phase; the JVP rule binds the first whenever the phase tangent is a symbolic
+zero. The delay, the integration interval and
 the tables are constants: :meth:`RFIAnalyticVisOp.eval` stops their gradients.
 """
 
@@ -19,8 +19,6 @@ from jax.core import ShapedArray
 from jax.extend import core
 from jax.interpreters import ad, mlir, xla
 
-from .rfi_interp_vis_op import RFIInterpVisOp, TILE
-
 from .rfi_vis_op import (
     _TAB_LIB,
     _TAB_LIB_GPU,
@@ -28,13 +26,52 @@ from .rfi_vis_op import (
     _check_tab_lib,
     _check_tab_lib_gpu,
     _dtype_suffix,
+    prepare_indices,
 )
 
 
-class RFIAnalyticVisOp(RFIInterpVisOp):
+#: Antennas per tile in the staged GPU kernels; the tile-pair list is built for
+#: it. The kernels hold the same value as ``kAnalyticTile`` in
+#: src/rfi_analytic_base.hpp and validate every tile-pair list against it, so
+#: the two have to be changed together.
+TILE = 32
+
+
+def tile_pair_list(n_ant, a1, a2):
+    """The antenna pairs the baseline list covers, per unordered tile pair.
+
+    The staged GPU kernels give a block one pair of antenna tiles and its
+    threads the pairs within it. Row ``tp`` of the result, for the unordered
+    tile pair ``(I, J)`` with ``I <= J`` in the order ``(0,0), (0,1), ...,
+    (0,n-1), (1,1), ...``, lists the pairs the baseline list holds in that
+    tile pair as ``i_local * TILE + j_local`` (the pair's (I, J) ordering;
+    within a tile paired with itself ``i_local <= j_local``), each once
+    whatever orderings the list holds, along the tile's diagonals
+    ``(j_local - i_local) % TILE``, padded with -1. Shape
+    ``(n_tile_pairs, TILE * TILE)`` int32.
+    """
+    n_tiles = (n_ant + TILE - 1) // TILE
+    n_tile_pairs = n_tiles * (n_tiles + 1) // 2
+    rows = [set() for _ in range(n_tile_pairs)]
+    for b in range(len(a1)):
+        p, q = int(a1[b]), int(a2[b])
+        i, j = (p, q) if p // TILE <= q // TILE else (q, p)
+        I, J = i // TILE, j // TILE
+        il, jl = i % TILE, j % TILE
+        if I == J and il > jl:
+            il, jl = jl, il
+        tp = I * n_tiles - I * (I - 1) // 2 + (J - I)
+        rows[tp].add(((jl - il) % TILE, il, jl))
+    out = np.full((n_tile_pairs, TILE * TILE), -1, dtype=np.int32)
+    for tp, row in enumerate(rows):
+        row = sorted(row)
+        out[tp, : len(row)] = [il * TILE + jl for _, il, jl in row]
+    return out
+
+
+class RFIAnalyticVisOp:
     """RFI visibility from amplitude coefficients and analytic phase moments.
 
-    The baseline staging and input axis order are those of RFIInterpVisOp.
     amp and phase are differentiated; the delay, integration interval and
     tables are constants. The recurrence has no time sample axis or Nyquist
     floor.
@@ -47,7 +84,34 @@ class RFIAnalyticVisOp(RFIInterpVisOp):
                 n_ant < 1 or np.any(a1 < 0) or np.any(a2 < 0) or
                 np.any(a1 >= n_ant) or np.any(a2 >= n_ant)):
             raise ValueError("Expected matching antenna-index vectors within [0, n_ant)")
-        super().__init__(n_ant, jnp.asarray(a1, jnp.int32), jnp.asarray(a2, jnp.int32))
+        # The staged GPU kernels form every pair of two antenna tiles once and
+        # write it to whichever orderings the list holds, so a pair must not
+        # appear twice: the second copy would never be written.
+        if len(np.unique(np.stack([a1, a2], axis=1), axis=0)) != len(a1):
+            raise ValueError("RFIAnalyticVisOp needs each (a1, a2) baseline at most once")
+        self.a1 = jnp.asarray(a1, jnp.int32)
+        self.a2 = jnp.asarray(a2, jnp.int32)
+        (
+            self.a1_sorter,
+            self.a1_start,
+            self.a2_sorter,
+            self.a2_start,
+        ) = prepare_indices(n_ant, self.a1, self.a2)
+        # The baseline index of each antenna pair, -1 where the list has none.
+        self.pair_index = (
+            jnp.full((n_ant, n_ant), -1, dtype=jnp.int32)
+            .at[self.a1, self.a2]
+            .set(jnp.arange(len(a1), dtype=jnp.int32))
+        )
+        self.tile_pairs = jnp.asarray(tile_pair_list(n_ant, a1, a2))
+
+    @property
+    def indices(self):
+        """The index arrays every primitive takes before the data arrays."""
+        return (
+            self.a1, self.a1_sorter, self.a1_start,
+            self.a2, self.a2_sorter, self.a2_start, self.pair_index, self.tile_pairs,
+        )
 
     def eval(self, amp, phase, delay_us, w_freq, start_freq, g_time,
              start_time, dnu_mhz, int_time, freq_mhz, *, segments=2, terms=6,
@@ -61,9 +125,10 @@ class RFIAnalyticVisOp(RFIInterpVisOp):
         are constants. freq_mhz and dnu_mhz are in MHz, not config.freqs' Hz.
 
         g_time[t,l,m] holds monomial coefficients in x = 2*tau/int_time,
-        including shifted edge stencils. w_freq and the stencil starts are
-        identical to RFIInterpVisOp's tables. int_time is a positive scalar
-        in seconds, with the same real dtype as phase and all other tables.
+        including shifted edge stencils. w_freq[f,k,u] holds the interpolation
+        weights across each channel at the fine offsets dnu_mhz[u]. int_time
+        is a positive scalar in seconds, with the same real dtype as phase and
+        all other tables.
         Each stencil must lie in its axis and contain its own cell.
 
         segments splits [-1,1] equally; terms controls the curvature series,

@@ -16,7 +16,7 @@ template <typename T> struct AnalyticViews {
   AnalyticOptions options;
 };
 
-// Coefficients have the interpolation sample buffer's antenna-fast layout.
+// Coefficients are laid out antenna-fast.
 // There is one frequency-quadrature axis, but no time-quadrature axis.
 TAB_H_D inline std::int64_t analytic_index(std::int64_t cell, std::int64_t r,
     std::int64_t u, std::int64_t m, std::int64_t ant, std::int64_t nr,
@@ -73,10 +73,23 @@ template <typename T>
 TAB_H_D inline Cplx<T> analytic_coefficient(AnalyticViews<T> v,
     Tensor4D<const Cplx<T> *> amp, std::int64_t ant, std::int64_t r,
     std::int64_t f, std::int64_t t, std::int64_t u, std::int64_t m) {
-  return interp_amp(amp, v.wf.ptr + f * v.wf.shape[1] * v.wf.shape[2],
-      v.gt.ptr + t * v.gt.shape[1] * v.gt.shape[2], std::int64_t(v.sf(f)),
-      std::int64_t(v.st(t)), v.wf.shape[1], v.gt.shape[1], v.wf.shape[2],
-      v.gt.shape[2], ant, r, u, m);
+  // The stencil contraction: the frequency weights at fine channel u times
+  // coefficient m of the time table, over the cell's stencil of data cells.
+  const auto n_sf = v.wf.shape[1], n_st = v.gt.shape[1];
+  const auto n_u = v.wf.shape[2], n_m = v.gt.shape[2];
+  const T *wf = v.wf.ptr + f * n_sf * n_u, *gt = v.gt.ptr + t * n_st * n_m;
+  const std::int64_t sf = v.sf(f), st = v.st(t);
+  Cplx<T> a{0, 0};
+  for (std::int64_t k = 0; k < n_sf; ++k) {
+    const T wk = wf[k * n_u + u];
+    for (std::int64_t l = 0; l < n_st; ++l) {
+      const T w = wk * gt[l * n_m + m];
+      const Cplx<T> c = amp(ant, r, sf + k, st + l);
+      a.re += w * c.re;
+      a.im += w * c.im;
+    }
+  }
+  return a;
 }
 
 // JAX's complex transpose pairs without conjugating the cotangent. For
@@ -115,20 +128,20 @@ RI_ANALYTIC_INLINE Cplx<T> analytic_contract(const Cplx<T> *p, const Cplx<T> *q,
 }
 
 template <ffi::DataType A, ffi::DataType R>
-ffi::Error analytic_validate(interp_index_t a1, interp_index_t a2,
+ffi::Error analytic_validate(analytic_index_t a1, analytic_index_t a2,
     ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tiles,
     ffi::Buffer<A, 4> amp, ffi::Buffer<A, 4> dot,
     ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> phase_dot, ffi::Buffer<R, 4> delay,
-    ffi::Buffer<R, 3> wf, interp_index_t sf, ffi::Buffer<R, 3> gt,
-    interp_index_t st, ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration,
+    ffi::Buffer<R, 3> wf, analytic_index_t sf, ffi::Buffer<R, 3> gt,
+    analytic_index_t st, ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration,
     ffi::Buffer<R, 1> freq, AnalyticOptions opt, bool cpu) {
   const auto a = amp.dimensions(), p = phase.dimensions(), d = delay.dimensions();
   const auto w = wf.dimensions(), g = gt.dimensions();
   const auto na = a[0], nr = a[1], nf = a[2], nt = a[3], nb = a1.dimensions()[0];
-  const auto ntiles = interp_tile_count(na);
+  const auto ntiles = analytic_tile_count(na);
   if (na < 1 || nr < 1 || nf < 1 || nt < 1 || a2.dimensions()[0] != nb ||
-      !interp_same_shape(amp, dot) || !interp_same_shape(amp, phase) ||
-      !interp_same_shape(phase, phase_dot) ||
+      !analytic_same_shape(amp, dot) || !analytic_same_shape(amp, phase) ||
+      !analytic_same_shape(phase, phase_dot) ||
       d[0] != na || d[1] != nr || d[2] != nt || d[3] < 1 ||
       w[0] != nf || w[1] < 1 || w[1] > nf || w[2] < 1 ||
       g[0] != nt || g[1] < 1 || g[1] > nt || g[2] < 1 ||
@@ -136,7 +149,7 @@ ffi::Error analytic_validate(interp_index_t a1, interp_index_t a2,
       dnu.dimensions()[0] != w[2] || freq.dimensions()[0] != nf ||
       pair.dimensions()[0] != na || pair.dimensions()[1] != na ||
       tiles.dimensions()[0] != ntiles * (ntiles + 1) / 2 ||
-      tiles.dimensions()[1] != kInterpTilePairs)
+      tiles.dimensions()[1] != kAnalyticTilePairs)
     return ffi::Error::InvalidArgument("Incompatible analytic signal, tangent, table, or baseline shapes");
   if (!analytic_configuration_fits(g[2], opt))
     return ffi::Error::InvalidArgument(
@@ -163,17 +176,17 @@ ffi::Error analytic_validate(interp_index_t a1, interp_index_t a2,
 }
 
 template <typename T, ffi::DataType A, ffi::DataType R>
-AnalyticViews<T> analytic_views(interp_index_t a1, interp_index_t a2,
+AnalyticViews<T> analytic_views(analytic_index_t a1, analytic_index_t a2,
     ffi::BufferR2<ffi::S32> pair, ffi::BufferR2<ffi::S32> tiles,
     ffi::Buffer<A, 4> amp, ffi::Buffer<A, 4> dot,
     ffi::Buffer<R, 4> phase, ffi::Buffer<R, 4> phase_dot, ffi::Buffer<R, 4> delay,
-    ffi::Buffer<R, 3> wf, interp_index_t sf, ffi::Buffer<R, 3> gt,
-    interp_index_t st, ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration,
+    ffi::Buffer<R, 3> wf, analytic_index_t sf, ffi::Buffer<R, 3> gt,
+    analytic_index_t st, ffi::Buffer<R, 1> dnu, ffi::Buffer<R, 0> duration,
     ffi::Buffer<R, 1> freq, AnalyticOptions opt) {
   const auto a = amp.dimensions(), d = delay.dimensions();
   return {
     {a1.typed_data(), a1.dimensions()[0]}, {a2.typed_data(), a2.dimensions()[0]},
-    {pair.typed_data(), a[0], a[0]}, {tiles.typed_data(), tiles.dimensions()[0], kInterpTilePairs},
+    {pair.typed_data(), a[0], a[0]}, {tiles.typed_data(), tiles.dimensions()[0], kAnalyticTilePairs},
     {reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1], a[2], a[3]},
     {reinterpret_cast<const Cplx<T> *>(dot.typed_data()), a[0], a[1], a[2], a[3]},
     {phase.typed_data(), a[0], a[1], a[2], a[3]},

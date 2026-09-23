@@ -1,6 +1,6 @@
 #pragma once
 
-#include "rfi_interp_common.hpp"
+#include "rfi_analytic_base.hpp"
 #include "rfi_analytic_limits.hpp"
 
 namespace ri_kernels {

@@ -440,7 +440,7 @@ def test_direct_bind_derivatives_and_shapes(device):
 
 def test_invalid_cpu_values(device):
     if device.platform != "cpu":
-        pytest.skip("GPU stencil values are caller-validated, as for RFIInterpVisOp")
+        pytest.skip("GPU stencil values are caller-validated")
     args = make_inputs(jnp.float64, jnp.complex128)
     a1, a2 = make_baselines(5)
     op = RFIAnalyticVisOp(5, a1, a2)
@@ -546,7 +546,7 @@ with jax.default_device(device):
     results = []
     for budget in (1, 256):
         dest = tmp_path / f"scratch-{budget}.npz"
-        env = dict(os.environ, RI_KERNELS_INTERP_SCRATCH_MB=str(budget),
+        env = dict(os.environ, RI_KERNELS_ANALYTIC_SCRATCH_MB=str(budget),
                    PYTHONPATH=os.pathsep.join([str(root), str(root / "tests"), os.environ.get("PYTHONPATH", "")]))
         run = subprocess.run([sys.executable, "-c", code, real_name, str(dest)],
                              env=env, capture_output=True, text=True, timeout=240)
