@@ -99,8 +99,7 @@ set(RI_KERNELS_CPU_SOURCES
   ./src/rfi_delay_kernel.cpp
   ./src/rfi_delay_jvp_kernel.cpp
   ./src/rfi_delay_transpose_kernel.cpp
-  ./src/rfi_interp_kernel.cpp
-  ./src/rfi_interp_transpose_kernel.cpp
+  ./src/rfi_analytic_kernel.cpp
 )
 
 set(RI_KERNELS_GPU_SOURCES
@@ -110,8 +109,7 @@ set(RI_KERNELS_GPU_SOURCES
   ./src/rfi_delay_kernel_gpu.cu
   ./src/rfi_delay_jvp_kernel_gpu.cu
   ./src/rfi_delay_transpose_kernel_gpu.cu
-  ./src/rfi_interp_kernel_gpu.cu
-  ./src/rfi_interp_transpose_kernel_gpu.cu
+  ./src/rfi_analytic_kernel_gpu.cu
   ./src/util_gpu.cu
 )
 
