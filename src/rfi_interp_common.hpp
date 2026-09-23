@@ -79,6 +79,28 @@ using interp_real1_f32_t = ffi::Buffer<ffi::F32, 1>;
 using interp_real1_f64_t = ffi::Buffer<ffi::F64, 1>;
 using interp_index_t = ffi::BufferR1<ffi::S32>;
 
+// Antennas per tile in the staged GPU kernels: the interpolation forward and
+// transpose, and the analytic operator, all cut the antennas the same way and
+// all read the same tile-pair list. A tile pair is a fixed kInterpTilePairs
+// entries wide because that is how the caller builds it -- TILE in
+// rfi_interp_vis_op.py, which the analytic op imports rather than redefining.
+// The two definitions have to move together; every handler that takes a
+// tile-pair list validates its width against this one.
+//
+// The value is the warp width on NVIDIA, which is what makes a tile diagonal
+// bank-conflict-free, but nothing here depends on the wave size: the kernels
+// synchronise through __syncthreads() and shared-memory atomics only, so a
+// wave64 AMD part runs the same layout correctly.
+constexpr int kInterpTile = 32;
+constexpr int kInterpTilePairs = kInterpTile * kInterpTile;
+
+// Tiles needed to cover n_ant antennas. The kernels index partial buffers by
+// it, so it has to be callable on the device as well as in the handlers'
+// shape checks.
+TAB_H_D constexpr std::int64_t interp_tile_count(std::int64_t n_ant) {
+  return (n_ant + kInterpTile - 1) / kInterpTile;
+}
+
 // A complex number with the layout of std::complex<T> and of the CUDA/HIP
 // complex types, so the FFI buffers of any of them can be viewed as this.
 template <typename T> struct Cplx {

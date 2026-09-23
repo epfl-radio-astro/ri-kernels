@@ -2,7 +2,7 @@
 //
 // The fine samples of a chunk of time cells are materialised first, once per
 // cell and antenna (rfi_interp_samples_gpu.cuh). The antennas are cut into
-// tiles of kTile, and one block works one unordered pair of tiles (I, J) on
+// tiles of kInterpTile, and one block works one unordered pair of tiles (I, J) on
 // one cell (f, t): for each source and each chunk of the cell's fine samples
 // it loads the samples of the two tiles, contiguous runs, into shared memory,
 // then forms the baseline products of the tile pair from there.
@@ -39,9 +39,10 @@ namespace ffi = xla::ffi;
 namespace ri_kernels {
 namespace gpu {
 
-constexpr int kTile = 32;      // antennas per tile
+// kInterpTile, the antennas per tile, comes from rfi_interp_common.hpp: the
+// transpose and the analytic operator cut the antennas the same way.
 constexpr int kBlock = 256;    // threads per block
-constexpr int kPairs = kTile * kTile / kBlock;  // list entries per thread
+constexpr int kPairs = kInterpTilePairs / kBlock;  // list entries per thread
 
 template <typename T, typename INT_T> struct InterpViews {
   Tensor1D<const int *, INT_T> a1, a2;
@@ -112,11 +113,11 @@ __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
   const INT_T n_s = n_int_f * n_int_t;
   const INT_T n_cells = (SPLIT ? cells.n_fc : v.amp.shape[2]) * n_tc;
 
-  // Layout: the staged tiles, sample-major (tile[s * kTile + a]).
+  // Layout: the staged tiles, sample-major (tile[s * kInterpTile + a]).
   Cplx<T> *tile_I = reinterpret_cast<Cplx<T> *>(dynamic_shared);
-  Cplx<T> *tile_J = tile_I + chunk * kTile;
-  Cplx<T> *dtile_I = tile_J + chunk * kTile;
-  Cplx<T> *dtile_J = dtile_I + chunk * kTile;
+  Cplx<T> *tile_J = tile_I + chunk * kInterpTile;
+  Cplx<T> *dtile_I = tile_J + chunk * kInterpTile;
+  Cplx<T> *dtile_J = dtile_I + chunk * kInterpTile;
 
   const int tid = threadIdx.x;
 
@@ -133,8 +134,8 @@ __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
     for (int k = 0; k < kPairs; ++k) {
       const INT_T e = v.tile_pairs(tp, tid * kPairs + k);
       has[k] = e >= 0;
-      pi[k] = has[k] ? e / kTile : 0;
-      pj[k] = has[k] ? e % kTile : 0;
+      pi[k] = has[k] ? e / kInterpTile : 0;
+      pj[k] = has[k] ? e % kInterpTile : 0;
       any = any || has[k];
     }
     const T scale = T(1) / T(n_s);
@@ -155,15 +156,15 @@ __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
           __syncthreads();  // the previous chunk's products are done
           // Stage: tile I, and tile J when it is a different tile, from the
           // materialised samples: a tile at one sample is one contiguous run.
-          for (INT_T idx = tid; idx < cs * kTile; idx += kBlock) {
-            const INT_T s_local = idx / kTile, a_local = idx % kTile;
+          for (INT_T idx = tid; idx < cs * kInterpTile; idx += kBlock) {
+            const INT_T s_local = idx / kInterpTile, a_local = idx % kInterpTile;
             const INT_T s = s0 + s_local;
-            const INT_T a = I * kTile + a_local;
+            const INT_T a = I * kInterpTile + a_local;
             const std::int64_t o = sample_index(f_local, t_local, r, s, a, n_tc, n_rfi, n_s, n_ant);
             tile_I[idx] = a < n_ant ? S[o] : Cplx<T>{0, 0};
             if constexpr (JVP) dtile_I[idx] = a < n_ant ? dS[o] : Cplx<T>{0, 0};
             if (!same) {
-              const INT_T a2 = J * kTile + a_local;
+              const INT_T a2 = J * kInterpTile + a_local;
               const std::int64_t o2 = sample_index(f_local, t_local, r, s, a2, n_tc, n_rfi, n_s, n_ant);
               tile_J[idx] = a2 < n_ant ? S[o2] : Cplx<T>{0, 0};
               if constexpr (JVP) dtile_J[idx] = a2 < n_ant ? dS[o2] : Cplx<T>{0, 0};
@@ -178,11 +179,11 @@ __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
           // antenna 0's samples and is never written).
           for (INT_T s_local = 0; s_local < cs; ++s_local) {
             for (int k = 0; k < kPairs; ++k) {
-              const Cplx<T> a = tile_I[s_local * kTile + pi[k]];
-              const Cplx<T> b = TJ[s_local * kTile + pj[k]];
+              const Cplx<T> a = tile_I[s_local * kInterpTile + pi[k]];
+              const Cplx<T> b = TJ[s_local * kInterpTile + pj[k]];
               if constexpr (JVP) {
-                const Cplx<T> da = dtile_I[s_local * kTile + pi[k]];
-                const Cplx<T> db = DJ[s_local * kTile + pj[k]];
+                const Cplx<T> da = dtile_I[s_local * kInterpTile + pi[k]];
+                const Cplx<T> db = DJ[s_local * kInterpTile + pj[k]];
                 acc[k] = cadd(acc[k], cadd(cmul(da, cconj(b)), cmul(a, cconj(db))));
               } else {
                 acc[k] = cadd(acc[k], cmul(a, cconj(b)));
@@ -195,7 +196,7 @@ __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
       // Write each pair to the orderings the baseline list holds.
       for (int k = 0; k < kPairs; ++k) {
         if (!has[k]) continue;
-        const INT_T a1 = I * kTile + pi[k], a2 = J * kTile + pj[k];
+        const INT_T a1 = I * kInterpTile + pi[k], a2 = J * kInterpTile + pj[k];
         const INT_T bl = v.pair(a1, a2);
         if (bl >= 0) out(bl, f, t) = cscale(scale, acc[k]);
         if (a1 != a2) {
@@ -213,7 +214,7 @@ __global__ void __launch_bounds__(kBlock) rfi_interp_staged_kernel(
 // samples does not force a chunk larger than shared memory can hold.
 template <typename T>
 std::int64_t staged_samples(std::int64_t n_s, int n_tiles_shared, std::size_t budget) {
-  const std::size_t per_sample = sizeof(Cplx<T>) * kTile * n_tiles_shared;
+  const std::size_t per_sample = sizeof(Cplx<T>) * kInterpTile * n_tiles_shared;
   std::int64_t chunk = std::int64_t(budget / per_sample);
   if (chunk > 32) chunk = 32;
   if (chunk > n_s) chunk = n_s;
@@ -252,7 +253,7 @@ ffi::Error calc_rfi_interp_gpu_dispatch(
   if (!interp_checked_product({n_s, plan.n_tc}, sample_work) ||
       sample_work > std::numeric_limits<INT_T>::max())
     return ffi::Error::InvalidArgument("Interpolation sample count exceeds the kernel index range");
-  const auto n_tiles = interp_ceil_div(n_ant, kTile);
+  const auto n_tiles = interp_tile_count(n_ant);
   std::int64_t tile_product;
   if (!interp_checked_product({n_tiles, n_tiles + 1}, tile_product) ||
       tile_product / 2 > std::numeric_limits<INT_T>::max())
@@ -265,7 +266,7 @@ ffi::Error calc_rfi_interp_gpu_dispatch(
   const std::size_t shared_limit = max_dynamic_shared_bytes();
   const std::size_t stage_budget = std::min<std::size_t>(shared_limit, 32 * 1024);
   const auto chunk = staged_samples<T>(n_s, n_tiles_shared, stage_budget);
-  const std::size_t shared = sizeof(Cplx<T>) * kTile * chunk * n_tiles_shared;
+  const std::size_t shared = sizeof(Cplx<T>) * kInterpTile * chunk * n_tiles_shared;
   if (shared > shared_limit)
     return ffi::Error::Internal(
         "One sample of an antenna tile needs " + std::to_string(shared) +
@@ -354,10 +355,11 @@ ffi::Error calc_rfi_interp_gpu_impl_tmpl(
         "Incompatible signal, phase, path, table, or baseline shapes");
   if (pair.dimensions()[0] != amp.dimensions()[0] || pair.dimensions()[1] != amp.dimensions()[0])
     return ffi::Error::InvalidArgument("Expected an (n_ant, n_ant) pair table");
-  const std::int64_t n_tiles = (amp.dimensions()[0] + kTile - 1) / kTile;
+  const std::int64_t n_tiles = interp_tile_count(amp.dimensions()[0]);
   if (tile_pairs.dimensions()[0] != n_tiles * (n_tiles + 1) / 2 ||
-      tile_pairs.dimensions()[1] != kTile * kTile)
-    return ffi::Error::InvalidArgument("Expected a (n_tile_pairs, 1024) tile-pair list");
+      tile_pairs.dimensions()[1] != kInterpTilePairs)
+    return ffi::Error::InvalidArgument(
+        "Expected a (n_tile_pairs, " + std::to_string(kInterpTilePairs) + ") tile-pair list");
   if (JVP && !interp_same_shape(amp_dot, amp))
     return ffi::Error::InvalidArgument("Expected the signal tangent to match the signal");
   if (FULL && !(interp_same_shape(phase_dot, phase) && interp_same_shape(delay_dot, delay)))

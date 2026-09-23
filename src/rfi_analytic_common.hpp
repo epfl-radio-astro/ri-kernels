@@ -125,7 +125,7 @@ ffi::Error analytic_validate(interp_index_t a1, interp_index_t a2,
   const auto a = amp.dimensions(), p = phase.dimensions(), d = delay.dimensions();
   const auto w = wf.dimensions(), g = gt.dimensions();
   const auto na = a[0], nr = a[1], nf = a[2], nt = a[3], nb = a1.dimensions()[0];
-  const auto ntiles = (na + 31) / 32;
+  const auto ntiles = interp_tile_count(na);
   if (na < 1 || nr < 1 || nf < 1 || nt < 1 || a2.dimensions()[0] != nb ||
       !interp_same_shape(amp, dot) || !interp_same_shape(amp, phase) ||
       !interp_same_shape(phase, phase_dot) ||
@@ -135,7 +135,8 @@ ffi::Error analytic_validate(interp_index_t a1, interp_index_t a2,
       sf.dimensions()[0] != nf || st.dimensions()[0] != nt ||
       dnu.dimensions()[0] != w[2] || freq.dimensions()[0] != nf ||
       pair.dimensions()[0] != na || pair.dimensions()[1] != na ||
-      tiles.dimensions()[0] != ntiles * (ntiles + 1) / 2 || tiles.dimensions()[1] != 1024)
+      tiles.dimensions()[0] != ntiles * (ntiles + 1) / 2 ||
+      tiles.dimensions()[1] != kInterpTilePairs)
     return ffi::Error::InvalidArgument("Incompatible analytic signal, tangent, table, or baseline shapes");
   if (!analytic_configuration_fits(g[2], opt))
     return ffi::Error::InvalidArgument(
@@ -172,7 +173,7 @@ AnalyticViews<T> analytic_views(interp_index_t a1, interp_index_t a2,
   const auto a = amp.dimensions(), d = delay.dimensions();
   return {
     {a1.typed_data(), a1.dimensions()[0]}, {a2.typed_data(), a2.dimensions()[0]},
-    {pair.typed_data(), a[0], a[0]}, {tiles.typed_data(), tiles.dimensions()[0], 1024},
+    {pair.typed_data(), a[0], a[0]}, {tiles.typed_data(), tiles.dimensions()[0], kInterpTilePairs},
     {reinterpret_cast<const Cplx<T> *>(amp.typed_data()), a[0], a[1], a[2], a[3]},
     {reinterpret_cast<const Cplx<T> *>(dot.typed_data()), a[0], a[1], a[2], a[3]},
     {phase.typed_data(), a[0], a[1], a[2], a[3]},

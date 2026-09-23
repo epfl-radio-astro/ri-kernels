@@ -10,7 +10,7 @@ namespace ri_kernels {
 template <typename T>
 void check_cells(int count, AnalyticOptions options) {
   const std::int64_t na = 2, nr = 1, nf = 1, nt = count, nu = 2, nb = 3;
-  std::vector<int> a1{0, 0, 1}, a2{0, 1, 1}, pair{0, 1, -1, 2}, tiles(1024, -1);
+  std::vector<int> a1{0, 0, 1}, a2{0, 1, 1}, pair{0, 1, -1, 2}, tiles(kInterpTilePairs, -1);
   std::vector<int> sf(nf, 0), st(nt, 0);
   std::vector<Cplx<T>> amp(na * nr * nf * nt, {T(1), T(.2)});
   std::vector<Cplx<T>> dot(amp.size(), {T(.3), T(.7)}), bar(amp.size());
@@ -29,7 +29,7 @@ void check_cells(int count, AnalyticOptions options) {
     delay[t * 4 + 3] = T(.000003);
   }
   AnalyticViews<T> v{
-      {a1.data(), nb}, {a2.data(), nb}, {pair.data(), na, na}, {tiles.data(), 1, 1024},
+      {a1.data(), nb}, {a2.data(), nb}, {pair.data(), na, na}, {tiles.data(), 1, kInterpTilePairs},
       {amp.data(), na, nr, nf, nt}, {dot.data(), na, nr, nf, nt},
       {phase.data(), na, nr, nf, nt}, {phase_dot.data(), na, nr, nf, nt},
       {delay.data(), na, nr, nt, 4},

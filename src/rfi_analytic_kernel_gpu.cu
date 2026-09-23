@@ -19,7 +19,9 @@
 namespace ri_kernels {
 namespace gpu {
 
-constexpr int kAnalyticTile = 32;
+// kInterpTile, the antennas per tile, comes from rfi_interp_common.hpp: this
+// operator reads the tile-pair list the interpolation op builds, so it cuts
+// the antennas the same way.
 constexpr int kAnalyticBlock = 128;
 // The delay orders the closed form carries: tau and its first three
 // derivatives, whatever longer path the caller hands in.
@@ -93,19 +95,19 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
     InterpCellChunk<std::int64_t> chunk) {
   constexpr bool JVP = Mode == 1 || Mode == 3, Transpose = Mode == 2 || Mode == 4;
   constexpr bool Phase = Mode >= 3;
-  constexpr int pairs_per_thread = 1024 / kAnalyticBlock;
+  constexpr int pairs_per_thread = kInterpTilePairs / kAnalyticBlock;
   extern __shared__ __align__(16) unsigned char shared[];
   const auto nm = v.gt.shape[2], na = v.amp.shape[0], nr = v.amp.shape[1], nu = v.wf.shape[2];
-  const auto ntiles = (na + 31) / 32;
-  Cplx<T> *si = reinterpret_cast<Cplx<T> *>(shared), *sj = si + 32 * nm;
-  Cplx<T> *xi = Mode ? sj + 32 * nm : si;
-  Cplx<T> *xj = Mode ? xi + 32 * nm : sj;
+  const auto ntiles = interp_tile_count(na);
+  Cplx<T> *si = reinterpret_cast<Cplx<T> *>(shared), *sj = si + kInterpTile * nm;
+  Cplx<T> *xi = Mode ? sj + kInterpTile * nm : si;
+  Cplx<T> *xj = Mode ? xi + kInterpTile * nm : sj;
   // The two tiles' own delay orders and centre phases, order-major over the
   // pair's antennas so that a warp walking a tile diagonal reads one bank
-  // each. Tile I occupies the first kAnalyticTile slots of a row, tile J the
+  // each. Tile I occupies the first kInterpTile slots of a row, tile J the
   // rest; a tile paired with itself simply stages its antennas twice.
-  constexpr int span = 2 * kAnalyticTile;
-  T *sd = reinterpret_cast<T *>(Mode ? xj + 32 * nm : sj + 32 * nm);
+  constexpr int span = 2 * kInterpTile;
+  T *sd = reinterpret_cast<T *>(Mode ? xj + kInterpTile * nm : sj + kInterpTile * nm);
   T *sp = sd + kAnalyticOrders * span;
   // The phase tangent (full JVP) or the phase cotangent sums (full transpose)
   // of the two tiles' antennas, laid out like sp.
@@ -123,8 +125,8 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
         // the gather is by antenna, so each warp would otherwise pull a
         // separate sector per lane, and that cost more than the closed form.
         for (int z = threadIdx.x; z < span; z += blockDim.x) {
-          const std::int64_t ant = (z < kAnalyticTile ? I : J) * kAnalyticTile +
-                                   (z % kAnalyticTile);
+          const std::int64_t ant = (z < kInterpTile ? I : J) * kInterpTile +
+                                   (z % kInterpTile);
           const bool live = ant < na;
           for (int k = 0; k < kAnalyticOrders; ++k)
             sd[k * span + z] = live && k < v.delay.shape[3] ? v.delay(ant, r, t, k) : T(0);
@@ -134,9 +136,9 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
         }
         __syncthreads();
         for (std::int64_t u = 0; u < nu; ++u) {
-          for (std::int64_t z = threadIdx.x; z < nm * 32; z += blockDim.x) {
-            const auto m = z / 32, il = z % 32;
-            const auto p = I * 32 + il, q = J * 32 + il;
+          for (std::int64_t z = threadIdx.x; z < nm * kInterpTile; z += blockDim.x) {
+            const auto m = z / kInterpTile, il = z % kInterpTile;
+            const auto p = I * kInterpTile + il, q = J * kInterpTile + il;
             const auto o = analytic_index(cell, r, u, m, 0, nr, nu, nm, na);
             si[z] = p < na ? s[o + p] : Cplx<T>{0, 0};
             sj[z] = q < na ? s[o + q] : Cplx<T>{0, 0};
@@ -150,9 +152,9 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
           for (int k = 0; k < pairs_per_thread; ++k) {
             const auto pair = v.tile_pairs(tp, threadIdx.x + k * kAnalyticBlock);
             if (pair < 0) continue;
-            const auto il = pair / 32, jl = pair % 32;
-            const std::int64_t p = I * 32 + il, q = J * 32 + jl;
-            const auto ip = il, iq = kAnalyticTile + jl;
+            const auto il = pair / kInterpTile, jl = pair % kInterpTile;
+            const std::int64_t p = I * kInterpTile + il, q = J * kInterpTile + jl;
+            const auto ip = il, iq = kInterpTile + jl;
             const AnalyticPair d{
                 double(sd[ip]) - double(sd[iq]),
                 double(sd[span + ip]) - double(sd[span + iq]),
@@ -164,7 +166,8 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
             if constexpr (!Transpose) {
               Cplx<T> primal{0, 0};
               auto z = analytic_contract<Default, T>(si + il, sj + jl, xi + il, xj + jl, h,
-                                                     int(nm), 32, JVP, Phase ? &primal : nullptr);
+                                                     int(nm), kInterpTile, JVP,
+                                                     Phase ? &primal : nullptr);
               if constexpr (Phase) z = cadd(z, cscale(sq[ip] - sq[iq], ctimes_i(primal)));
               acc[k] = cadd(acc[k], z);
             } else {
@@ -179,26 +182,26 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
                 RI_ANALYTIC_UNROLL
                 for (int l = 0; l < (Default ? AnalyticStorage<Default>::coefficients : nm); ++l) {
                   const auto w = cmul(g, h[j + l]);
-                  gp = cadd(gp, cmul(w, cconj(sj[l * 32 + jl])));
-                  gq = cadd(gq, cconj(cmul(w, si[l * 32 + il])));
+                  gp = cadd(gp, cmul(w, cconj(sj[l * kInterpTile + jl])));
+                  gq = cadd(gq, cconj(cmul(w, si[l * kInterpTile + il])));
                 }
-                analytic_atomic(xi + j * 32 + il, gp);
-                analytic_atomic((I == J ? xi : xj) + j * 32 + jl, gq);
+                analytic_atomic(xi + j * kInterpTile + il, gp);
+                analytic_atomic((I == J ? xi : xj) + j * kInterpTile + jl, gq);
               }
               if constexpr (Phase) {
                 const auto z = analytic_contract<Default, T>(si + il, sj + jl, si + il, sj + jl, h,
-                                                             int(nm), 32, false);
+                                                             int(nm), kInterpTile, false);
                 const auto gz = cmul(g, z);
                 analytic_add(sq + ip, -gz.im);
-                analytic_add(sq + (I == J ? 0 : kAnalyticTile) + jl, gz.im);
+                analytic_add(sq + (I == J ? 0 : kInterpTile) + jl, gz.im);
               }
             }
           }
           __syncthreads();
           if constexpr (Transpose) {
-            for (std::int64_t z = threadIdx.x; z < nm * 32; z += blockDim.x) {
-              const auto m = z / 32, il = z % 32;
-              const auto p = I * 32 + il, q = J * 32 + il;
+            for (std::int64_t z = threadIdx.x; z < nm * kInterpTile; z += blockDim.x) {
+              const auto m = z / kInterpTile, il = z % kInterpTile;
+              const auto p = I * kInterpTile + il, q = J * kInterpTile + il;
               const auto o = analytic_index(cell, r, u, m, 0, nr, nu, nm, na);
               if (p < na) partials[(o + p) * ntiles + J] = xi[z];
               if (I != J && q < na) partials[(o + q) * ntiles + I] = xj[z];
@@ -210,11 +213,11 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
           // The phase cotangent has no frequency-offset or coefficient axis:
           // one partial per antenna and partner tile for the whole (cell, r).
           for (int z = threadIdx.x; z < span; z += blockDim.x) {
-            const std::int64_t ant = (z < kAnalyticTile ? I : J) * kAnalyticTile +
-                                     (z % kAnalyticTile);
+            const std::int64_t ant = (z < kInterpTile ? I : J) * kInterpTile +
+                                     (z % kInterpTile);
             if (ant >= na) continue;
             const auto o = ((cell * nr + r) * na + ant) * ntiles;
-            if (z < kAnalyticTile) phase_partials[o + J] = sq[z];
+            if (z < kInterpTile) phase_partials[o + J] = sq[z];
             else if (I != J) phase_partials[o + I] = sq[z];
           }
           __syncthreads();
@@ -224,7 +227,8 @@ __global__ void analytic_tiles(AnalyticViews<T> v, const Cplx<T> *s,
         for (int k = 0; k < pairs_per_thread; ++k) {
           const auto pair = v.tile_pairs(tp, threadIdx.x + k * kAnalyticBlock);
           if (pair < 0) continue;
-          const auto p = I * 32 + pair / 32, q = J * 32 + pair % 32;
+          const auto p = I * kInterpTile + pair / kInterpTile;
+          const auto q = J * kInterpTile + pair % kInterpTile;
           const auto b1 = v.pair(p, q), b2 = v.pair(q, p);
           const auto z = cscale(T(1) / T(nu), acc[k]);
           if (b1 >= 0) out(b1, f, t) = z;
@@ -242,7 +246,7 @@ template <typename T>
 __global__ void analytic_gather(AnalyticViews<T> v, const Cplx<T> *partials,
     Tensor4D<Cplx<T> *> out, InterpCellChunk<std::int64_t> chunk, bool first) {
   const auto na = v.amp.shape[0], nr = v.amp.shape[1], nf = v.amp.shape[2], nt = v.amp.shape[3];
-  const auto nm = v.gt.shape[2], nu = v.wf.shape[2], ntiles = (na + 31) / 32;
+  const auto nm = v.gt.shape[2], nu = v.wf.shape[2], ntiles = interp_tile_count(na);
   for (std::int64_t index = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
        index < na * nr * nf * nt; index += std::int64_t(blockDim.x) * gridDim.x) {
     auto z = index;
@@ -279,7 +283,7 @@ __global__ void analytic_gather(AnalyticViews<T> v, const Cplx<T> *partials,
 template <typename T>
 __global__ void analytic_gather_phase(AnalyticViews<T> v, const T *partials,
     Tensor4D<T *> out, InterpCellChunk<std::int64_t> chunk) {
-  const auto na = v.amp.shape[0], nr = v.amp.shape[1], ntiles = (na + 31) / 32;
+  const auto na = v.amp.shape[0], nr = v.amp.shape[1], ntiles = interp_tile_count(na);
   const auto work = chunk.n_fc * chunk.n_tc * nr * na;
   for (std::int64_t index = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
        index < work; index += std::int64_t(blockDim.x) * gridDim.x) {
@@ -299,7 +303,7 @@ ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scrat
   constexpr bool JVP = Mode == 1 || Mode == 3, Transpose = Mode == 2 || Mode == 4;
   constexpr bool Phase = Mode >= 3;
   const auto na = v.amp.shape[0], nr = v.amp.shape[1], nf = v.amp.shape[2], nt = v.amp.shape[3];
-  const auto nm = v.gt.shape[2], nu = v.wf.shape[2], ntiles = (na + 31) / 32;
+  const auto nm = v.gt.shape[2], nu = v.wf.shape[2], ntiles = interp_tile_count(na);
   std::int64_t per_cell, phase_per_time = 0;
   if (!interp_checked_product({std::int64_t(sizeof(Cplx<T>)), na, nr, nu, nm}, per_cell))
     return ffi::Error::InvalidArgument("Analytic coefficient size exceeds the 64-bit byte range");
@@ -317,8 +321,8 @@ ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scrat
   Cplx<T> *extra = Mode ? s + plan.sample_bytes / sizeof(Cplx<T>) : nullptr;
   T *phase_partials = Mode == 4 ? reinterpret_cast<T *>(
       reinterpret_cast<unsigned char *>(*mem) + plan.sample_bytes * buffers) : nullptr;
-  const std::size_t shared = sizeof(Cplx<T>) * nm * 32 * (Mode ? 4 : 2) +
-                            sizeof(T) * 2 * kAnalyticTile * (kAnalyticOrders + 1 + (Phase ? 1 : 0));
+  const std::size_t shared = sizeof(Cplx<T>) * nm * kInterpTile * (Mode ? 4 : 2) +
+                            sizeof(T) * 2 * kInterpTile * (kAnalyticOrders + 1 + (Phase ? 1 : 0));
   if (shared > get_device_prop().sharedMemPerBlock) return ffi::Error::Internal("Analytic tiles exceed shared memory limit");
   Tensor3D<Cplx<T> *> out(output, v.a1.shape[0], nf, nt);
   Tensor3D<const Cplx<T> *> cot(cotangent, v.a1.shape[0], nf, nt);

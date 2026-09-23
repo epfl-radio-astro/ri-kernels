@@ -46,7 +46,11 @@ from .rfi_vis_op import (
 )
 
 
-#: Antennas per tile in the staged GPU kernels; the tile-pair list is built for it.
+#: Antennas per tile in the staged GPU kernels; the tile-pair list is built for
+#: it. The kernels hold the same value as ``kInterpTile`` in
+#: src/rfi_interp_common.hpp and validate every tile-pair list against it, so
+#: the two have to be changed together. The analytic op imports this one rather
+#: than defining its own.
 TILE = 32
 
 

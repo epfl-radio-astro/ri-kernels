@@ -1,8 +1,8 @@
 // GPU transpose (VJP with respect to the data-grid signal) of the data-grid
 // RFI visibility, staged. See rfi_interp_transpose_kernel.cpp for the formulas.
 //
-// A block owns one tile of kTile antennas, one cell and one source, and walks
-// every partner tile to build its own antennas' cotangent samples:
+// A block owns one tile of kInterpTile antennas, one cell and one source, and
+// walks every partner tile to build its own antennas' cotangent samples:
 //
 //   W[i, j] = (vbar[pair(i, j)] + conj(vbar[pair(j, i)])) / n_samples,
 //   G[i](s) = sum over every partner j of  W[i, j] conj(S[j](s)),
@@ -18,9 +18,9 @@
 // contraction are applied once per antenna, not once per tile pair it appears
 // in, and the partials H carry an antenna axis rather than a tile-pair one:
 // (n_ant, n_rfi, n_freq, n_time_chunk, n_slots) instead of
-// (n_tile_pairs, 2, kTile, ...), smaller by a factor of n_tiles + 1 -- 162 MB
-// to 18 MB at 256 antennas, 32 sources and 32 channels. The gather then has no
-// tile-pair axis to sum over either.
+// (n_tile_pairs, 2, kInterpTile, ...), smaller by a factor of n_tiles + 1 --
+// 162 MB to 18 MB at 256 antennas, 32 sources and 32 channels. The gather then
+// has no tile-pair axis to sum over either.
 //
 // The fine samples and phase factors of a chunk of time cells are materialised
 // first, once per cell and antenna (rfi_interp_samples_gpu.cuh), so staging is
@@ -62,7 +62,8 @@ namespace ffi = xla::ffi;
 namespace ri_kernels {
 namespace gpu {
 
-constexpr int kTileT = 32;     // antennas per tile
+// kInterpTile, the antennas per tile, comes from rfi_interp_common.hpp: the
+// forward kernel and the analytic operator cut the antennas the same way.
 constexpr int kBlockT = 256;   // threads per block
 
 // Samples per chunk: the four tiles within 16 KB.
@@ -115,11 +116,11 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_own(
   T *wt = wf + n_sf * n_int_f;
   const std::size_t head = (sizeof(T) * (n_sf * n_int_f + n_st * n_int_t) + 15) / 16 * 16;
   Cplx<T> *W = reinterpret_cast<Cplx<T> *>(dynamic_shared + head);  // [j][i], one partner
-  Cplx<T> *S_own = W + kTileT * kTileT;                             // [s][a]
-  Cplx<T> *S_par = S_own + kChunk * kTileT;
-  Cplx<T> *G = S_par + kChunk * kTileT;                             // [s][i]
-  Cplx<T> *Hacc = G + kChunk * kTileT;                              // [slot][i]
-  T *P = reinterpret_cast<T *>(Hacc + kTileT * n_slots);            // [s][i], full variant
+  Cplx<T> *S_own = W + kInterpTile * kInterpTile;                             // [s][a]
+  Cplx<T> *S_par = S_own + kChunk * kInterpTile;
+  Cplx<T> *G = S_par + kChunk * kInterpTile;                             // [s][i]
+  Cplx<T> *Hacc = G + kChunk * kInterpTile;                              // [slot][i]
+  T *P = reinterpret_cast<T *>(Hacc + kInterpTile * n_slots);            // [s][i], full variant
 
   const int tid = threadIdx.x;
   const INT_T I = blockIdx.y;             // the tile of antennas this block owns
@@ -134,15 +135,15 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_own(
       wf[i] = v.w_freq(f, i / n_int_f, i % n_int_f);
     for (INT_T i = tid; i < n_st * n_int_t; i += kBlockT)
       wt[i] = v.w_time(t, i / n_int_t, i % n_int_t);
-    for (INT_T idx = tid; idx < kTileT * n_slots; idx += kBlockT) Hacc[idx] = Cplx<T>{0, 0};
+    for (INT_T idx = tid; idx < kInterpTile * n_slots; idx += kBlockT) Hacc[idx] = Cplx<T>{0, 0};
 
     for (INT_T s0 = 0; s0 < n_s; s0 += kChunk) {
       const INT_T cs = n_s - s0 < kChunk ? n_s - s0 : kChunk;
       __syncthreads();  // the weights and the previous chunk's contraction
       // The own tile's samples, and a clean G to accumulate the partners into.
-      for (INT_T idx = tid; idx < cs * kTileT; idx += kBlockT) {
-        const INT_T s_local = idx / kTileT, i_local = idx % kTileT;
-        const INT_T a = I * kTileT + i_local;
+      for (INT_T idx = tid; idx < cs * kInterpTile; idx += kBlockT) {
+        const INT_T s_local = idx / kInterpTile, i_local = idx % kInterpTile;
+        const INT_T a = I * kInterpTile + i_local;
         S_own[idx] = a < n_ant
                          ? v.S[sample_index(f_local, t_local, r, s0 + s_local, a, n_tc, n_rfi, n_s, n_ant)]
                          : Cplx<T>{0, 0};
@@ -154,9 +155,9 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_own(
         // This partner's cotangent weights. Cheap beside the product below --
         // one entry against kChunk sample products -- so rebuilding them per
         // source and per chunk costs less than holding every partner's.
-        for (INT_T idx = tid; idx < kTileT * kTileT; idx += kBlockT) {
-          const INT_T i_local = idx / kTileT, j_local = idx % kTileT;
-          const INT_T a = I * kTileT + i_local, b = J * kTileT + j_local;
+        for (INT_T idx = tid; idx < kInterpTile * kInterpTile; idx += kBlockT) {
+          const INT_T i_local = idx / kInterpTile, j_local = idx % kInterpTile;
+          const INT_T a = I * kInterpTile + i_local, b = J * kInterpTile + j_local;
           Cplx<T> w{0, 0};
           if (a < n_ant && b < n_ant) {
             const INT_T bl = v.pair(a, b);
@@ -167,12 +168,12 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_own(
           // Stored transposed, [j][i]: the product below has a thread per own
           // antenna i and walks j, so this is what makes a warp's reads
           // consecutive words rather than 32 apart in the same bank.
-          W[j_local * kTileT + i_local] = w;
+          W[j_local * kInterpTile + i_local] = w;
         }
         if (J != I) {
-          for (INT_T idx = tid; idx < cs * kTileT; idx += kBlockT) {
-            const INT_T s_local = idx / kTileT, j_local = idx % kTileT;
-            const INT_T b = J * kTileT + j_local;
+          for (INT_T idx = tid; idx < cs * kInterpTile; idx += kBlockT) {
+            const INT_T s_local = idx / kInterpTile, j_local = idx % kInterpTile;
+            const INT_T b = J * kInterpTile + j_local;
             S_par[idx] = b < n_ant
                              ? v.S[sample_index(f_local, t_local, r, s0 + s_local, b, n_tc, n_rfi, n_s, n_ant)]
                              : Cplx<T>{0, 0};
@@ -181,11 +182,12 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_own(
         __syncthreads();
         const Cplx<T> *SJ = J == I ? S_own : S_par;
         // G[i](s) += sum_j W[i, j] conj(S_J[j](s)).
-        for (INT_T idx = tid; idx < cs * kTileT; idx += kBlockT) {
-          const INT_T s_local = idx / kTileT, i_local = idx % kTileT;
+        for (INT_T idx = tid; idx < cs * kInterpTile; idx += kBlockT) {
+          const INT_T s_local = idx / kInterpTile, i_local = idx % kInterpTile;
           Cplx<T> acc{0, 0};
-          for (INT_T j = 0; j < kTileT; ++j)
-            acc = cadd(acc, cmul(W[j * kTileT + i_local], cconj(SJ[s_local * kTileT + j])));
+          for (INT_T j = 0; j < kInterpTile; ++j)
+            acc = cadd(acc, cmul(W[j * kInterpTile + i_local],
+                                 cconj(SJ[s_local * kInterpTile + j])));
           G[idx] = cadd(G[idx], acc);
         }
       }
@@ -193,9 +195,9 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_own(
       __syncthreads();
       // G is complete for this chunk: turn it by the antenna's phase factor and
       // push it through the stencil weights, once, onto the cell's partials.
-      for (INT_T idx = tid; idx < cs * kTileT; idx += kBlockT) {
-        const INT_T s_local = idx / kTileT, i_local = idx % kTileT;
-        const INT_T a = I * kTileT + i_local;
+      for (INT_T idx = tid; idx < cs * kInterpTile; idx += kBlockT) {
+        const INT_T s_local = idx / kInterpTile, i_local = idx % kInterpTile;
+        const INT_T a = I * kInterpTile + i_local;
         if (a >= n_ant) {
           G[idx] = Cplx<T>{0, 0};
           if constexpr (FULL) P[idx] = T(0);
@@ -206,20 +208,21 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_own(
         G[idx] = cmul(e, G[idx]);
       }
       __syncthreads();
-      for (INT_T idx = tid; idx < kTileT * n_slots; idx += kBlockT) {
-        const INT_T i_local = idx % kTileT, slot = idx / kTileT;
+      for (INT_T idx = tid; idx < kInterpTile * n_slots; idx += kBlockT) {
+        const INT_T i_local = idx % kInterpTile, slot = idx / kInterpTile;
         Cplx<T> h{0, 0};
         if (slot < n_stencil) {
           const INT_T kf = slot / n_st, kt = slot % n_st;
           for (INT_T s_local = 0; s_local < cs; ++s_local) {
             const INT_T s = s0 + s_local, vv = s / n_int_f, u = s % n_int_f;
-            h = cadd(h, cscale(wf[kf * n_int_f + u] * wt[kt * n_int_t + vv], G[s_local * kTileT + i_local]));
+            h = cadd(h, cscale(wf[kf * n_int_f + u] * wt[kt * n_int_t + vv],
+                               G[s_local * kInterpTile + i_local]));
           }
         } else if constexpr (FULL) {
           const INT_T k = slot - n_stencil - 1;  // -1 is the phase, then the delay orders
           for (INT_T s_local = 0; s_local < cs; ++s_local) {
             const INT_T s = s0 + s_local, vv = s / n_int_f, u = s % n_int_f;
-            const T pc = P[s_local * kTileT + i_local];
+            const T pc = P[s_local * kInterpTile + i_local];
             h.re += k < 0 ? pc : delay_phase_coeff(k, freq_f, v.dnu(u), v.dt(vv)) * pc;
           }
         }
@@ -229,9 +232,9 @@ __global__ void __launch_bounds__(kBlockT) rfi_interp_transpose_own(
 
     // The cell's partials for this antenna tile and source, written once.
     __syncthreads();
-    for (INT_T idx = tid; idx < kTileT * n_slots; idx += kBlockT) {
-      const INT_T i_local = idx % kTileT, slot = idx / kTileT;
-      const INT_T a = I * kTileT + i_local;
+    for (INT_T idx = tid; idx < kInterpTile * n_slots; idx += kBlockT) {
+      const INT_T i_local = idx % kInterpTile, slot = idx / kInterpTile;
+      const INT_T a = I * kInterpTile + i_local;
       if (a < n_ant)
         v.H[h_index(a, r, f, t_local, slot, n_rfi, n_freq, n_tc, n_slots)] = Hacc[idx];
     }
@@ -323,7 +326,7 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
       (FULL && !interp_checked_sum(1, dd[3], extra_slots)) ||
       !interp_checked_sum(n_stencil, extra_slots, n_slots))
     return ffi::Error::InvalidArgument("Interpolation stencil or sample count exceeds the 64-bit index range");
-  const auto n_tiles = interp_ceil_div(n_ant, kTileT);
+  const auto n_tiles = interp_tile_count(n_ant);
 
   // Shared memory, in the order the kernel lays it out: the cell's weight rows,
   // one partner's cotangent weights and this source's partials, which are there
@@ -338,14 +341,15 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
       !interp_checked_sum(wf_count, wt_count, weight_count) ||
       !interp_checked_product({sizeof(T), weight_count}, weight_bytes) ||
       !interp_checked_sum(weight_bytes, 15, padded_weights) ||
-      !interp_checked_product({sizeof(Cplx<T>), kTileT, n_slots}, partial_bytes))
+      !interp_checked_product({sizeof(Cplx<T>), kInterpTile, n_slots}, partial_bytes))
     return ffi::Error::InvalidArgument("Interpolation shared memory exceeds the 64-bit byte range");
   const std::int64_t head = padded_weights / 16 * 16;
-  if (!interp_checked_sum(head, sizeof(Cplx<T>) * kTileT * kTileT, fixed) ||
+  if (!interp_checked_sum(head, sizeof(Cplx<T>) * kInterpTile * kInterpTile, fixed) ||
       !interp_checked_sum(fixed, partial_bytes, fixed))
     return ffi::Error::InvalidArgument("Interpolation shared memory exceeds the 64-bit byte range");
   const std::int64_t per_sample =
-      sizeof(Cplx<T>) * 3 * std::size_t(kTileT) + (FULL ? sizeof(T) * std::size_t(kTileT) : 0);
+      sizeof(Cplx<T>) * 3 * std::size_t(kInterpTile) +
+      (FULL ? sizeof(T) * std::size_t(kInterpTile) : 0);
   const std::int64_t shared_limit = max_dynamic_shared_bytes();
   std::int64_t kChunk = ChunkT<T>::value;
   while (kChunk > 1 && (fixed > shared_limit || per_sample * kChunk > shared_limit - fixed)) kChunk /= 2;
@@ -383,7 +387,7 @@ ffi::Error calc_rfi_interp_transpose_gpu_dispatch(
   std::int64_t sample_work;
   if (!interp_checked_product({n_s, plan.n_tc}, sample_work) ||
       sample_work > std::numeric_limits<INT_T>::max() ||
-      n_slots > std::numeric_limits<INT_T>::max() / kTileT ||
+      n_slots > std::numeric_limits<INT_T>::max() / kInterpTile ||
       weight_count > std::numeric_limits<INT_T>::max())
     return ffi::Error::InvalidArgument("Interpolation sample or stencil count exceeds the kernel index range");
   auto h_mem = scratch.Allocate(std::size_t(plan.total_bytes), alignof(Cplx<T>));
@@ -515,10 +519,11 @@ ffi::Error calc_rfi_interp_transpose_gpu_impl_tmpl(
   const std::int64_t n_ant = amp.dimensions()[0];
   if (pair.dimensions()[0] != n_ant || pair.dimensions()[1] != n_ant)
     return ffi::Error::InvalidArgument("Expected an (n_ant, n_ant) pair table");
-  const std::int64_t n_tiles = (n_ant + kTileT - 1) / kTileT;
+  const std::int64_t n_tiles = interp_tile_count(n_ant);
   if (tile_pairs.dimensions()[0] != n_tiles * (n_tiles + 1) / 2 ||
-      tile_pairs.dimensions()[1] != kTileT * kTileT)
-    return ffi::Error::InvalidArgument("Expected a (n_tile_pairs, 1024) tile-pair list");
+      tile_pairs.dimensions()[1] != kInterpTilePairs)
+    return ffi::Error::InvalidArgument(
+        "Expected a (n_tile_pairs, " + std::to_string(kInterpTilePairs) + ") tile-pair list");
   if (vis_bar.dimensions()[0] != a1.dimensions()[0] ||
       vis_bar.dimensions()[1] != amp.dimensions()[2] ||
       vis_bar.dimensions()[2] != amp.dimensions()[3])
