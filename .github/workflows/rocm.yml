@@ -1,0 +1,69 @@
+name: ROCm
+
+# Builds a ri_kernels wheel with the ROCm (HIP) kernels enabled, to check that
+# the GPU sources still compile with hipcc. The wheel is not published: there
+# is no ROCm distribution of ri_kernels yet, and the build runs in AMD's ROCm
+# development image rather than a manylinux container, so the result would not
+# be a portable wheel anyway. It is uploaded as a workflow artifact only.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rocm-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build_rocm:
+    name: ri_kernels (ROCm ${{ matrix.rocm }})
+    runs-on: ubuntu-latest
+    container: rocm/dev-ubuntu-24.04:${{ matrix.rocm }}
+    strategy:
+      fail-fast: false
+      matrix:
+        rocm: ["7.2.4"]
+    env:
+      RI_KERNELS_ROCM: "1"
+    steps:
+      - name: Install build dependencies
+        # The slim dev image has hipcc and the HIP runtime but not hipCUB (nor
+        # rocPRIM, which it pulls in), used by the reduction kernels.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git cmake ninja-build python3 python3-venv hipcub-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Build the wheel
+        # CMake's HIP language support compiles with ROCm's clang directly (not
+        # the hipcc wrapper); point it there rather than rely on discovery.
+        env:
+          HIPCXX: /opt/rocm/llvm/bin/clang++
+          ROCM_PATH: /opt/rocm
+          CMAKE_PREFIX_PATH: /opt/rocm
+        run: |
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install --upgrade pip build
+          /opt/venv/bin/python -m build --wheel --outdir wheelhouse -v
+
+      - name: Smoke-test the built libraries
+        # dlopen both libri_kernels.so and libri_kernels_hip.so. No GPU is
+        # needed to load the HIP library, only the runtime from the image.
+        env:
+          LD_LIBRARY_PATH: /opt/rocm/lib
+        run: |
+          python3 -c "import glob, sys, zipfile; names = zipfile.ZipFile(glob.glob('wheelhouse/*.whl')[0]).namelist(); sys.exit(0 if 'ri_kernels/libri_kernels_hip.so' in names else 'libri_kernels_hip.so missing from wheel')"
+          python3 ci/check_library.py wheelhouse ri_kernels
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-ri_kernels_rocm${{ matrix.rocm }}
+          path: wheelhouse/*.whl
+          retention-days: 7
