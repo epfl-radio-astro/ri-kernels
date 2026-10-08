@@ -31,6 +31,8 @@ using cudaDeviceProp = hipDeviceProp_t;
 #define cudaSuccess hipSuccess
 #define cudaGetErrorString hipGetErrorString
 #define cudaGetDeviceProperties hipGetDeviceProperties
+#define cudaFuncSetAttribute hipFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 
 #else // CUDA
 

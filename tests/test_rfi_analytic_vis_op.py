@@ -123,9 +123,14 @@ def monomial_tables(n_cells: int, half_width: int):
     return coefficients, starts
 
 
-def make_inputs(real, complex_, **shape):
+def make_inputs(real, complex_, pol=2, **shape):
+    """The operator's arguments, with a (..., pol, 2) two-column signal."""
     args = _interp_inputs(real, complex_, **shape)
     g, starts = monomial_tables(args[0].shape[-1], shape.get("half_width", 1))
+    rng = np.random.default_rng(shape.get("seed", 0) + 100)
+    factors = args[0].shape + (pol, 2)
+    amp = rng.normal(size=factors) + 1j * rng.normal(size=factors)
+    args[0] = jnp.asarray(amp, complex_)
     args[5] = jnp.asarray(g, real)
     args[6] = jnp.asarray(starts, jnp.int32)
     args[8] = jnp.asarray(2., real)
@@ -140,9 +145,34 @@ def upcast(x):
     return x
 
 
-def reference(amp, phase, delay, *tables, a1, a2, **options):
+def scalar_reference(amp, phase, delay, *tables, a1, a2, **options):
+    """The frozen scalar reference, sum_rfi H amp[a1] conj(amp[a2]), antenna first."""
     return analytic_rfi_vis(amp.swapaxes(0, 1), phase.swapaxes(0, 1),
                             delay.swapaxes(0, 1), *tables, a1, a2, **options)
+
+
+# i**k, the rotations of the polarisation identity.
+_ROTATIONS = np.array([1, 1j, -1, -1j])
+
+
+def reference(amp, phase, delay, *tables, a1, a2, **options):
+    """The polarised visibilities (n_bl, n_freq, n_time, P, P) from the scalar reference.
+
+    The scalar reference is the diagonal S(X) = B(X, X) of the sesquilinear
+    form B(X, Y) = sum_rfi H X[a1] conj(Y[a2]). Polarisation recovers every
+    off-diagonal value from it, B(X, Y) = 1/4 sum_k i^k S(X + i^k Y), and
+    V_ij = sum_c B(A[..., i, c], A[..., j, c]). One vmap over the stack keeps
+    a single compilation, and the derivatives flow through it unchanged.
+    """
+    n_pol = amp.shape[4]
+    rotations = jnp.asarray(_ROTATIONS, amp.dtype)
+    # (..., i, j, c, k): A_ic + i^k A_jc.
+    stack = (amp[..., :, None, :, None] + rotations * amp[..., None, :, :, None])
+    stack = jnp.moveaxis(stack.reshape(amp.shape[:4] + (-1,)), -1, 0)
+    scalar = jax.vmap(lambda x: scalar_reference(x, phase, delay, *tables, a1=a1, a2=a2, **options))
+    values = jnp.moveaxis(scalar(stack), 0, -1)
+    values = values.reshape(values.shape[:-1] + (n_pol, n_pol, 2, 4))
+    return jnp.einsum("...ijck,k->...ij", values, rotations) / 4
 
 
 def assert_close(actual, expected, real):
@@ -212,7 +242,7 @@ def perturbations(args, n_bl, seed=1):
     """Random signal and phase tangents and a visibility cotangent."""
     rng = np.random.default_rng(seed)
     amp, phase = args[:2]
-    out = (n_bl,) + amp.shape[2:]
+    out = (n_bl,) + amp.shape[2:4] + (amp.shape[4],) * 2
     amp_dot = rng.normal(size=amp.shape) + 1j * rng.normal(size=amp.shape)
     g = rng.normal(size=out) + 1j * rng.normal(size=out)
     return (jnp.asarray(amp_dot, amp.dtype), jnp.asarray(rng.normal(size=phase.shape), phase.dtype),
@@ -252,6 +282,7 @@ def test_reference_preserves_single_precision(half_width, options, phase_terms):
     with jax.default_device(CPU):
         args = make_inputs(jnp.float32, jnp.complex64, n_ant=2, n_rfi=1,
                            n_freq=1, n_time=5, n_int_f=1, half_width=half_width)
+        args[0] = args[0][..., 0, 0]
         a, b, c = phase_terms
         nu = float(args[-1][0])
         delay = jnp.zeros_like(args[2])
@@ -262,7 +293,7 @@ def test_reference_preserves_single_precision(half_width, options, phase_terms):
 
         @jax.jit
         def run(args, tangent, cotangent):
-            fn = lambda amp: reference(amp, *args[1:], a1=a1, a2=a2, **options)
+            fn = lambda amp: scalar_reference(amp, *args[1:], a1=a1, a2=a2, **options)
             value, dot = jax.jvp(fn, (args[0],), (tangent,))
             return value, dot, jax.vjp(fn, args[0])[1](cotangent)[0]
 
@@ -297,11 +328,16 @@ CASES = [(name, {}) for name in SHAPES] + [
 ]
 
 
+@pytest.fixture(params=[1, 2], ids=lambda p: f"P{p}")
+def pol(request):
+    return request.param
+
+
 @pytest.mark.parametrize("shape,options", CASES,
                          ids=[f"{name}-{'-'.join(map(str, o.values())) or 'default'}" for name, o in CASES])
-def test_value_and_derivatives(precision, device, shape, options):
+def test_value_and_derivatives(precision, device, pol, shape, options):
     real, complex_ = precision
-    args = make_inputs(real, complex_, **SHAPES[shape])
+    args = make_inputs(real, complex_, pol=pol, **SHAPES[shape])
     a1, a2 = make_baselines(args[0].shape[0], shuffle=True)
     check(RFIAnalyticVisOp(args[0].shape[0], a1, a2), args, a1, a2, **options)
 
@@ -328,14 +364,14 @@ def test_phase_regimes(precision, device, a, b, c):
 
 
 @pytest.mark.parametrize("n_ant", [1, 33, 65])
-def test_sparse_reversed_and_auto_baselines(precision, device, n_ant):
-    # Tile edges, reversed orderings and autocorrelations, whose phase
-    # cotangent contributions cancel.
+def test_sparse_reversed_and_auto_baselines(precision, device, pol, n_ant):
+    # Tile edges, reversed orderings (the conjugate transpose, which swaps XY
+    # and YX) and autocorrelations, whose phase cotangent contributions cancel.
     real, complex_ = precision
     pairs = sorted(set([(0, 0), (n_ant - 1, n_ant - 1), (0, n_ant - 1), (n_ant - 1, 0),
                         (min(31, n_ant - 1), min(32, n_ant - 1))]))[::-1]
     a1, a2 = (jnp.asarray(x, jnp.int32) for x in np.asarray(pairs).T)
-    args = make_inputs(real, complex_, n_ant=n_ant, n_rfi=1, n_freq=1, n_time=3, n_int_f=1)
+    args = make_inputs(real, complex_, pol=pol, n_ant=n_ant, n_rfi=1, n_freq=1, n_time=3, n_int_f=1)
     check(RFIAnalyticVisOp(n_ant, a1, a2), args, a1, a2)
 
 
@@ -362,7 +398,7 @@ def test_the_signal_only_kernels_serve_a_fixed_phase():
     args = make_inputs(jnp.float32, jnp.complex64)
     a1, a2 = make_baselines(args[0].shape[0])
     op = RFIAnalyticVisOp(args[0].shape[0], a1, a2)
-    cot = jnp.ones((len(a1),) + args[0].shape[2:], dtype=jnp.complex64)
+    cot = jnp.ones((len(a1),) + args[0].shape[2:4] + (2, 2), dtype=jnp.complex64)
     names = ("rfi_analytic_jvp_op", "rfi_analytic_transpose_op",
              "rfi_analytic_full_jvp_op", "rfi_analytic_full_transpose_op")
 
@@ -399,6 +435,10 @@ def test_cubic_translation_matters(device):
     (5, jnp.zeros((6, 3, 10)), "monomial"),
     (8, jnp.ones(2), "scalar"), (7, jnp.zeros((2, 1)), "dnu|w_freq"),
     (6, jnp.zeros(6, jnp.int64), "int32"),
+    (0, jnp.zeros((5, 2, 3, 6), jnp.complex128), "pad a scalar signal"),
+    (0, jnp.zeros((5, 2, 3, 6, 3, 2), jnp.complex128), "P, 2"),
+    (0, jnp.zeros((5, 2, 3, 6, 2, 1), jnp.complex128), "P, 2"),
+    (1, jnp.zeros((5, 2, 3, 5)), "phase shape"),
 ])
 def test_bad_shapes(slot, value, match):
     args = make_inputs(jnp.float64, jnp.complex128)
@@ -454,13 +494,13 @@ def test_duplicate_baselines():
         RFIAnalyticVisOp(2, np.array([0, 0]), np.array([1, 1]))
 
 
-def test_empty_baselines(precision, device):
+def test_empty_baselines(precision, device, pol):
     real, complex_ = precision
-    args = make_inputs(real, complex_)
+    args = make_inputs(real, complex_, pol=pol)
     empty = jnp.array([], jnp.int32)
     op = RFIAnalyticVisOp(5, empty, empty)
     value, pullback = jax.vjp(lambda a: op.eval(a, *args[1:]), args[0])
-    assert value.shape == (0, 3, 6)
+    assert value.shape == (0, 3, 6, pol, pol)
     np.testing.assert_array_equal(pullback(jnp.zeros_like(value))[0], jnp.zeros_like(args[0]))
 
 
@@ -487,14 +527,14 @@ def test_mixed_real_precision(slot):
 
 
 @pytest.mark.parametrize("real_name", ["float32", "float64"])
-def test_gpu_scratch_chunks(real_name, device):
+def test_gpu_scratch_chunks(real_name, device, pol):
     if device.platform == "cpu":
         pytest.skip("Scratch chunking is a GPU path")
     # This shape forces a frequency split at 1 MiB even for complex64. The
     # final chunks are short on both axes, and edge stencils cross chunks.
     real = getattr(jnp, real_name)
     complex_ = jnp.complex64 if real == jnp.float32 else jnp.complex128
-    args = make_inputs(real, complex_, n_ant=65, n_rfi=2, n_freq=13, n_time=5, n_int_f=9)
+    args = make_inputs(real, complex_, pol=pol, n_ant=65, n_rfi=2, n_freq=13, n_time=5, n_int_f=9)
     a1 = jnp.array([0, 64, 31, 32, 0, 32, 64], jnp.int32)
     a2 = jnp.array([64, 0, 32, 31, 0, 32, 64], jnp.int32)
     op = RFIAnalyticVisOp(65, a1, a2)
@@ -521,7 +561,7 @@ def test_ffi_rejects_excess_capacity(option, value, device):
                    scratch_mb=np.int64(256))
     options[option] = np.int64(value)
     target = "ri_rfi_analytic_vis_fwd_" + ("cpu" if device.platform == "cpu" else "gpu") + "_f64"
-    call = jax.ffi.ffi_call(target, jax.ShapeDtypeStruct((len(a1), 3, 6), jnp.complex128))
+    call = jax.ffi.ffi_call(target, jax.ShapeDtypeStruct((len(a1), 3, 6, 2, 2), jnp.complex128))
     with pytest.raises(Exception, match="capacity"):
         call(*op.indices, *args, **options).block_until_ready()
 
@@ -532,7 +572,58 @@ def test_ffi_rejects_excess_coefficients(device):
     a1, a2 = make_baselines(5)
     op = RFIAnalyticVisOp(5, a1, a2)
     target = "ri_rfi_analytic_vis_fwd_" + ("cpu" if device.platform == "cpu" else "gpu") + "_f64"
-    call = jax.ffi.ffi_call(target, jax.ShapeDtypeStruct((len(a1), 3, 6), jnp.complex128))
+    call = jax.ffi.ffi_call(target, jax.ShapeDtypeStruct((len(a1), 3, 6, 2, 2), jnp.complex128))
     with pytest.raises(Exception, match="capacity"):
         call(*op.indices, *args, segments=np.int64(2), terms=np.int64(6),
              cubic_terms=np.int64(3), scratch_mb=np.int64(256)).block_until_ready()
+
+
+# --- polarisation: structure and the scalar embedding ------------------------
+
+def test_padded_rank_one(device):
+    """A zero second column is a rank-one signal: P=1 is the XX entry of P=2,
+    and the zero column still leaves nonzero cross-receiver response."""
+    args = make_inputs(jnp.float64, jnp.complex128, pol=2)
+    args[0] = args[0].at[..., 1].set(0)
+    a1, a2 = make_baselines(5, shuffle=True)
+    op = RFIAnalyticVisOp(5, a1, a2)
+    full = op.eval(*args)
+    one = op.eval(args[0][..., :1, :], *args[1:])
+    assert_close(one[..., 0, 0], full[..., 0, 0], jnp.float64)
+    assert np.max(np.abs(full[..., 0, 1])) > 1e-3
+
+
+def test_scalar_embedding(precision, device):
+    """P=1 with a zero second column is the frozen scalar reference itself,
+    value and both derivatives, without the polarisation identity."""
+    real, complex_ = precision
+    args = make_inputs(real, complex_, pol=1)
+    args[0] = args[0].at[..., 1].set(0)
+    a1, a2 = make_baselines(5, shuffle=True)
+    op = RFIAnalyticVisOp(5, a1, a2)
+    scalar = [upcast(x) for x in args]
+    scalar[0] = scalar[0][..., 0, 0]
+    rest = scalar[2:]
+    with jax.default_device(CPU):
+        fn = lambda a, p: scalar_reference(a, p, *rest, a1=upcast(a1), a2=upcast(a2), **DEFAULT_OPTIONS)
+        expected_value, pullback = jax.vjp(fn, *scalar[:2])
+        g = jnp.asarray(np.random.default_rng(3).normal(size=expected_value.shape), jnp.complex128)
+        expected_bars = pullback(g)
+    value, pullback = jax.vjp(lambda a, p: op.eval(a, p, *args[2:])[..., 0, 0], *args[:2])
+    amp_bar, phase_bar = pullback(g.astype(complex_))
+    assert_close(value, expected_value, real)
+    assert_close(amp_bar[..., 0, 0], expected_bars[0], real)
+    assert_close(phase_bar, expected_bars[1], real)
+    np.testing.assert_array_equal(amp_bar[..., 1], 0)
+
+
+def test_reversal_is_conjugate_transpose_and_autos_are_positive(precision, device):
+    real, complex_ = precision
+    args = make_inputs(real, complex_, pol=2, n_ant=3)
+    a1, a2 = jnp.array([0, 1, 0, 2, 1], jnp.int32), jnp.array([1, 0, 0, 2, 1], jnp.int32)
+    value = check(RFIAnalyticVisOp(3, a1, a2), args, a1, a2).value
+    assert_close(value[1], value[0].conj().swapaxes(-1, -2), real)
+    autos = np.asarray(value[2:], np.complex128)
+    assert_close(autos, autos.conj().swapaxes(-1, -2), real)
+    scale = np.max(np.abs(autos))
+    assert np.min(np.linalg.eigvalsh(autos)) > -1e-5 * scale

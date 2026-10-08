@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <type_traits>
 
+#include "rfi_vis_common.hpp"
 #include "tensor.hpp"
 #include "xla/ffi/api/ffi.h"
 
@@ -16,8 +17,12 @@ namespace ri_kernels {
 namespace ffi = xla::ffi;
 
 // Type aliases to avoid commas inside XLA_FFI_DEFINE_HANDLER_SYMBOL macro args.
-using analytic_amp_f32_t = ffi::Buffer<ffi::C64, 4>;
-using analytic_amp_f64_t = ffi::Buffer<ffi::C128, 4>;
+// The signal is (antenna, source, freq, time, P, 2): P receivers and two
+// latent columns. The visibilities are (baseline, freq, time, P, P).
+using analytic_amp_f32_t = ffi::Buffer<ffi::C64, 6>;
+using analytic_amp_f64_t = ffi::Buffer<ffi::C128, 6>;
+using analytic_vis_f32_t = ffi::Buffer<ffi::C64, 5>;
+using analytic_vis_f64_t = ffi::Buffer<ffi::C128, 5>;
 using analytic_real4_f32_t = ffi::Buffer<ffi::F32, 4>;
 using analytic_real4_f64_t = ffi::Buffer<ffi::F64, 4>;
 using analytic_real3_f32_t = ffi::Buffer<ffi::F32, 3>;
@@ -85,19 +90,6 @@ template <typename T> TAB_H_D inline void sincos_t(T x, T *s, T *c) {
   *s = std::sin(x);
   *c = std::cos(x);
 #endif
-}
-
-// Tangents and cotangents are read through views built from the primal
-// extents, so a mismatched buffer would run off the end rather than fail.
-template <typename LHS, typename RHS>
-bool analytic_same_shape(const LHS &lhs, const RHS &rhs) {
-  const auto a = lhs.dimensions();
-  const auto b = rhs.dimensions();
-  if (a.size() != b.size()) return false;
-  for (std::size_t i = 0; i < a.size(); ++i) {
-    if (a[i] != b[i]) return false;
-  }
-  return true;
 }
 
 } // namespace ri_kernels

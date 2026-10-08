@@ -1,9 +1,15 @@
 """Compiled analytic RFI visibility and its JVPs and transposes.
 
+The signal is a two-column factor per antenna, receiver (P of them, one or
+two) and cell; a baseline's visibility is the P x P matrix
+``sum_c C[a1, ..., i, c] conj(C[a2, ..., j, c])`` integrated against the
+pair's phase weights, which every matrix entry shares. Reversing a baseline
+takes the conjugate transpose.
+
 The signal and the phase are differentiated. The phase enters every cell's
 weights as the one factor ``exp(i (phase[a1] - phase[a2]))``, so its tangent
-turns the pair's product by ``i`` and its cotangent is ``-Im(g V)`` on ``a1``
-and ``+Im(g V)`` on ``a2``, summed over the sources and fine channels. Two
+turns the pair's product by ``i`` and its cotangent is ``-Im(sum_ij g_ij V_ij)``
+on ``a1`` and the opposite on ``a2``, summed over the sources and fine channels. Two
 kernel pairs carry the derivatives: the signal alone, and the signal with the
 phase; the JVP rule binds the first whenever the phase tangent is a symbolic
 zero. The delay, the integration interval and
@@ -79,7 +85,7 @@ def tile_pair_list(n_ant, a1, a2):
 
 
 class RFIAnalyticVisOp:
-    """RFI visibility from amplitude coefficients and analytic phase moments.
+    """Polarised RFI visibility from two-column factors and analytic phase moments.
 
     amp and phase are differentiated; the delay, integration interval and
     tables are constants. The recurrence has no time sample axis or Nyquist
@@ -125,10 +131,17 @@ class RFIAnalyticVisOp:
     def eval(self, amp, phase, delay_us, w_freq, start_freq, g_time,
              start_time, dnu_mhz, int_time, freq_mhz, *, segments=2, terms=6,
              cubic_terms=3, scratch_mb=SCRATCH_MB):
-        """Return complex (n_bl, n_freq, n_time) visibilities.
+        """Return complex (n_bl, n_freq, n_time, P, P) visibilities.
 
-        amp and phase have shape (n_ant, n_rfi, n_freq, n_time); delay_us
-        is (n_ant, n_rfi, n_time, n_path), with delay derivatives in us/s^k.
+        amp has shape (n_ant, n_rfi, n_freq, n_time, P, 2): per receiver
+        (P is 1 or 2), the two latent columns of the signal factor; pad a
+        rank-one signal with a zero second column. The result for baseline
+        (p, q) is ``sum_rfi sum_c amp[p,...,i,c] conj(amp[q,...,j,c])``
+        integrated over the cell: P=1 gives one correlation such as XX, P=2
+        ``[[XX, XY], [YX, YY]]``. A reversed baseline is its conjugate
+        transpose. phase has shape (n_ant, n_rfi, n_freq, n_time), shared by
+        every matrix entry; delay_us is (n_ant, n_rfi, n_time, n_path), with
+        delay derivatives in us/s^k.
         phase holds the reduced centre phase, computed in float64 before
         casting. Both are differentiated; delay_us and everything after it
         are constants. freq_mhz and dnu_mhz are in MHz, not config.freqs' Hz.
@@ -222,11 +235,15 @@ def _validate(amp, phase, delay, w_freq, start_freq, g_time, start_time, dnu, in
     for name, x in (("start_freq", start_freq), ("start_time", start_time)):
         if jnp.dtype(x.dtype) != jnp.int32:
             raise TypeError(f"RFI analytic kernels require int32 {name}; got {x.dtype}.")
-    if len(amp.shape) != 4:
-        raise ValueError(f"Expected a rank-4 signal (n_ant, n_rfi, n_freq, n_time); got {amp.shape}")
-    n_ant, n_rfi, n_freq, n_time = amp.shape
+    if len(amp.shape) != 6 or amp.shape[4] not in (1, 2) or amp.shape[5] != 2:
+        hint = " (pad a scalar signal to (..., 1, 2) with a zero second column)" if len(amp.shape) == 4 else ""
+        raise ValueError(
+            f"Expected a signal of shape (n_ant, n_rfi, n_freq, n_time, P, 2) with P 1 or 2; "
+            f"got {amp.shape}{hint}"
+        )
+    n_ant, n_rfi, n_freq, n_time = amp.shape[:4]
     expected = {
-        "phase": amp.shape,
+        "phase": amp.shape[:4],
         "delay_us": (n_ant, n_rfi, n_time, delay.shape[-1] if len(delay.shape) == 4 else -1),
         "w_freq": (n_freq, w_freq.shape[1] if len(w_freq.shape) == 3 else -1, len(dnu.shape) == 1 and dnu.shape[0]),
         "start_freq": (n_freq,),
@@ -250,7 +267,7 @@ def _validate(amp, phase, delay, w_freq, start_freq, g_time, start_time, dnu, in
         raise ValueError("dnu_mhz must be a nonempty vector")
     if not 1 <= g_time.shape[2] <= 9:
         raise ValueError("g_time supports 1 through 9 monomial coefficients")
-    if min(amp.shape) < 1:
+    if min(amp.shape[:4]) < 1:
         raise ValueError("The signal axes must be nonempty")
     return suffix
 
@@ -269,7 +286,8 @@ def _validate_like(name, primal, other):
 
 
 def _output_aval(a1, amp):
-    return ShapedArray((a1.shape[0], amp.shape[2], amp.shape[3]), amp.dtype)
+    n_pol = amp.shape[4]
+    return ShapedArray((a1.shape[0], amp.shape[2], amp.shape[3], n_pol, n_pol), amp.dtype)
 
 
 def _validate_indices(args):
