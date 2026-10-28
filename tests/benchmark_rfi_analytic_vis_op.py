@@ -8,7 +8,6 @@ for the scientific accuracy and end-to-end optimisation comparison.
 import argparse
 import json
 import time
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -16,8 +15,8 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-from test_rfi_analytic_vis_op import make_inputs, make_baselines, reference
-from ri_kernels.jax_api import RFIAnalyticVisOp
+from test_rfi_analytic_vis_op import make_inputs, make_baselines
+from ri_kernels.jax_api import RFIAnalyticVisOp, RFIAnalyticVisOpRef
 
 
 def main():
@@ -28,6 +27,8 @@ def main():
     parser.add_argument("--channels", type=int, default=4)
     parser.add_argument("--cells", type=int, default=16)
     parser.add_argument("--precision", choices=["float32", "float64"], default="float32")
+    parser.add_argument("--pol", type=int, choices=[1, 2], default=2,
+                        help="receivers per antenna, P: the output is P x P per baseline")
     # The pure-JAX analytic form the kernel is validated against. Worth timing
     # beside it: the kernel exists because expressing the moment recurrence in
     # JAX costs sequential array launches that a kernel does in registers.
@@ -43,23 +44,19 @@ def main():
             shape = dict(n_ant=na, n_rfi=options.sources, n_freq=options.channels,
                          n_time=options.cells, n_int_f=2)
             a1, a2 = make_baselines(na, autocorr=False)
-            operators = [("analytic", RFIAnalyticVisOp(na, a1, a2), make_inputs(real, complex_, **shape))]
+            inputs = lambda: make_inputs(real, complex_, pol=options.pol, **shape)
+            operators = [("analytic", RFIAnalyticVisOp(na, a1, a2), inputs())]
             if options.with_reference:
-                operators.append(("jax-analytic", None, make_inputs(real, complex_, **shape)))
+                operators.append(("jax-analytic", RFIAnalyticVisOpRef(na, a1, a2), inputs()))
             for name, op, args in operators:
-                if op is None:
-                    ref = partial(reference, a1=a1, a2=a2, segments=2, terms=6, cubic_terms=3)
-                    fn = lambda a: ref(a, *args[1:])
-                    fn2 = lambda a, p: ref(a, p, *args[2:])
-                    fn3 = lambda a, p, d: ref(a, p, d, *args[3:])
-                else:
-                    fn = lambda a: op.eval(a, *args[1:])
-                    fn2 = lambda a, p: op.eval(a, p, *args[2:])
-                    fn3 = lambda a, p, d: op.eval(a, p, d, *args[3:])
+                fn = lambda a: op.eval(a, *args[1:])
+                fn2 = lambda a, p: op.eval(a, p, *args[2:])
+                fn3 = lambda a, p, d: op.eval(a, p, d, *args[3:])
                 tangent = jnp.full_like(args[0], .3 + .7j)
                 phase_tangent = jnp.full_like(args[1], .1)
                 delay_tangent = jnp.full_like(args[2], 1e-3)
-                cotangent = jnp.full((len(a1), options.channels, options.cells), .7 - .2j, complex_)
+                cotangent = jnp.full((len(a1), options.channels, options.cells, options.pol, options.pol),
+                                     .7 - .2j, complex_)
                 amp, phase, delay = args[0], args[1], args[2]
                 # The full pair carries the phase derivative as well, the
                 # delay pair the delay's besides.
@@ -92,6 +89,7 @@ def main():
                         continue
                     print(json.dumps(dict(operator=name, derivative=kind, antennas=na,
                         device=device.device_kind, jax=jax.__version__, precision=options.precision,
+                        pol=options.pol,
                         sources=options.sources, channels=options.channels, cells=options.cells,
                         iterations=options.iterations, seconds_median=float(np.median(timings)),
                         seconds_min=min(timings))), flush=True)

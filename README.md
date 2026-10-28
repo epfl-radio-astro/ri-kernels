@@ -48,23 +48,35 @@ python -m pytest tests
 
 ## RFI visibilities
 
-`RFIVisOp` computes the per-baseline RFI visibility
+`RFIVisOp` computes the per-baseline polarised RFI visibility
 
 ```
-vis[bl, f, t] = mean over (n_int_freq, n_int_time) of
-                sum over n_rfi of A[a1] conj(A[a2]) exp(i (φ[a1] - φ[a2]))
+vis[bl, f, t, i, j] = mean over (n_int_freq, n_int_time) of
+                      sum over n_rfi and c of
+                      A[a1, ..., i, c] conj(A[a2, ..., j, c]) exp(i (φ[a1] - φ[a2]))
 ```
 
-for amplitudes `A` shaped `(n_ant, n_freq, n_time, n_rfi, n_int_freq,
-n_int_time)` and phases `φ` in radians of the same shape, giving an output of
-shape `(n_baselines, n_freq, n_time)`. It is constructed from the baseline
-layout and evaluated through `eval`:
+for signal factors `A` shaped `(n_ant, n_freq, n_time, n_rfi, n_int_freq,
+n_int_time, P, 2)` and phases `φ` in radians shaped `(n_ant, n_freq, n_time,
+n_rfi, n_int_freq, n_int_time)`, giving an output of shape `(n_baselines,
+n_freq, n_time, P, P)`. It is constructed from the baseline layout and
+evaluated through `eval`:
 
 ```python
 from ri_kernels.jax_api import RFIVisOp
 
 vis = RFIVisOp(n_ant, a1, a2).eval(rfi_amp_fine, rfi_phase)
 ```
+
+As for `RFIAnalyticVisOp` below, the signal is a two-column factor per
+receiver (P is 1 or 2). Pad a rank-one signal with a zero second column; a
+zero column still permits X/Y response and leakage. P = 1 gives one
+same-receiver correlation such as XX, and P = 2 gives `[[XX, XY], [YX, YY]]`.
+The phase is common to every receiver and column, so the kernels compute one
+phase factor per fine sample for all P × P entries. A reversed baseline is the
+conjugate transpose, which exchanges XY and YX. `eval` moves the `(P, 2)` axes
+in front of the fine-sample axes before calling the kernels, which keeps each
+component contiguous for SIMD and coalesced loads.
 
 The operator has native primal, JVP, and transpose kernels for CPU, CUDA, and
 ROCm, so both forward- and reverse-mode differentiation stay inside the
@@ -76,7 +88,9 @@ complex128 with float64. Both amplitudes and phases are differentiated.
 `RFIAnalyticVisOp` integrates the time polynomial against phase moments, with
 frequency quadrature unchanged. It stages amplitude coefficients per antenna
 and cell, then contracts pairs of antenna tiles. The default time scratch axis
-has three coefficients, independent of fringe winding.
+has three coefficients, independent of fringe winding. The signal is a
+two-column factor per receiver, so one call returns a single correlation
+(P = 1) or the full 2 × 2 polarisation matrix (P = 2) of every baseline.
 
 ```python
 from ri_kernels.jax_api import RFIAnalyticVisOp
@@ -88,10 +102,15 @@ vis = RFIAnalyticVisOp(n_ant, a1, a2).eval(
 )
 ```
 
-- `amp`, complex `(n_ant, n_rfi, n_freq, n_time)`: the signal on the data
-  grid.
+- `amp`, complex `(n_ant, n_rfi, n_freq, n_time, P, 2)`: the signal factor on
+  the data grid, per receiver (P is 1 or 2) and latent column. There are
+  always two columns; pad a rank-one signal with a zero second column (a
+  zero column still permits X/Y response and leakage). Factors may be fitted
+  directly or built upstream, e.g. as Jones matrices times a source factor;
+  the kernel is agnostic.
 - `phase`, real `(n_ant, n_rfi, n_freq, n_time)`: the phase at the channel and
-  cell centre, reduced to one turn (in float64, before casting).
+  cell centre, reduced to one turn (in float64, before casting). It is common
+  to every receiver and column.
 - `delay_us`, real `(n_ant, n_rfi, n_time, n_path)`: the geometric delay in
   microseconds, with the sign that makes the phase `2π f τ`, and its first
   `n_path - 1` time derivatives at the cell centre, relative to the array mean
@@ -109,6 +128,15 @@ vis = RFIAnalyticVisOp(n_ant, a1, a2).eval(
   is cycles.
 - `int_time`: a positive scalar in seconds.
 
+The result has shape `(n_bl, n_freq, n_time, P, P)`, summed over the sources:
+
+    V[b, ..., i, j] = Σ_rfi ∫ Σ_c amp[a1, ..., i, c] conj(amp[a2, ..., j, c]) e^{iΦ}
+
+P = 1 gives one same-receiver correlation such as XX, and P = 2 gives
+`[[XX, XY], [YX, YY]]`. Every matrix entry and both columns share one set of
+phase moments per baseline, so the moment cost does not grow with P. A
+reversed baseline is the conjugate transpose, which exchanges XY and YX.
+
 Every real operand shares the precision of `phase`; the stencil starts are
 int32. The constructor builds, per pair of 32-antenna tiles, the list of the
 pairs the baselines cover there (`tile_pair_list`), which the staged GPU
@@ -122,9 +150,10 @@ delay tangents as well; one transpose kernel serves both and always returns
 the phase cotangent with the signal's. The phase enters every cell's weights as the one factor
 `exp(i (phase[a1] - phase[a2]))`, so the phase tangent turns the pair's
 product by `i` (`dV = i (dphase[a1] - dphase[a2]) V` per source and fine
-channel) and the cotangent is `-Im(g V)` on `a1` and `+Im(g V)` on `a2`,
-summed over the baseline's sources and fine channels; both cost one extra
-contraction against weights the kernel has already formed.
+channel, for every matrix entry) and the cotangent is `-Im(Σ_ij g_ij V_ij)` on
+`a1` and the opposite on `a2`, summed over the baseline's sources and fine
+channels; both cost one extra contraction against weights the kernel has
+already formed.
 
 The delay's four orders move the closed form's angles: the delay itself the
 centre phase (by `2π dnu τ`), the rate the winding `a`, the curvature `b` and
@@ -132,10 +161,11 @@ the jerk the cubic `c`. The weights integrate `x^m exp(i (φ + a x + b x² +
 c x³))`, so their derivatives in these are the weights of one, two and three
 orders higher, turned by `i`; the curvature and cubic series are truncated, so
 the kernels subtract what the truncation leaves out of their derivatives, and
-the delay gradient is that of the visibility as computed. The delay cotangent
-sums `-s Im(g V')` on `a1` and `+s Im(g V')` on `a2` over the sources, the
-channels and the fine channels, with `V'` the pair's product against the
-order's derivative weights and `s` what a unit of the order adds to its angle.
+the delay gradient is that of the visibility as computed. Every matrix entry
+shares the weights, so the delay cotangent sums `-s Im(Σ_ij g_ij V'_ij)` on
+`a1` and the opposite on `a2` over the sources, the channels and the fine
+channels, with `V'` the pair's matrix against the order's derivative weights
+and `s` what a unit of the order adds to its angle.
 Orders above three, and the third with `cubic_terms=0`, get a zero gradient.
 The three further weight orders make the delay derivative cost about half as
 much again as the full pass without it, so the full JVP and the transpose form
@@ -175,13 +205,19 @@ six-term, three-cubic-term path has unrolled moment orders so its CUDA
 recurrence can stay in registers. Wider configurations use a bounded general
 implementation.
 
-GPU scratch is bounded by the `scratch_mb` argument of `eval` (256 MiB by
-default), with time chunks and, when necessary, frequency chunks. A smaller
+GPU scratch is sized to the `scratch_mb` argument of `eval` (256 MiB by
+default), with time chunks and, when necessary, frequency chunks. The scratch
+is allocated as the plan needs it, not reserved up front, and `scratch_mb` is
+a target rather than a hard limit: when even one channel of one cell does not
+fit beside the transpose's frequency-complete phase and delay partials, the
+kernels use that minimum instead of failing. A smaller
 budget means more chunks, and each chunk of a transpose passes over the whole
 signal cotangent. The transpose reduces coefficient cotangents within each tile
 in shared memory, writes separate partials for partner tiles, and gathers
 through the interpolation stencils. Shared-memory atomics mean the last bits of
-the GPU transpose can vary between runs.
+the GPU transpose can vary between runs. The staged tiles grow with P; when
+they exceed the default 48 KiB (double precision, P = 2, wide stencils) the
+kernel opts in to the card's larger shared-memory limit.
 
 After building on the GPU host, run:
 
@@ -190,15 +226,18 @@ python -m pytest tests/test_rfi_analytic_vis_op.py
 python tests/benchmark_rfi_analytic_vis_op.py --antennas 256 512 --iterations 100
 ```
 
-The analytic tests compare both precisions and the amplitude, phase and delay
-derivatives against a frozen float64 JAX reference. They cover zero winding, both recurrence
-branches, the Fresnel boundary, cubic translation, wider coefficient counts,
+The analytic tests compare both precisions, P = 1 and 2, and the amplitude,
+phase and delay derivatives against a frozen float64 JAX reference; the
+polarised matrix is recovered from its scalar form by the polarisation
+identity. They cover zero winding, both recurrence branches, the Fresnel
+boundary, cubic translation, wider coefficient counts,
 sparse/reversed/autocorrelation baselines, partial antenna tiles and forced
 scratch splitting. The benchmark reports synchronised forward, JVP and VJP
 times, signal-only, with the phase and with the delay, after compilation and
 warmup. It uses
 synthetic inputs; repeat the scientific accuracy check and the 100-iteration
 optimisation with the production SKA-Low data. Inspect ptxas register/spill
-reports and Nsight local-memory traffic for the default specialisation before
+reports and Nsight local-memory traffic for the default specialisation (at
+`--pol 1` and `--pol 2`: P = 2 holds four accumulators per pair) before
 interpreting its speedup. CUDA compilation, device tests and performance need
 the GPU host; CPU tests do not establish those results.

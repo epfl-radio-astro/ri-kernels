@@ -1,5 +1,19 @@
 """
 Custom JAX primitives for RFI visibility calculation using FFI.
+
+The signal is a two-column factor per antenna, receiver (P of them, one or
+two) and fine sample; a baseline's visibility is the P x P matrix
+``sum_c A[a1, ..., i, c] conj(A[a2, ..., j, c]) exp(i (phase[a1] - phase[a2]))``
+summed over the sources and averaged over the fine samples. The phase is
+shared by every matrix entry. Reversing a baseline takes the conjugate
+transpose.
+
+The primitives see the signal with (P, 2) moved in front of the reduction
+axes, (n_ant, n_freq, n_time, P, 2, n_rfi, n_int_freq, n_int_time), so that
+each component is contiguous over the fine samples; ``RFIVisOp.eval`` does
+the move, and JAX differentiates through it. When the signal is computed in
+the same jit, XLA fuses the move into that computation; a signal that enters
+the jit as an argument is copied on every call.
 """
 
 import ctypes
@@ -17,8 +31,8 @@ from jax.interpreters import ad, mlir, xla
 
 class RFIVisOp:
     """
-    Operator for computing RFI visibility using JAX FFI with precomputed indices.
-    
+    Operator for computing polarised RFI visibility using JAX FFI with precomputed indices.
+
     This class encapsulates the antenna baseline indexing logic required for efficient
     RFI visibility calculations. It precomputes sorted indices and search positions
     for both antenna arrays (a1 and a2) to enable fast lookups in the FFI kernel.
@@ -48,21 +62,54 @@ class RFIVisOp:
     
     def eval(self, rfi_amp_fine, rfi_phase):
         """
-        Evaluate the RFI visibility for given RFI amplitudes and phases.
-        
+        Evaluate the polarised RFI visibility for given RFI amplitudes and phases.
+
         Args:
-            rfi_amp_fine: Fine-grained RFI amplitude array with shape
-                         (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time).
-            rfi_phase: RFI phase array with shape matching rfi_amp_fine.
-        
+            rfi_amp_fine: Fine-grained RFI signal factor with shape
+                         (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time, P, 2):
+                         per receiver (P is 1 or 2), the two latent columns.
+                         Pad a rank-one signal with a zero second column (a zero
+                         column still permits X/Y response and leakage).
+            rfi_phase: RFI phase array with shape
+                       (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time),
+                       shared by every receiver and column.
+
         Returns:
-            Array of RFI visibilities with shape (n_baselines, n_freq, n_time).
+            Array of RFI visibilities with shape (n_baselines, n_freq, n_time, P, P):
+            ``sum_rfi mean_fine sum_c A[a1, ..., i, c] conj(A[a2, ..., j, c]) e^{i dphi}``.
+            P=1 gives one correlation such as XX, P=2 ``[[XX, XY], [YX, YY]]``. A
+            reversed baseline is the conjugate transpose.
         """
+        _validate(rfi_amp_fine, rfi_phase)
+        # Move (P, 2) in front of the reduction axes for the kernels.
+        amp = jnp.moveaxis(rfi_amp_fine, (6, 7), (3, 4))
         return rfi_vis_op.bind(
             self.a1, self.a1_sorter, self.a1_start,
             self.a2, self.a2_sorter, self.a2_start,
-            rfi_amp_fine, rfi_phase
+            amp, rfi_phase
         )
+
+
+def _validate(rfi_amp_fine, rfi_phase):
+    """Check the public shapes: the signal (..., P, 2) and the phase without them."""
+    shape = tuple(rfi_amp_fine.shape)
+    if len(shape) != 8 or shape[6] not in (1, 2) or shape[7] != 2:
+        hint = " (pad a scalar signal to (..., 1, 2) with a zero second column)" if len(shape) == 6 else ""
+        raise ValueError(
+            "Expected rfi_amp_fine of shape (n_ant, n_freq, n_time, n_rfi, n_int_freq, "
+            f"n_int_time, P, 2) with P 1 or 2; got {shape}{hint}"
+        )
+    if tuple(rfi_phase.shape) != shape[:6]:
+        raise ValueError(
+            f"Expected rfi_phase of shape {shape[:6]} (rfi_amp_fine without its (P, 2) axes); "
+            f"got {tuple(rfi_phase.shape)}"
+        )
+
+
+def _output_aval(a1, amp):
+    """(n_bl, n_freq, n_time, P, P) for a signal in the kernel layout."""
+    n_pol = amp.shape[3]
+    return ShapedArray((a1.shape[0], amp.shape[1], amp.shape[2], n_pol, n_pol), amp.dtype)
 
 
 def prepare_indices(n_ant, a1, a2):
@@ -304,11 +351,9 @@ def rfi_jvp_abstract(
     Abstract evaluation for the RFI JVP operation.
     """
     _dtype_suffix(rfi_amp_fine.dtype, rfi_phase.dtype)
-    # rfi_amp_fine and rfi_phase shape is
-    # (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time)
-    n_freq = rfi_amp_fine.shape[1]
-    n_time = rfi_amp_fine.shape[2]
-    return ShapedArray([a1.shape[0], n_freq, n_time], rfi_amp_fine.dtype)
+    # rfi_amp_fine is (n_ant, n_freq, n_time, P, 2, n_rfi, n_int_freq, n_int_time)
+    # here, rfi_phase (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time).
+    return _output_aval(a1, rfi_amp_fine)
 
 
 rfi_jvp_op.def_abstract_eval(rfi_jvp_abstract)
@@ -421,11 +466,9 @@ def rfi_vis_abstract(
     Abstract evaluation for the RFI visibility operation.
     """
     _dtype_suffix(rfi_amp_fine.dtype, rfi_phase.dtype)
-    # rfi_amp_fine and rfi_phase shape is
-    # (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time)
-    n_freq = rfi_amp_fine.shape[1]
-    n_time = rfi_amp_fine.shape[2]
-    return ShapedArray([a1.shape[0], n_freq, n_time], rfi_amp_fine.dtype)
+    # rfi_amp_fine is (n_ant, n_freq, n_time, P, 2, n_rfi, n_int_freq, n_int_time)
+    # here, rfi_phase (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time).
+    return _output_aval(a1, rfi_amp_fine)
 
 
 rfi_vis_op.def_abstract_eval(rfi_vis_abstract)

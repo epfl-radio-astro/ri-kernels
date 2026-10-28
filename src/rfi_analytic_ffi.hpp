@@ -2,8 +2,8 @@
 // scalar duration in the time-offset slot: the forward, the signal JVP, the
 // full JVP that carries the phase and delay tangents as well, and the
 // transpose that returns the signal, phase and delay cotangents. Options are
-// static FFI attributes; scratch_mb bounds the GPU coefficient scratch and the
-// CPU handlers ignore it. delay_grad, on the last two, says whether the delay
+// static FFI attributes; scratch_mb is the GPU coefficient scratch target,
+// exceeded only when one cell needs more, and the CPU handlers ignore it. delay_grad, on the last two, says whether the delay
 // is differentiated: without it the full JVP ignores the delay tangent and
 // the transpose writes a zero delay cotangent, and neither forms the further
 // weight orders the delay's derivative needs.
@@ -35,7 +35,7 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_fwd, f32)(
     analytic_real1_f32_t dnu,
     ffi::BufferR0<ffi::F32> duration,
     analytic_real1_f32_t freq,
-    ffi::Result<ffi::BufferR3<ffi::C64>> out,
+    ffi::Result<analytic_vis_f32_t> out,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
     std::int64_t scratch_mb) {
   return RI_ANALYTIC_DISPATCH<0, float, ffi::C64, ffi::F32>(
@@ -64,7 +64,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_fwd, f32),
         .Arg<analytic_real1_f32_t>()
         .Arg<ffi::BufferR0<ffi::F32>>()
         .Arg<analytic_real1_f32_t>()
-        .Ret<ffi::BufferR3<ffi::C64>>()
+        .Ret<analytic_vis_f32_t>()
         .Attr<std::int64_t>("segments")
         .Attr<std::int64_t>("terms")
         .Attr<std::int64_t>("cubic_terms")
@@ -91,7 +91,7 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_jvp, f32)(
     analytic_real1_f32_t dnu,
     ffi::BufferR0<ffi::F32> duration,
     analytic_real1_f32_t freq,
-    ffi::Result<ffi::BufferR3<ffi::C64>> out,
+    ffi::Result<analytic_vis_f32_t> out,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
     std::int64_t scratch_mb) {
   return RI_ANALYTIC_DISPATCH<1, float, ffi::C64, ffi::F32>(
@@ -121,7 +121,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_jvp, f32),
         .Arg<analytic_real1_f32_t>()
         .Arg<ffi::BufferR0<ffi::F32>>()
         .Arg<analytic_real1_f32_t>()
-        .Ret<ffi::BufferR3<ffi::C64>>()
+        .Ret<analytic_vis_f32_t>()
         .Attr<std::int64_t>("segments")
         .Attr<std::int64_t>("terms")
         .Attr<std::int64_t>("cubic_terms")
@@ -150,7 +150,7 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_jvp, f32)(
     analytic_real1_f32_t dnu,
     ffi::BufferR0<ffi::F32> duration,
     analytic_real1_f32_t freq,
-    ffi::Result<ffi::BufferR3<ffi::C64>> out,
+    ffi::Result<analytic_vis_f32_t> out,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
     std::int64_t scratch_mb, std::int64_t delay_grad) {
   return RI_ANALYTIC_DISPATCH<2, float, ffi::C64, ffi::F32>(
@@ -182,7 +182,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_jvp, f32),
         .Arg<analytic_real1_f32_t>()
         .Arg<ffi::BufferR0<ffi::F32>>()
         .Arg<analytic_real1_f32_t>()
-        .Ret<ffi::BufferR3<ffi::C64>>()
+        .Ret<analytic_vis_f32_t>()
         .Attr<std::int64_t>("segments")
         .Attr<std::int64_t>("terms")
         .Attr<std::int64_t>("cubic_terms")
@@ -209,8 +209,8 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_transpose, f32)(
     analytic_real1_f32_t dnu,
     ffi::BufferR0<ffi::F32> duration,
     analytic_real1_f32_t freq,
-    ffi::BufferR3<ffi::C64> cot,
-    ffi::Result<ffi::BufferR4<ffi::C64>> out,
+    analytic_vis_f32_t cot,
+    ffi::Result<analytic_amp_f32_t> out,
     ffi::Result<ffi::BufferR4<ffi::F32>> phase_bar,
     ffi::Result<ffi::BufferR4<ffi::F32>> delay_bar,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
@@ -241,8 +241,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_transpose, f32),
         .Arg<analytic_real1_f32_t>()
         .Arg<ffi::BufferR0<ffi::F32>>()
         .Arg<analytic_real1_f32_t>()
-        .Arg<ffi::BufferR3<ffi::C64>>()
-        .Ret<ffi::BufferR4<ffi::C64>>()
+        .Arg<analytic_vis_f32_t>()
+        .Ret<analytic_amp_f32_t>()
         .Ret<ffi::BufferR4<ffi::F32>>()
         .Ret<ffi::BufferR4<ffi::F32>>()
         .Attr<std::int64_t>("segments")
@@ -271,7 +271,7 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_fwd, f64)(
     analytic_real1_f64_t dnu,
     ffi::BufferR0<ffi::F64> duration,
     analytic_real1_f64_t freq,
-    ffi::Result<ffi::BufferR3<ffi::C128>> out,
+    ffi::Result<analytic_vis_f64_t> out,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
     std::int64_t scratch_mb) {
   return RI_ANALYTIC_DISPATCH<0, double, ffi::C128, ffi::F64>(
@@ -300,7 +300,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_fwd, f64),
         .Arg<analytic_real1_f64_t>()
         .Arg<ffi::BufferR0<ffi::F64>>()
         .Arg<analytic_real1_f64_t>()
-        .Ret<ffi::BufferR3<ffi::C128>>()
+        .Ret<analytic_vis_f64_t>()
         .Attr<std::int64_t>("segments")
         .Attr<std::int64_t>("terms")
         .Attr<std::int64_t>("cubic_terms")
@@ -327,7 +327,7 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_jvp, f64)(
     analytic_real1_f64_t dnu,
     ffi::BufferR0<ffi::F64> duration,
     analytic_real1_f64_t freq,
-    ffi::Result<ffi::BufferR3<ffi::C128>> out,
+    ffi::Result<analytic_vis_f64_t> out,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
     std::int64_t scratch_mb) {
   return RI_ANALYTIC_DISPATCH<1, double, ffi::C128, ffi::F64>(
@@ -357,7 +357,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_jvp, f64),
         .Arg<analytic_real1_f64_t>()
         .Arg<ffi::BufferR0<ffi::F64>>()
         .Arg<analytic_real1_f64_t>()
-        .Ret<ffi::BufferR3<ffi::C128>>()
+        .Ret<analytic_vis_f64_t>()
         .Attr<std::int64_t>("segments")
         .Attr<std::int64_t>("terms")
         .Attr<std::int64_t>("cubic_terms")
@@ -386,7 +386,7 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_jvp, f64)(
     analytic_real1_f64_t dnu,
     ffi::BufferR0<ffi::F64> duration,
     analytic_real1_f64_t freq,
-    ffi::Result<ffi::BufferR3<ffi::C128>> out,
+    ffi::Result<analytic_vis_f64_t> out,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
     std::int64_t scratch_mb, std::int64_t delay_grad) {
   return RI_ANALYTIC_DISPATCH<2, double, ffi::C128, ffi::F64>(
@@ -418,7 +418,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_jvp, f64),
         .Arg<analytic_real1_f64_t>()
         .Arg<ffi::BufferR0<ffi::F64>>()
         .Arg<analytic_real1_f64_t>()
-        .Ret<ffi::BufferR3<ffi::C128>>()
+        .Ret<analytic_vis_f64_t>()
         .Attr<std::int64_t>("segments")
         .Attr<std::int64_t>("terms")
         .Attr<std::int64_t>("cubic_terms")
@@ -445,8 +445,8 @@ RI_ANALYTIC_RETURN RI_ANALYTIC_IMPL(_full_transpose, f64)(
     analytic_real1_f64_t dnu,
     ffi::BufferR0<ffi::F64> duration,
     analytic_real1_f64_t freq,
-    ffi::BufferR3<ffi::C128> cot,
-    ffi::Result<ffi::BufferR4<ffi::C128>> out,
+    analytic_vis_f64_t cot,
+    ffi::Result<analytic_amp_f64_t> out,
     ffi::Result<ffi::BufferR4<ffi::F64>> phase_bar,
     ffi::Result<ffi::BufferR4<ffi::F64>> delay_bar,
     std::int64_t segments, std::int64_t terms, std::int64_t cubic_terms,
@@ -477,8 +477,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(RI_ANALYTIC_NAME(_full_transpose, f64),
         .Arg<analytic_real1_f64_t>()
         .Arg<ffi::BufferR0<ffi::F64>>()
         .Arg<analytic_real1_f64_t>()
-        .Arg<ffi::BufferR3<ffi::C128>>()
-        .Ret<ffi::BufferR4<ffi::C128>>()
+        .Arg<analytic_vis_f64_t>()
+        .Ret<analytic_amp_f64_t>()
         .Ret<ffi::BufferR4<ffi::F64>>()
         .Ret<ffi::BufferR4<ffi::F64>>()
         .Attr<std::int64_t>("segments")

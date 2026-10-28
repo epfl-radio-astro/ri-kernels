@@ -1,6 +1,8 @@
 // Scratch is reused across time chunks, keeping every channel together when
 // one full time cell fits. Only a cell that exceeds the budget is split across
-// frequency. The transpose keeps its smaller partials across all channels so
+// frequency. The budget is a target, not a limit: when even one channel of one
+// cell does not fit beside the frequency-complete partials, the plan takes
+// that minimum instead, and only the allocator can refuse it. The transpose keeps its smaller partials across all channels so
 // that both gathers retain their stencil reach and their summation order.
 // Allocation capacities are separate from the actual extents of a tail chunk;
 // kernels pack the samples using those actual extents.
@@ -11,7 +13,6 @@
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
-#include <string>
 
 #include "rfi_analytic_base.hpp"
 
@@ -59,6 +60,7 @@ template <typename INT_T> struct AnalyticCellChunk {
 
 // h_per_time is frequency-complete; sample_per_freq is one sample buffer for
 // one channel and time cell. All byte arithmetic stays checked and in 64 bits.
+// A budget below the minimum, one channel and time cell, is raised to it.
 inline ffi::Error make_analytic_chunk_plan(
     std::int64_t n_time, std::int64_t n_freq, std::int64_t sample_per_freq,
     std::int64_t h_per_time, std::int64_t n_sample_buffers, std::int64_t budget,
@@ -74,11 +76,7 @@ inline ffi::Error make_analytic_chunk_plan(
       !analytic_checked_product({per_freq, n_freq}, full_samples) ||
       !analytic_checked_sum(h_per_time, full_samples, per_time)) return overflow();
 
-  if (minimum > budget)
-    return ffi::Error::InvalidArgument(
-        "Analytic scratch needs at least " + std::to_string(minimum) +
-        " bytes for one frequency and time cell (including frequency-complete partials), "
-        "but scratch_mb allows " + std::to_string(budget) + " bytes");
+  budget = std::max(budget, minimum);
 
   plan.n_tc = 1;
   plan.n_fc = n_freq;

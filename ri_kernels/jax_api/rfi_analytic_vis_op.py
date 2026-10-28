@@ -1,25 +1,30 @@
 """Compiled analytic RFI visibility and its JVPs and transposes.
 
+The signal is a two-column factor per antenna, receiver (P of them, one or
+two) and cell; a baseline's visibility is the P x P matrix
+``sum_c C[a1, ..., i, c] conj(C[a2, ..., j, c])`` integrated against the
+pair's phase weights, which every matrix entry shares. Reversing a baseline
+takes the conjugate transpose.
+
 The signal, the phase and the delay are differentiated. The phase enters
 every cell's weights as the one factor ``exp(i (phase[a1] - phase[a2]))``, so
 its tangent turns the pair's product by ``i`` and its cotangent is
-``-Im(g V)`` on ``a1`` and ``+Im(g V)`` on ``a2``, summed over the sources and
-fine channels. The delay's orders move the angles of the closed form (the
-centre phase, the winding, the curvature and the cubic), and the weights'
-derivative in each is the weights of a higher order, so the delay's derivative
-is the pair's product against those, turned by ``i`` the same way. Two JVP
-kernels carry the tangents: the signal alone, and the signal with the phase
-and the delay; the JVP rule binds the first whenever the phase and delay
-tangents are symbolic zeros. One transpose kernel serves both and always
-returns the phase cotangent with the signal's; the signal-only JVP drops it.
-The delay's derivative needs three further weight orders, so the full JVP and
-the transpose form it only under their static ``delay_grad``, which the JVP
-rule sets when the delay tangent is not a symbolic zero. The transpose rule
-clears it when that tangent is a constant of the transposed map, and the
-transpose's dead-code elimination rule clears it when the delay cotangent is
-unused. The integration
-interval and the tables are constants: :meth:`RFIAnalyticVisOp.eval` stops
-their gradients.
+``-Im(sum_ij g_ij V_ij)`` on ``a1`` and the opposite on ``a2``, summed over
+the sources and fine channels. The delay's orders move the angles of the
+closed form (the centre phase, the winding, the curvature and the cubic), and
+the weights' derivative in each is the weights of a higher order, so the
+delay's derivative is the pair's product against those, turned by ``i`` the
+same way. Two JVP kernels carry the tangents: the signal alone, and the signal
+with the phase and the delay; the JVP rule binds the first whenever the phase
+and delay tangents are symbolic zeros. One transpose kernel serves both and
+always returns the phase cotangent with the signal's; the signal-only JVP
+drops it. The delay's derivative needs three further weight orders, so the
+full JVP and the transpose form it only under their static ``delay_grad``,
+which the JVP rule sets when the delay tangent is not a symbolic zero. The
+transpose rule clears it when that tangent is a constant of the transposed
+map, and the transpose's dead-code elimination rule clears it when the delay
+cotangent is unused. The integration interval and the tables are constants:
+:meth:`RFIAnalyticVisOp.eval` stops their gradients.
 """
 
 from functools import partial
@@ -50,8 +55,8 @@ from .rfi_vis_op import (
 #: the two have to be changed together.
 TILE = 32
 
-#: The default bound, in MiB, on the GPU coefficient scratch; see ``scratch_mb``
-#: in :meth:`RFIAnalyticVisOp.eval`.
+#: The default target, in MiB, for the GPU coefficient scratch; see
+#: ``scratch_mb`` in :meth:`RFIAnalyticVisOp.eval`.
 SCRATCH_MB = 256
 
 # The largest scratch_mb whose byte count fits in int64.
@@ -91,7 +96,7 @@ def tile_pair_list(n_ant, a1, a2):
 
 
 class RFIAnalyticVisOp:
-    """RFI visibility from amplitude coefficients and analytic phase moments.
+    """Polarised RFI visibility from two-column factors and analytic phase moments.
 
     amp, phase and the delay are differentiated; the integration interval
     and tables are constants. The recurrence has no time sample axis or
@@ -137,10 +142,17 @@ class RFIAnalyticVisOp:
     def eval(self, amp, phase, delay_us, w_freq, start_freq, g_time,
              start_time, dnu_mhz, int_time, freq_mhz, *, segments=2, terms=6,
              cubic_terms=3, scratch_mb=SCRATCH_MB):
-        """Return complex (n_bl, n_freq, n_time) visibilities.
+        """Return complex (n_bl, n_freq, n_time, P, P) visibilities.
 
-        amp and phase have shape (n_ant, n_rfi, n_freq, n_time); delay_us
-        is (n_ant, n_rfi, n_time, n_path), with delay derivatives in us/s^k.
+        amp has shape (n_ant, n_rfi, n_freq, n_time, P, 2): per receiver
+        (P is 1 or 2), the two latent columns of the signal factor; pad a
+        rank-one signal with a zero second column. The result for baseline
+        (p, q) is ``sum_rfi sum_c amp[p,...,i,c] conj(amp[q,...,j,c])``
+        integrated over the cell: P=1 gives one correlation such as XX, P=2
+        ``[[XX, XY], [YX, YY]]``. A reversed baseline is its conjugate
+        transpose. phase has shape (n_ant, n_rfi, n_freq, n_time), shared by
+        every matrix entry; delay_us is (n_ant, n_rfi, n_time, n_path), with
+        delay derivatives in us/s^k.
         phase holds the reduced centre phase, computed in float64 before
         casting. All three are differentiated, the delay in the orders the
         closed form carries (below); everything after delay_us is a constant.
@@ -163,11 +175,13 @@ class RFIAnalyticVisOp:
         the reference's more conservative configuration. Coefficient counts
         up to 9, terms up to 32 and cubic_terms up to 8 are supported.
 
-        scratch_mb bounds the GPU coefficient scratch in MiB; the CPU ignores
-        it. The GPU kernels chunk over time, and over frequency when one time
-        cell does not fit, so a smaller budget costs more launches and, in the
-        transposes, more passes over the cotangent. A budget below one cell and
-        channel fails at run time.
+        scratch_mb is the target size of the GPU coefficient scratch in MiB;
+        the CPU ignores it. The GPU kernels chunk over time, and over frequency
+        when one time cell does not fit, so a smaller budget costs more
+        launches and, in the transposes, more passes over the cotangent. When
+        even one channel of one cell does not fit beside the transpose's
+        frequency-complete phase and delay partials, the kernels take that
+        minimum instead, so scratch_mb is exceeded rather than failing.
         """
         _validate_options(segments=segments, terms=terms, cubic_terms=cubic_terms,
                           scratch_mb=scratch_mb)
@@ -238,11 +252,15 @@ def _validate(amp, phase, delay, w_freq, start_freq, g_time, start_time, dnu, in
     for name, x in (("start_freq", start_freq), ("start_time", start_time)):
         if jnp.dtype(x.dtype) != jnp.int32:
             raise TypeError(f"RFI analytic kernels require int32 {name}; got {x.dtype}.")
-    if len(amp.shape) != 4:
-        raise ValueError(f"Expected a rank-4 signal (n_ant, n_rfi, n_freq, n_time); got {amp.shape}")
-    n_ant, n_rfi, n_freq, n_time = amp.shape
+    if len(amp.shape) != 6 or amp.shape[4] not in (1, 2) or amp.shape[5] != 2:
+        hint = " (pad a scalar signal to (..., 1, 2) with a zero second column)" if len(amp.shape) == 4 else ""
+        raise ValueError(
+            f"Expected a signal of shape (n_ant, n_rfi, n_freq, n_time, P, 2) with P 1 or 2; "
+            f"got {amp.shape}{hint}"
+        )
+    n_ant, n_rfi, n_freq, n_time = amp.shape[:4]
     expected = {
-        "phase": amp.shape,
+        "phase": amp.shape[:4],
         "delay_us": (n_ant, n_rfi, n_time, delay.shape[-1] if len(delay.shape) == 4 else -1),
         "w_freq": (n_freq, w_freq.shape[1] if len(w_freq.shape) == 3 else -1, len(dnu.shape) == 1 and dnu.shape[0]),
         "start_freq": (n_freq,),
@@ -266,7 +284,7 @@ def _validate(amp, phase, delay, w_freq, start_freq, g_time, start_time, dnu, in
         raise ValueError("dnu_mhz must be a nonempty vector")
     if not 1 <= g_time.shape[2] <= 9:
         raise ValueError("g_time supports 1 through 9 monomial coefficients")
-    if min(amp.shape) < 1:
+    if min(amp.shape[:4]) < 1:
         raise ValueError("The signal axes must be nonempty")
     return suffix
 
@@ -285,7 +303,8 @@ def _validate_like(name, primal, other):
 
 
 def _output_aval(a1, amp):
-    return ShapedArray((a1.shape[0], amp.shape[2], amp.shape[3]), amp.dtype)
+    n_pol = amp.shape[4]
+    return ShapedArray((a1.shape[0], amp.shape[2], amp.shape[3], n_pol, n_pol), amp.dtype)
 
 
 def _validate_indices(args):
