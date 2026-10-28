@@ -345,10 +345,12 @@ def _full_transpose_abstract(*args, **options):
 rfi_analytic_full_transpose_op.def_abstract_eval(_full_transpose_abstract)
 
 
-def _full_transpose_dce(used_outputs, eqn):
+def _full_transpose_dce(used_outputs, *args):
     # Dead-code elimination (jit runs it before lowering): drop the delay's
     # cotangent when nothing reads it, as when only the signal's and the
-    # phase's gradients are kept.
+    # phase's gradients are kept. JAX 0.12 added a `live_ins` argument before
+    # `eqn`; taking the last argument supports both signatures.
+    eqn = args[-1]
     if not any(used_outputs):
         return [False] * len(eqn.invars), None
     if eqn.params["delay_grad"] and not used_outputs[2]:
