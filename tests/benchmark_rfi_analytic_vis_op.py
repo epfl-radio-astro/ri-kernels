@@ -8,7 +8,6 @@ for the scientific accuracy and end-to-end optimisation comparison.
 import argparse
 import json
 import time
-from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -16,8 +15,8 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-from test_rfi_analytic_vis_op import make_inputs, make_baselines, reference
-from ri_kernels.jax_api import RFIAnalyticVisOp
+from test_rfi_analytic_vis_op import make_inputs, make_baselines
+from ri_kernels.jax_api import RFIAnalyticVisOp, RFIAnalyticVisOpRef
 
 
 def main():
@@ -45,17 +44,12 @@ def main():
             a1, a2 = make_baselines(na, autocorr=False)
             operators = [("analytic", RFIAnalyticVisOp(na, a1, a2), make_inputs(real, complex_, **shape))]
             if options.with_reference:
-                operators.append(("jax-analytic", None, make_inputs(real, complex_, **shape)))
+                operators.append(("jax-analytic", RFIAnalyticVisOpRef(na, a1, a2),
+                                  make_inputs(real, complex_, **shape)))
             for name, op, args in operators:
-                if op is None:
-                    ref = partial(reference, a1=a1, a2=a2, segments=2, terms=6, cubic_terms=3)
-                    fn = lambda a: ref(a, *args[1:])
-                    fn2 = lambda a, p: ref(a, p, *args[2:])
-                    fn3 = lambda a, p, d: ref(a, p, d, *args[3:])
-                else:
-                    fn = lambda a: op.eval(a, *args[1:])
-                    fn2 = lambda a, p: op.eval(a, p, *args[2:])
-                    fn3 = lambda a, p, d: op.eval(a, p, d, *args[3:])
+                fn = lambda a: op.eval(a, *args[1:])
+                fn2 = lambda a, p: op.eval(a, p, *args[2:])
+                fn3 = lambda a, p, d: op.eval(a, p, d, *args[3:])
                 tangent = jnp.full_like(args[0], .3 + .7j)
                 phase_tangent = jnp.full_like(args[1], .1)
                 delay_tangent = jnp.full_like(args[2], 1e-3)

@@ -33,7 +33,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: pipx run build --sdist
+      # The build requirements pin jax==0.6.0, whose jaxlib ships cp310-cp313
+      # wheels only; the runner's default Python can be newer. Use the version
+      # the wheels are built for.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install build
+          python -m build --sdist
       - uses: actions/upload-artifact@v4
         with:
           name: sdist-ri_kernels

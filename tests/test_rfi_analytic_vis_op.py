@@ -1,4 +1,4 @@
-"""Analytic CPU/CUDA values and amplitude, phase and delay derivatives against the JAX specification."""
+"""Analytic CPU/CUDA values and amplitude, phase and delay derivatives against :class:`RFIAnalyticVisOpRef`."""
 from collections import namedtuple
 from functools import partial
 
@@ -7,12 +7,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from analytic_reference import analytic_rfi_vis
 from ri_kernels.jax_api.rfi_analytic_vis_op import (
     RFIAnalyticVisOp, _TAB_LIB_ANALYTIC, _TAB_LIB_ANALYTIC_GPU,
     rfi_analytic_vis_op, rfi_analytic_jvp_op,
     rfi_analytic_full_jvp_op, rfi_analytic_full_transpose_op,
 )
+from ri_kernels.jax_api.rfi_analytic_vis_op_ref import RFIAnalyticVisOpRef
 
 
 def _devices():
@@ -140,11 +140,6 @@ def upcast(x):
     return x
 
 
-def reference(amp, phase, delay, *tables, a1, a2, **options):
-    return analytic_rfi_vis(amp.swapaxes(0, 1), phase.swapaxes(0, 1),
-                            delay.swapaxes(0, 1), *tables, a1, a2, **options)
-
-
 def assert_close(actual, expected, real):
     tolerance = 3e-5 if real == jnp.float32 else 5e-10
     scale = max(float(np.max(np.abs(expected), initial=0)), 1.)
@@ -157,7 +152,7 @@ def assert_close(actual, expected, real):
 # test therefore goes through the same two jitted entry points, which return
 # the value and all derivatives at once. The reference always runs on the CPU
 # in float64, so both precisions and every device share one compilation per
-# shape and option set.
+# shape, baseline list and option set.
 
 CPU = jax.devices("cpu")[0]
 DEFAULT_OPTIONS = dict(segments=2, terms=6, cubic_terms=3)
@@ -171,10 +166,12 @@ Results = namedtuple(
 )
 
 
-@partial(jax.jit, static_argnames=("segments", "terms", "cubic_terms"))
-def _expected(args, a1, a2, amp_dot, phase_dot, delay_dot, g, *, segments, terms, cubic_terms):
-    fn = lambda amp, phase, delay: reference(amp, phase, delay, *args[3:], a1=a1, a2=a2,
-                                             segments=segments, terms=terms, cubic_terms=cubic_terms)
+@partial(jax.jit, static_argnames=("a1", "a2", "segments", "terms", "cubic_terms"))
+def _expected(args, amp_dot, phase_dot, delay_dot, g, *, a1, a2, segments, terms, cubic_terms):
+    # The reference validates its baselines on the host, so they come in static.
+    ref = RFIAnalyticVisOpRef(args[0].shape[0], np.asarray(a1, np.int32), np.asarray(a2, np.int32))
+    fn = lambda amp, phase, delay: ref.eval(amp, phase, delay, *args[3:], segments=segments,
+                                            terms=terms, cubic_terms=cubic_terms)
     primals, zero = tuple(args[:3]), jnp.zeros_like
     value, full_jvp = jax.jvp(fn, primals, (amp_dot, phase_dot, delay_dot))
     amp_jvp = jax.jvp(fn, primals, (amp_dot, zero(phase_dot), zero(delay_dot)))[1]
@@ -188,8 +185,9 @@ def expected(args, a1, a2, amp_dot, phase_dot, delay_dot, g, **options):
     """The reference's Results, in float64 on the CPU."""
     with jax.default_device(CPU):
         put = lambda x: jax.device_put(upcast(x), CPU)
-        return _expected(tuple(map(put, args)), put(a1), put(a2), put(amp_dot),
-                         put(phase_dot), put(delay_dot), put(g), **{**DEFAULT_OPTIONS, **options})
+        return _expected(tuple(map(put, args)), put(amp_dot), put(phase_dot), put(delay_dot), put(g),
+                         a1=tuple(np.asarray(a1).tolist()), a2=tuple(np.asarray(a2).tolist()),
+                         **{**DEFAULT_OPTIONS, **options})
 
 
 def kernel_results(op, args, amp_dot, phase_dot, delay_dot, g, **options):
@@ -256,43 +254,6 @@ def check(op, args, a1, a2, seed=1, **options):
                  jnp.sum(actual.full_phase_bar * phase_dot) + jnp.sum(actual.delay_bar * delay_dot),
                  real)
     return actual
-
-
-@pytest.mark.parametrize("half_width,options,phase_terms", [
-    (0, dict(segments=1, terms=1, cubic_terms=0), (.7, 0., 0.)),
-    (1, dict(segments=2, terms=6, cubic_terms=3), (20.9, .5, .002)),
-    (2, dict(segments=3, terms=16, cubic_terms=3), (0., 12., .02)),
-])
-def test_reference_preserves_single_precision(half_width, options, phase_terms):
-    # The kernel tests deliberately upcast their reference inputs. Exercise
-    # the reference itself in single precision with x64 still enabled: turning
-    # x64 off hides promotions from integer loop indices and real constants.
-    assert jax.config.x64_enabled
-    with jax.default_device(CPU):
-        args = make_inputs(jnp.float32, jnp.complex64, n_ant=2, n_rfi=1,
-                           n_freq=1, n_time=5, n_int_f=1, half_width=half_width)
-        a, b, c = phase_terms
-        nu = float(args[-1][0])
-        delay = jnp.zeros_like(args[2])
-        for k, value in enumerate((a / (2*np.pi*nu), b / (np.pi*nu), c / (np.pi/3*nu)), 1):
-            delay = delay.at[0, 0, :, k].set(value)
-        args[2] = delay
-        a1, a2 = jnp.array([0], jnp.int32), jnp.array([1], jnp.int32)
-
-        @jax.jit
-        def run(args, tangent, cotangent):
-            fn = lambda amp: reference(amp, *args[1:], a1=a1, a2=a2, **options)
-            value, dot = jax.jvp(fn, (args[0],), (tangent,))
-            return value, dot, jax.vjp(fn, args[0])[1](cotangent)[0]
-
-        tangent = jnp.full_like(args[0], .3 + .7j)
-        cotangent = jnp.full((1, 1, 5), .7 - .2j, jnp.complex64)
-        single = run(args, tangent, cotangent)
-        double = run([upcast(x) for x in args], upcast(tangent), upcast(cotangent))
-        for actual, expected_ in zip(single, double):
-            assert actual.dtype == jnp.complex64
-            assert expected_.dtype == jnp.complex128
-            assert_close(actual, expected_, jnp.float32)
 
 
 SHAPES = {

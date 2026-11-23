@@ -1,10 +1,10 @@
 """Tests for :class:`ri_kernels.rfi_vis_op.RFIVisOp`.
 
-The FFI kernels are checked against a plain JAX implementation of the same
-computation (``ref_rfi_vis_kernel``): direct evaluation, the JVP (forward mode)
-and the VJP (reverse mode, i.e. the transpose kernel). JAX differentiates the
-reference automatically, so the same call produces both the expected value and
-the expected derivatives.
+The FFI kernels are checked against :class:`RFIVisOpRef`, the plain JAX
+implementation of the same computation: direct evaluation, the JVP (forward
+mode) and the VJP (reverse mode, i.e. the transpose kernel). JAX
+differentiates the reference automatically, so the same call produces both
+the expected value and the expected derivatives.
 """
 
 from collections import namedtuple
@@ -16,24 +16,7 @@ import pytest
 
 from ri_kernels.jax_api import rfi_vis_op as rfi_vis_op_module
 from ri_kernels.jax_api.rfi_vis_op import RFIVisOp, prepare_indices
-
-
-def ref_rfi_vis_kernel(rfi_amp_fine, rfi_phase, a1, a2):
-    """Reference RFI visibility computation in pure JAX.
-
-    ``rfi_amp_fine`` / ``rfi_phase`` have shape
-    ``(n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time)``. The RFI sources
-    are summed coherently and the sub-integration samples are averaged, giving
-    ``(n_bl, n_freq, n_time)``.
-    """
-    vis_rfi_fine = jnp.sum(
-        rfi_amp_fine[a1]
-        * jnp.conjugate(rfi_amp_fine[a2])
-        * jnp.exp(1.0j * (rfi_phase[a1] - rfi_phase[a2])),
-        axis=3,
-    )
-    # (n_bl, n_freq, n_time, n_int_freq, n_int_time) -> (n_bl, n_freq, n_time)
-    return jnp.mean(vis_rfi_fine, axis=(3, 4))
+from ri_kernels.jax_api.rfi_vis_op_ref import RFIVisOpRef
 
 
 # --- Test parameters ---------------------------------------------------------
@@ -164,12 +147,13 @@ def test_eval_matches_reference(device, precision, shape):
     a1, a2 = make_baselines(shape.n_ant)
     amp, phase = make_signal(shape, precision)
     op = RFIVisOp(shape.n_ant, a1, a2)
+    ref = RFIVisOpRef(shape.n_ant, a1, a2)
 
     vis = op.eval(amp, phase)
 
     assert vis.shape == (len(a1), shape.n_freq, shape.n_time)
     assert vis.dtype == precision.complex
-    assert_close(vis, ref_rfi_vis_kernel(amp, phase, a1, a2), precision)
+    assert_close(vis, ref.eval(amp, phase), precision)
 
 
 @BASELINE_LAYOUTS
@@ -179,8 +163,9 @@ def test_eval_baseline_layouts(device, precision, auto_corr, shuffle):
     a1, a2 = make_baselines(shape.n_ant, auto_corr=auto_corr, shuffle=shuffle)
     amp, phase = make_signal(shape, precision)
     op = RFIVisOp(shape.n_ant, a1, a2)
+    ref = RFIVisOpRef(shape.n_ant, a1, a2)
 
-    assert_close(op.eval(amp, phase), ref_rfi_vis_kernel(amp, phase, a1, a2), precision)
+    assert_close(op.eval(amp, phase), ref.eval(amp, phase), precision)
 
 
 def test_eval_under_jit(device, precision):
@@ -226,13 +211,10 @@ def test_jvp_matches_reference(device, precision):
     amp, phase = make_signal(shape, precision)
     amp_dot, phase_dot = make_signal(shape, precision, seed=1)
     op = RFIVisOp(shape.n_ant, a1, a2)
+    ref = RFIVisOpRef(shape.n_ant, a1, a2)
 
     vis, vis_dot = jax.jvp(op.eval, (amp, phase), (amp_dot, phase_dot))
-    ref_vis, ref_vis_dot = jax.jvp(
-        lambda a, p: ref_rfi_vis_kernel(a, p, a1, a2),
-        (amp, phase),
-        (amp_dot, phase_dot),
-    )
+    ref_vis, ref_vis_dot = jax.jvp(ref.eval, (amp, phase), (amp_dot, phase_dot))
 
     assert_close(vis, ref_vis, precision, "primal")
     assert_close(vis_dot, ref_vis_dot, precision, "tangent")
@@ -246,14 +228,15 @@ def test_jvp_single_argument(device, precision, wrt):
     amp, phase = make_signal(shape, precision)
     amp_dot, phase_dot = make_signal(shape, precision, seed=1)
     op = RFIVisOp(shape.n_ant, a1, a2)
+    ref = RFIVisOpRef(shape.n_ant, a1, a2)
 
     if wrt == "amp":
         fun = lambda a: op.eval(a, phase)  # noqa: E731
-        ref_fun = lambda a: ref_rfi_vis_kernel(a, phase, a1, a2)  # noqa: E731
+        ref_fun = lambda a: ref.eval(a, phase)  # noqa: E731
         primal, tangent = amp, amp_dot
     else:
         fun = lambda p: op.eval(amp, p)  # noqa: E731
-        ref_fun = lambda p: ref_rfi_vis_kernel(amp, p, a1, a2)  # noqa: E731
+        ref_fun = lambda p: ref.eval(amp, p)  # noqa: E731
         primal, tangent = phase, phase_dot
 
     vis, vis_dot = jax.jvp(fun, (primal,), (tangent,))
@@ -270,13 +253,10 @@ def test_jvp_baseline_layouts(device, precision, auto_corr, shuffle):
     amp, phase = make_signal(shape, precision)
     amp_dot, phase_dot = make_signal(shape, precision, seed=1)
     op = RFIVisOp(shape.n_ant, a1, a2)
+    ref = RFIVisOpRef(shape.n_ant, a1, a2)
 
     _, vis_dot = jax.jvp(op.eval, (amp, phase), (amp_dot, phase_dot))
-    _, ref_vis_dot = jax.jvp(
-        lambda a, p: ref_rfi_vis_kernel(a, p, a1, a2),
-        (amp, phase),
-        (amp_dot, phase_dot),
-    )
+    _, ref_vis_dot = jax.jvp(ref.eval, (amp, phase), (amp_dot, phase_dot))
 
     assert_close(vis_dot, ref_vis_dot, precision, "tangent")
 
@@ -318,14 +298,13 @@ def test_vjp_matches_reference(device, precision):
     a1, a2 = make_baselines(shape.n_ant)
     amp, phase = make_signal(shape, precision)
     op = RFIVisOp(shape.n_ant, a1, a2)
+    ref = RFIVisOpRef(shape.n_ant, a1, a2)
     cotangent = make_cotangent(shape, len(a1), precision, seed=2)
 
     vis, vjp_fun = jax.vjp(op.eval, amp, phase)
     amp_bar, phase_bar = vjp_fun(cotangent)
 
-    ref_vis, ref_vjp_fun = jax.vjp(
-        lambda a, p: ref_rfi_vis_kernel(a, p, a1, a2), amp, phase
-    )
+    ref_vis, ref_vjp_fun = jax.vjp(ref.eval, amp, phase)
     ref_amp_bar, ref_phase_bar = ref_vjp_fun(cotangent)
 
     assert_close(vis, ref_vis, precision, "primal")
@@ -340,10 +319,11 @@ def test_vjp_baseline_layouts(device, precision, auto_corr, shuffle):
     a1, a2 = make_baselines(shape.n_ant, auto_corr=auto_corr, shuffle=shuffle)
     amp, phase = make_signal(shape, precision)
     op = RFIVisOp(shape.n_ant, a1, a2)
+    ref = RFIVisOpRef(shape.n_ant, a1, a2)
     cotangent = make_cotangent(shape, len(a1), precision, seed=2)
 
     _, vjp_fun = jax.vjp(op.eval, amp, phase)
-    _, ref_vjp_fun = jax.vjp(lambda a, p: ref_rfi_vis_kernel(a, p, a1, a2), amp, phase)
+    _, ref_vjp_fun = jax.vjp(ref.eval, amp, phase)
 
     amp_bar, phase_bar = vjp_fun(cotangent)
     ref_amp_bar, ref_phase_bar = ref_vjp_fun(cotangent)
@@ -374,14 +354,13 @@ def test_grad_of_real_loss(device, precision, shape):
     a1, a2 = make_baselines(shape.n_ant)
     amp, phase = make_signal(shape, precision)
     op = RFIVisOp(shape.n_ant, a1, a2)
+    ref = RFIVisOpRef(shape.n_ant, a1, a2)
 
     def loss(fun):
         return lambda a, p: jnp.sum(jnp.abs(fun(a, p)) ** 2)
 
     amp_bar, phase_bar = jax.grad(loss(op.eval), argnums=(0, 1))(amp, phase)
-    ref_amp_bar, ref_phase_bar = jax.grad(
-        loss(lambda a, p: ref_rfi_vis_kernel(a, p, a1, a2)), argnums=(0, 1)
-    )(amp, phase)
+    ref_amp_bar, ref_phase_bar = jax.grad(loss(ref.eval), argnums=(0, 1))(amp, phase)
 
     assert_close(amp_bar, ref_amp_bar, precision, "d(loss)/d(rfi_amp_fine)")
     assert_close(phase_bar, ref_phase_bar, precision, "d(loss)/d(rfi_phase)")
