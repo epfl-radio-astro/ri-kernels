@@ -202,3 +202,23 @@ optimisation with the production SKA-Low data. Inspect ptxas register/spill
 reports and Nsight local-memory traffic for the default specialisation before
 interpreting its speedup. CUDA compilation, device tests and performance need
 the GPU host; CPU tests do not establish those results.
+
+## Pure JAX references
+
+`RFIVisOpRef` and `RFIAnalyticVisOpRef` compute the same visibilities as
+`RFIVisOp` and `RFIAnalyticVisOp` in plain JAX, with the same constructor and
+`eval` signature, so either can stand in for its kernel:
+
+```python
+from ri_kernels.jax_api import RFIAnalyticVisOpRef
+
+vis = RFIAnalyticVisOpRef(n_ant, a1, a2).eval(amp, phase, delay_us, ...)
+```
+
+JAX differentiates them directly and they need no FFI library, but they
+materialise every baseline at once (the analytic one cell at a time), so they
+are meant for checking the kernels and for small problems. The analytic
+reference accepts `scratch_mb` and ignores it, and does not apply the kernels'
+limits on coefficient counts and series lengths. The kernel tests check
+against these references, and `tests/test_*_ref.py` check the references
+themselves against a direct sum and brute-force quadrature.
