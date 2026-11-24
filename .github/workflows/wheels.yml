@@ -36,7 +36,7 @@ jobs:
       # The build requirements pin jax==0.6.0, whose jaxlib ships cp310-cp313
       # wheels only; the runner's default Python can be newer. Use the version
       # the wheels are built for.
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
       - run: |
