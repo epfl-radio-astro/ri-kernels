@@ -185,7 +185,7 @@ RI_ANALYTIC_INLINE void analytic_linear(double a, int requested, Cplx<W> *values
     for (int j = 0; j <= degree; ++j) {
       const int m = degree + 1 - j;
       const Cplx<W> boundary = (m & 1) ? Cplx<W>{e.re, 0} : Cplx<W>{0, e.im};
-      last = cscale(W(1. / m), cadd(boundary, cscale(-aw, ctimes_i(last))));
+      last = cscale(W(1) / W(m), cadd(boundary, cscale(-aw, ctimes_i(last))));
       values[m - 1] = last;
     }
   }
@@ -193,7 +193,7 @@ RI_ANALYTIC_INLINE void analytic_linear(double a, int requested, Cplx<W> *values
   // body would otherwise weigh one double compare per order, and those go
   // down the one pipe a consumer card is short of.
   const int ascent = !(aa < degree) ? degree : int(aa);
-  Cplx<W> last{a == 0 ? W(1) : e.im / aw, 0};
+  Cplx<W> last{aw == W(0) ? W(1) : e.im / aw, 0};
   values[0] = last;
   RI_ANALYTIC_UNROLL
   for (int m = 1; m <= degree; ++m) {

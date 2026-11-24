@@ -1,12 +1,15 @@
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 
-# Parse version from pyproject.toml
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/pyproject.toml" PYPROJECT_TOML)
-string(REGEX MATCH "\nversion = \"([^\"]+)\"" _ "${PYPROJECT_TOML}")
-set(RI_KERNELS_VERSION "${CMAKE_MATCH_1}")
+# Use scikit-build-core's version when available, falling back to pyproject.toml.
+if(DEFINED SKBUILD_PROJECT_VERSION)
+	set(RI_KERNELS_VERSION "${SKBUILD_PROJECT_VERSION}")
+else()
+	file(READ "${CMAKE_CURRENT_SOURCE_DIR}/pyproject.toml" PYPROJECT_TOML)
+	string(REGEX MATCH "\r?\nversion[ \t]*=[ \t]*\"([^\"]+)\"" _ "${PYPROJECT_TOML}")
+	set(RI_KERNELS_VERSION "${CMAKE_MATCH_1}")
+endif()
 
 project(ri_kernels LANGUAGES CXX VERSION "${RI_KERNELS_VERSION}")
-set(RI_KERNELS_SO_VERSION ${CMAKE_PROJECT_VERSION_MAJOR})
 
 
 # set default build type to RELEASE
@@ -19,8 +22,11 @@ endif()
 
 # set language and standard
 set(CMAKE_CXX_STANDARD 20)
-set(CUDA_STANDARD 20)
-set(CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_HIP_STANDARD 20)
+set(CMAKE_HIP_STANDARD_REQUIRED ON)
 
 include(CMakeDependentOption)
 include(FetchContent)
@@ -61,7 +67,11 @@ option(RI_KERNELS_STATIC_CUDART "Link the CUDA runtime statically" ON)
 
 option(RI_KERNELS_BUNDLED_LIBS "Use all bundled libraries" ON)
 cmake_dependent_option(RI_KERNELS_BUNDLED_HIGHWAY "Use bundled highway lib" ON "RI_KERNELS_BUNDLED_LIBS" OFF)
-option(RI_KERNELS_MULTI_ARCH "Build kernels for multiple CPU architectues with dynamic dispatch. When disabled, arch flags should be set through CMAKE_CXX_FLAGS." ON)
+option(RI_KERNELS_MULTI_ARCH "Build kernels for multiple CPU architectures with dynamic dispatch. When disabled, arch flags should be set through CMAKE_CXX_FLAGS." ON)
+
+if(RI_KERNELS_CUDA AND RI_KERNELS_ROCM)
+	message(FATAL_ERROR "RI_KERNELS_CUDA and RI_KERNELS_ROCM cannot be enabled simultaneously.")
+endif()
 
 # Directory inside the wheel the GPU libraries are installed into. The CPU
 # library always ships in the ri_kernels package, but the GPU libraries are
@@ -73,7 +83,9 @@ set(RI_KERNELS_GPU_INSTALL_DIR "ri_kernels" CACHE STRING
 set(CMAKE_CUDA_ARCHITECTURES "75-real;80-real;90-real;90-virtual" CACHE STRING "CUDA Architectures")
 set(CMAKE_HIP_ARCHITECTURES "gfx90a;gfx942;gfx1030;gfx1100" CACHE STRING "HIP Architectures")
 
-set(Python_EXECUTABLE "python3" CACHE STRING "The python interpreter")
+if(NOT Python_EXECUTABLE)
+	find_package(Python COMPONENTS Interpreter REQUIRED)
+endif()
 
 # Detect jaxlib include directory (override with -DJAXLIB_HOME=...)
 if(NOT DEFINED JAXLIB_HOME)
@@ -85,7 +97,7 @@ if(NOT DEFINED JAXLIB_HOME)
 		RESULT_VARIABLE _jaxlib_result
 	)
 	if(NOT _jaxlib_result EQUAL 0)
-		message(FATAL_ERROR "Failed to locate jaxlib via python3. "
+		message(FATAL_ERROR "Failed to locate jaxlib via ${Python_EXECUTABLE}. "
 			"Install jaxlib or pass -DJAXLIB_HOME=<path>.")
 	endif()
 endif()
@@ -123,11 +135,10 @@ if(RI_KERNELS_CPU)
 	set(HWY_ENABLE_INSTALL OFF CACHE BOOL "")
 	set(HWY_ENABLE_TESTS OFF CACHE BOOL "")
 	set(HWY_FORCE_STATIC_LIBS ON CACHE BOOL "")
-	set(HWY_ENABLE_CONTRIB ON CACHE BOOL "")
 	FetchContent_Declare(
 	  hwy
 	  URL https://github.com/google/highway/archive/refs/tags/1.4.0.tar.gz
-	  URL_MD5 9d335797777e17f827c7980b8313a34b
+	  URL_HASH SHA256=e72241ac9524bb653ae52ced768b508045d4438726a303f10181a38f764a453c
 	)
 	FetchContent_MakeAvailable(hwy)
 	if(NOT TARGET hwy::hwy)
@@ -151,7 +162,6 @@ if(RI_KERNELS_CUDA)
   set_source_files_properties(${RI_KERNELS_GPU_SOURCES} PROPERTIES LANGUAGE CUDA)
 
   add_library(ri_kernels_cuda SHARED ${RI_KERNELS_GPU_SOURCES})
-  # set_target_properties(ri_kernels_cuda PROPERTIES OUTPUT_NAME "ri_kernels_cuda_${CUDAToolkit_VERSION_MAJOR}")
   target_include_directories(ri_kernels_cuda PRIVATE ${JAXLIB_HOME}/include ./src)
   if(RI_KERNELS_STATIC_CUDART)
     set_property(TARGET ri_kernels_cuda PROPERTY CUDA_RUNTIME_LIBRARY Static)

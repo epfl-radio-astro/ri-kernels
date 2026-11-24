@@ -22,6 +22,8 @@ namespace gpu {
 // kAnalyticTile, the antennas per tile, comes from rfi_analytic_base.hpp: it
 // has to match the tile-pair list the Python op builds.
 constexpr int kAnalyticBlock = 128;
+static_assert(kAnalyticTilePairs % kAnalyticBlock == 0,
+              "kAnalyticTilePairs must be a multiple of kAnalyticBlock");
 // The delay orders the closed form carries: tau and its first three
 // derivatives, whatever longer path the caller hands in.
 constexpr int kAnalyticOrders = kAnalyticDelayOrders;
@@ -380,7 +382,11 @@ ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scrat
     return ffi::Error::InvalidArgument("Analytic phase cotangent size exceeds the 64-bit byte range");
   // Without Delay the transpose's delay cotangent is zero.
   if (Transpose && !Delay) {
-    auto error = cudaMemsetAsync(delay_output, 0, sizeof(T) * na * nr * nt * npath, stream);
+    std::int64_t delay_bytes = 0;
+    if (!analytic_checked_product({std::int64_t(sizeof(T)), na, nr, nt, npath}, delay_bytes) ||
+        std::uint64_t(delay_bytes) > std::numeric_limits<std::size_t>::max())
+      return ffi::Error::InvalidArgument("Analytic delay cotangent size exceeds the 64-bit byte range");
+    auto error = cudaMemsetAsync(delay_output, 0, std::size_t(delay_bytes), stream);
     if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));
   }
   const std::int64_t buffers = Transpose ? 1 + ntiles : JVP ? 2 : 1;
@@ -397,7 +403,10 @@ ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scrat
   const std::size_t shared = sizeof(Cplx<T>) * nm * kAnalyticTile * (Mode ? 4 : 2) +
                             sizeof(T) * 2 * kAnalyticTile *
                                 (kAnalyticOrders + 1 + (Phase ? 1 : 0) + (Delay ? kAnalyticOrders : 0));
-  if (shared > get_device_prop().sharedMemPerBlock) return ffi::Error::Internal("Analytic tiles exceed shared memory limit");
+  DeviceLimits limits;
+  if (auto err = get_device_limits(limits); err != cudaSuccess)
+    return ffi::Error::Internal(std::string("GPU device query error: ") + cudaGetErrorString(err));
+  if (shared > limits.shared_mem_per_block) return ffi::Error::Internal("Analytic tiles exceed shared memory limit");
   Tensor3D<Cplx<T> *> out(output, v.a1.shape[0], nf, nt);
   Tensor3D<const Cplx<T> *> cot(cotangent, v.a1.shape[0], nf, nt);
   Tensor4D<Cplx<T> *> bar(output, na, nr, nf, nt);
@@ -407,29 +416,29 @@ ffi::Error analytic_gpu_launch(cudaStream_t stream, ffi::ScratchAllocator &scrat
     for (std::int64_t f0 = 0; f0 < nf; f0 += plan.n_fc) {
       const AnalyticCellChunk<std::int64_t> chunk{t0, std::min(plan.n_tc, nt - t0), f0, std::min(plan.n_fc, nf - f0)};
       const auto work = chunk.n_tc * chunk.n_fc * per_cell / sizeof(Cplx<T>);
-      const auto grid = create_clamped_grid(analytic_grid_extent(analytic_ceil_div(work, 128)), 1, 1);
+      const auto grid = create_clamped_grid(analytic_ceil_div(work, 128), 1, 1, limits);
       analytic_materialise<JVP><<<grid, 128, 0, stream>>>(v, s, extra, chunk);
       auto error = cudaGetLastError();
       if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));
-      const auto pair_grid = create_clamped_grid(analytic_grid_extent(chunk.n_tc * chunk.n_fc),
-                                                 analytic_grid_extent(v.tile_pairs.shape[0]), 1);
+      const auto pair_grid = create_clamped_grid(chunk.n_tc * chunk.n_fc,
+                                                 v.tile_pairs.shape[0], 1, limits);
       analytic_tiles<Default, Mode, Delay><<<pair_grid, kAnalyticBlock, shared, stream>>>(
           v, s, extra, extra, phase_partials, delay_partials, cot, out, chunk);
       error = cudaGetLastError();
       if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));
       if constexpr (Transpose) {
-        const auto gather_grid = create_clamped_grid(analytic_grid_extent(analytic_ceil_div(na * nr * nf * nt, 128)), 1, 1);
+        const auto gather_grid = create_clamped_grid(analytic_ceil_div(na * nr * nf * nt, 128), 1, 1, limits);
         analytic_gather<<<gather_grid, 128, 0, stream>>>(v, extra, bar, chunk, t0 == 0 && f0 == 0);
         error = cudaGetLastError();
         if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));
         const auto cells = chunk.n_tc * chunk.n_fc;
-        const auto phase_grid = create_clamped_grid(analytic_grid_extent(analytic_ceil_div(cells * nr * na, 128)), 1, 1);
+        const auto phase_grid = create_clamped_grid(analytic_ceil_div(cells * nr * na, 128), 1, 1, limits);
         analytic_gather_phase<<<phase_grid, 128, 0, stream>>>(v, phase_partials, phase_bar, chunk);
         error = cudaGetLastError();
         if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));
         if constexpr (Delay) {
           const auto delay_grid = create_clamped_grid(
-              analytic_grid_extent(analytic_ceil_div(chunk.n_tc * nr * na * npath, 128)), 1, 1);
+              analytic_ceil_div(chunk.n_tc * nr * na * npath, 128), 1, 1, limits);
           analytic_gather_delay<<<delay_grid, 128, 0, stream>>>(v, delay_partials, delay_bar, chunk);
           error = cudaGetLastError();
           if (error != cudaSuccess) return ffi::Error::Internal(cudaGetErrorString(error));

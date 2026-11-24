@@ -2,11 +2,6 @@
 Custom JAX primitives for RFI visibility calculation using FFI.
 """
 
-import ctypes
-import importlib.util
-import os
-import site
-import sysconfig
 from functools import partial
 
 import jax
@@ -15,54 +10,17 @@ from jax.core import ShapedArray
 from jax.extend import core
 from jax.interpreters import ad, mlir, xla
 
-class RFIVisOp:
-    """
-    Operator for computing RFI visibility using JAX FFI with precomputed indices.
-    
-    This class encapsulates the antenna baseline indexing logic required for efficient
-    RFI visibility calculations. It precomputes sorted indices and search positions
-    for both antenna arrays (a1 and a2) to enable fast lookups in the FFI kernel.
-    """
-    
-    def __init__(self, n_ant, a1, a2):
-        """
-        Initialize the RFI visibility operator with antenna baseline information.
-        
-        Args:
-            n_ant: Number of antennas in the array.
-            a1: Array of first antenna indices for each baseline (shape: [n_baselines]).
-            a2: Array of second antenna indices for each baseline (shape: [n_baselines]).
-        
-        The initialization precomputes:
-            - a1_sorter, a2_sorter: Indices that would sort the a1 and a2 arrays
-            - a1_start, a2_start: Starting positions for each antenna in the sorted arrays
-        """
-        self.a1 = a1
-        self.a2 = a2
-        self.a1_sorter = jnp.argsort(a1).astype(a1.dtype)
-        self.a2_sorter = jnp.argsort(a2).astype(a1.dtype)
-
-        v = jnp.arange(0, n_ant, dtype=a1.dtype)
-        self.a1_start = jnp.searchsorted(a1, v, sorter=self.a1_sorter)
-        self.a2_start = jnp.searchsorted(a2, v, sorter=self.a2_sorter)
-    
-    def eval(self, rfi_amp_fine, rfi_phase):
-        """
-        Evaluate the RFI visibility for given RFI amplitudes and phases.
-        
-        Args:
-            rfi_amp_fine: Fine-grained RFI amplitude array with shape
-                         (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time).
-            rfi_phase: RFI phase array with shape matching rfi_amp_fine.
-        
-        Returns:
-            Array of RFI visibilities with shape (n_baselines, n_freq, n_time).
-        """
-        return rfi_vis_op.bind(
-            self.a1, self.a1_sorter, self.a1_start,
-            self.a2, self.a2_sorter, self.a2_start,
-            rfi_amp_fine, rfi_phase
-        )
+from ._common import _dtype_suffix
+from ._lib import (
+    _TAB_LIB,
+    _TAB_LIB_CUDA,
+    _TAB_LIB_GPU as _TAB_LIB_GPU,
+    _TAB_LIB_ROCM,
+    _check_tab_lib,
+    _check_tab_lib_gpu,
+    _ffi_target,
+    _register_targets,
+)
 
 
 def prepare_indices(n_ant, a1, a2):
@@ -81,136 +39,143 @@ def prepare_indices(n_ant, a1, a2):
     a2_sorter = jnp.argsort(a2).astype(a1.dtype)
 
     v = jnp.arange(0, n_ant, dtype=a1.dtype)
-    a1_start = jnp.searchsorted(a1, v, sorter=a1_sorter)
-    a2_start = jnp.searchsorted(a2, v, sorter=a2_sorter)
+    a1_start = jnp.searchsorted(a1, v, sorter=a1_sorter).astype(a1.dtype)
+    a2_start = jnp.searchsorted(a2, v, sorter=a2_sorter).astype(a1.dtype)
 
     return (a1_sorter, a1_start, a2_sorter, a2_start)
 
 
-_DIR_PATH = os.path.dirname(os.path.realpath(__file__))
+class RFIVisOp:
+    """
+    Operator for computing RFI visibility using JAX FFI with precomputed indices.
 
-# The CPU library ships inside ri_kernels itself, while the GPU libraries come
-# from optional add-on distributions (ri_kernels_cuda12, ri_kernels_cuda13,
-# ri_kernels_rocm) that install a top-level package of their own containing
-# nothing but the shared library. Search all of them. cuda13 is probed before
-# cuda12 so that a machine with both installed picks the newer toolkit.
-_PKG_NAMES = (
-    "ri_kernels",
-    "ri_kernels_cuda13",
-    "ri_kernels_cuda12",
-    "ri_kernels_rocm",
-)
+    This class encapsulates the antenna baseline indexing logic required for efficient
+    RFI visibility calculations. It precomputes sorted indices and search positions
+    for both antenna arrays (a1 and a2) to enable fast lookups in the FFI kernel.
+    """
 
+    def __init__(self, n_ant, a1, a2):
+        """
+        Initialize the RFI visibility operator with antenna baseline information.
 
-def _site_dirs():
-    dirs = list(site.getsitepackages())
-    user_site = site.getusersitepackages()
-    if user_site:
-        dirs.append(user_site)
-    purelib = sysconfig.get_paths().get("purelib")
-    if purelib:
-        dirs.append(purelib)
-    return dirs
+        Args:
+            n_ant: Number of antennas in the array.
+            a1: Array of first antenna indices for each baseline (shape: [n_baselines]).
+            a2: Array of second antenna indices for each baseline (shape: [n_baselines]).
 
+        The initialization precomputes:
+            - a1_sorter, a2_sorter: Indices that would sort the a1 and a2 arrays
+            - a1_start, a2_start: Starting positions for each antenna in the sorted arrays
+        """
+        a1 = jnp.asarray(a1)
+        a2 = jnp.asarray(a2)
+        if (
+            n_ant < 1
+            or a1.ndim != 1
+            or a2.shape != a1.shape
+            or not jnp.issubdtype(a1.dtype, jnp.integer)
+            or not jnp.issubdtype(a2.dtype, jnp.integer)
+        ):
+            raise ValueError(
+                "Expected n_ant >= 1 and matching 1D integer antenna-index vectors"
+            )
+        self.a1 = a1.astype(jnp.int32)
+        self.a2 = a2.astype(jnp.int32)
+        (
+            self.a1_sorter,
+            self.a1_start,
+            self.a2_sorter,
+            self.a2_start,
+        ) = prepare_indices(n_ant, self.a1, self.a2)
 
-def _candidate_dirs():
-    dirs = [_DIR_PATH]
-    site_dirs = _site_dirs()
-    for pkg in _PKG_NAMES:
-        try:
-            spec = importlib.util.find_spec(pkg)
-        except (ImportError, ValueError):
-            spec = None
-        if spec and spec.submodule_search_locations:
-            dirs.extend(spec.submodule_search_locations)
-        for sp in site_dirs:
-            dirs.append(os.path.join(sp, pkg))
-    return dirs
+    def eval(self, rfi_amp_fine, rfi_phase):
+        """
+        Evaluate the RFI visibility for given RFI amplitudes and phases.
 
+        Args:
+            rfi_amp_fine: Fine-grained RFI amplitude array with shape
+                         (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time).
+            rfi_phase: RFI phase array in radians with shape matching rfi_amp_fine.
+                      On CPU, Highway's vectorised sin/cos is accurate for phase
+                      differences within [-39000, +39000] radians; reduce larger
+                      phases to a bounded range beforehand.
 
-def _load_library(name):
-    seen = set()
-    for d in _candidate_dirs():
-        lib_path = os.path.join(d, name)
-        if lib_path in seen:
-            continue
-        seen.add(lib_path)
-        if os.path.isfile(lib_path):
-            return ctypes.cdll.LoadLibrary(lib_path)
-    return None
-
-
-
-_TAB_LIB_GPU_NAME = "libri_kernels_cuda.so"
-_TAB_PLATFORM_NAME = "CUDA"
-
-if any("rocm" in str(s) for s in list(jax.devices())):
-    _TAB_LIB_GPU_NAME = "libri_kernels_hip.so"
-    _TAB_PLATFORM_NAME = "ROCM"
-
-
-_TAB_LIB = _load_library("libri_kernels.so")
-_TAB_LIB_GPU = _load_library(_TAB_LIB_GPU_NAME)
-
-
-def _ffi_target(op, pass_, platform, dtype):
-    """Name of an FFI handler: both its exported symbol and its XLA target."""
-    return f"ri_{op}_{pass_}_{platform}_{dtype}"
+        Returns:
+            Array of RFI visibilities with shape (n_baselines, n_freq, n_time).
+        """
+        return rfi_vis_op.bind(
+            self.a1, self.a1_sorter, self.a1_start,
+            self.a2, self.a2_sorter, self.a2_start,
+            rfi_amp_fine, rfi_phase,
+        )
 
 
-def _register_targets(lib, op, passes, platform, xla_platform):
-    for dtype in ("f32", "f64"):
-        for pass_ in passes:
-            name = _ffi_target(op, pass_, platform, dtype)
-            jax.ffi.register_ffi_target(
-                name, jax.ffi.pycapsule(getattr(lib, name)), platform=xla_platform
+_PASSES = ("fwd", "jvp", "transpose")
+
+if _TAB_LIB:
+    _register_targets(_TAB_LIB, "rfi_vis", _PASSES, "cpu", "cpu")
+
+if _TAB_LIB_CUDA:
+    _register_targets(_TAB_LIB_CUDA, "rfi_vis", _PASSES, "gpu", "CUDA")
+
+if _TAB_LIB_ROCM:
+    _register_targets(_TAB_LIB_ROCM, "rfi_vis", _PASSES, "gpu", "ROCM")
+
+
+def _validate_rfi_inputs(a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase):
+    _dtype_suffix(rfi_amp_fine.dtype, rfi_phase.dtype)
+    if rfi_amp_fine.ndim != 6:
+        raise ValueError(
+            "Expected rfi_amp_fine of shape (n_ant, n_freq, n_time, n_rfi, "
+            f"n_int_freq, n_int_time); got {rfi_amp_fine.shape}"
+        )
+    if rfi_phase.shape != rfi_amp_fine.shape:
+        raise ValueError(
+            f"Expected rfi_phase of shape {rfi_amp_fine.shape}; got {rfi_phase.shape}"
+        )
+    if a1.ndim != 1:
+        raise ValueError(f"Expected 1D baseline index array a1; got {a1.shape}")
+    n_bl = a1.shape[0]
+    n_ant = rfi_amp_fine.shape[0]
+    for name, arr, expected_shape in (
+        ("a1", a1, (n_bl,)),
+        ("a1_sorter", a1_sorter, (n_bl,)),
+        ("a1_start", a1_start, (n_ant,)),
+        ("a2", a2, (n_bl,)),
+        ("a2_sorter", a2_sorter, (n_bl,)),
+        ("a2_start", a2_start, (n_ant,)),
+    ):
+        if arr.shape != expected_shape or jnp.dtype(arr.dtype) != jnp.int32:
+            raise ValueError(
+                f"Expected int32 {name} of shape {expected_shape}; got {arr.shape} {arr.dtype}"
             )
 
 
-if _TAB_LIB:
-    _register_targets(_TAB_LIB, "rfi_vis", ("fwd", "jvp", "transpose"), "cpu", "cpu")
-
-if _TAB_LIB_GPU:
-    _register_targets(
-        _TAB_LIB_GPU, "rfi_vis", ("fwd", "jvp", "transpose"), "gpu", _TAB_PLATFORM_NAME
-    )
-
-
-def _dtype_suffix(amp_dtype, phase_dtype):
-    """Pick the FFI symbol suffix for a (rfi_amp_fine, rfi_phase) dtype pair.
-
-    The kernels accept matched precision: complex64+float32 or complex128+float64.
-    Mixed precision is rejected at the Python boundary.
-    """
-    amp = jnp.dtype(amp_dtype)
-    phase = jnp.dtype(phase_dtype)
-    if amp == jnp.complex64 and phase == jnp.float32:
-        return "f32"
-    if amp == jnp.complex128 and phase == jnp.float64:
-        return "f64"
-    raise TypeError(
-        f"RFI FFI kernels require matched precision: (complex64, float32) "
-        f"or (complex128, float64). Got (amp={amp}, phase={phase})."
-    )
-
-
-def _check_tab_lib():
-    if _TAB_LIB is None:
-        raise RuntimeError(
-            f"FFI selected, but libri_kernels.so not found! "
-            f"Install the wheel built via scikit-build-core or build from "
-            f"{_DIR_PATH}"
+def _validate_like(name, primal, other):
+    if other.shape != primal.shape or jnp.dtype(other.dtype) != jnp.dtype(primal.dtype):
+        raise ValueError(
+            f"Expected {name} shape {primal.shape} and dtype {primal.dtype}; "
+            f"got {other.shape} and {other.dtype}"
         )
 
 
-def _check_tab_lib_gpu():
-    if _TAB_LIB_GPU is None:
-        raise RuntimeError(
-            f"FFI selected, but {_TAB_LIB_GPU_NAME} not found! "
-            f"Install the matching add-on package (ri_kernels_cuda12 or "
-            f"ri_kernels_cuda13), or rebuild the wheel with "
-            f"-Ccmake.define.RI_KERNELS_CUDA=ON (or RI_KERNELS_ROCM=ON)"
-        )
+def _lowering(pass_, platform, phase_idx=7):
+    ffi_platform = "cpu" if platform == "cpu" else "gpu"
+
+    def lowering(ctx, *args):
+        if platform == "cpu":
+            _check_tab_lib()
+        else:
+            _check_tab_lib_gpu(platform)
+        suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[phase_idx].dtype)
+        return jax.ffi.ffi_lowering(_ffi_target("rfi_vis", pass_, ffi_platform, suffix))(ctx, *args)
+
+    return lowering
+
+
+def _register_lowerings(primitive, pass_, phase_idx=7):
+    for platform in ("cpu", "cuda", "rocm"):
+        mlir.register_lowering(primitive, _lowering(pass_, platform, phase_idx), platform=platform)
 
 
 # --- Transpose Op ---
@@ -223,63 +188,21 @@ rfi_transpose_op.multiple_results = True
 def rfi_transpose_abstract(
     a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase, g
 ):
-    """
-    Abstract evaluation for the RFI transpose operation.
-    """
-    _dtype_suffix(rfi_amp_fine.dtype, rfi_phase.dtype)
-    # Shapes are implicitly checked by JAX mechanisms or assumed correct from lowering
+    """Abstract evaluation for the RFI transpose operation."""
+    _validate_rfi_inputs(
+        a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase
+    )
+    expected_g = ShapedArray(
+        (a1.shape[0], rfi_amp_fine.shape[1], rfi_amp_fine.shape[2]), rfi_amp_fine.dtype
+    )
+    _validate_like("visibility cotangent", expected_g, g)
     t1 = ShapedArray(rfi_amp_fine.shape, rfi_amp_fine.dtype)
     t2 = ShapedArray(rfi_phase.shape, rfi_phase.dtype)
     return (t1, t2)
 
 
 rfi_transpose_op.def_abstract_eval(rfi_transpose_abstract)
-
-
-def rfi_transpose_lowering_cpu(
-    ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase, g
-):
-    _check_tab_lib()
-    suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[7].dtype)
-    res = jax.ffi.ffi_lowering(_ffi_target("rfi_vis", "transpose", "cpu", suffix))
-    return res(
-        ctx,
-        a1,
-        a1_sorter,
-        a1_start,
-        a2,
-        a2_sorter,
-        a2_start,
-        rfi_amp_fine,
-        rfi_phase,
-        g,
-    )
-
-
-mlir.register_lowering(rfi_transpose_op, rfi_transpose_lowering_cpu, platform="cpu")
-
-
-def rfi_transpose_lowering_gpu(
-    ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase, g
-):
-    _check_tab_lib_gpu()
-    suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[7].dtype)
-    res = jax.ffi.ffi_lowering(_ffi_target("rfi_vis", "transpose", "gpu", suffix))
-    return res(
-        ctx,
-        a1,
-        a1_sorter,
-        a1_start,
-        a2,
-        a2_sorter,
-        a2_start,
-        rfi_amp_fine,
-        rfi_phase,
-        g,
-    )
-
-
-mlir.register_lowering(rfi_transpose_op, rfi_transpose_lowering_gpu, platform="gpu")
+_register_lowerings(rfi_transpose_op, "transpose", phase_idx=7)
 
 
 # --- JVP Op ---
@@ -300,86 +223,19 @@ def rfi_jvp_abstract(
     rfi_phase,
     rfi_phase_grad,
 ):
-    """
-    Abstract evaluation for the RFI JVP operation.
-    """
-    _dtype_suffix(rfi_amp_fine.dtype, rfi_phase.dtype)
-    # rfi_amp_fine and rfi_phase shape is
-    # (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time)
+    """Abstract evaluation for the RFI JVP operation."""
+    _validate_rfi_inputs(
+        a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase
+    )
+    _validate_like("rfi_amp_fine tangent", rfi_amp_fine, rfi_amp_fine_grad)
+    _validate_like("rfi_phase tangent", rfi_phase, rfi_phase_grad)
     n_freq = rfi_amp_fine.shape[1]
     n_time = rfi_amp_fine.shape[2]
-    return ShapedArray([a1.shape[0], n_freq, n_time], rfi_amp_fine.dtype)
+    return ShapedArray((a1.shape[0], n_freq, n_time), rfi_amp_fine.dtype)
 
 
 rfi_jvp_op.def_abstract_eval(rfi_jvp_abstract)
-
-
-def rfi_jvp_lowering_cpu(
-    ctx,
-    a1,
-    a1_sorter,
-    a1_start,
-    a2,
-    a2_sorter,
-    a2_start,
-    rfi_amp_fine,
-    rfi_amp_fine_grad,
-    rfi_phase,
-    rfi_phase_grad,
-):
-    _check_tab_lib()
-    suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[8].dtype)
-    res = jax.ffi.ffi_lowering(_ffi_target("rfi_vis", "jvp", "cpu", suffix))
-    return res(
-            ctx,
-            a1,
-            a1_sorter,
-            a1_start,
-            a2,
-            a2_sorter,
-            a2_start,
-            rfi_amp_fine,
-            rfi_amp_fine_grad,
-            rfi_phase,
-            rfi_phase_grad,
-        )
-
-
-mlir.register_lowering(rfi_jvp_op, rfi_jvp_lowering_cpu, platform="cpu")
-
-
-def rfi_jvp_lowering_gpu(
-    ctx,
-    a1,
-    a1_sorter,
-    a1_start,
-    a2,
-    a2_sorter,
-    a2_start,
-    rfi_amp_fine,
-    rfi_amp_fine_grad,
-    rfi_phase,
-    rfi_phase_grad,
-):
-    _check_tab_lib_gpu()
-    suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[8].dtype)
-    res = jax.ffi.ffi_lowering(_ffi_target("rfi_vis", "jvp", "gpu", suffix))
-    return res(
-            ctx,
-            a1,
-            a1_sorter,
-            a1_start,
-            a2,
-            a2_sorter,
-            a2_start,
-            rfi_amp_fine,
-            rfi_amp_fine_grad,
-            rfi_phase,
-            rfi_phase_grad,
-        )
-
-
-mlir.register_lowering(rfi_jvp_op, rfi_jvp_lowering_gpu, platform="gpu")
+_register_lowerings(rfi_jvp_op, "jvp", phase_idx=8)
 
 
 def rfi_jvp_transpose(
@@ -395,14 +251,23 @@ def rfi_jvp_transpose(
     rfi_phase,
     rfi_phase_grad,
 ):
-    """
-    Transpose rule for the RFI JVP operation.
-    """
+    """Transpose rule for the RFI JVP operation."""
     t1, t2 = rfi_transpose_op.bind(
         a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase, g
     )
 
-    return None, None, None, None, None, None, t1, t1, t2, t2
+    return (
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        t1 if ad.is_undefined_primal(rfi_amp_fine_grad) else None,
+        None,
+        t2 if ad.is_undefined_primal(rfi_phase_grad) else None,
+    )
 
 
 ad.primitive_transposes[rfi_jvp_op] = rfi_jvp_transpose
@@ -417,68 +282,21 @@ rfi_vis_op.def_impl(partial(xla.apply_primitive, rfi_vis_op))
 def rfi_vis_abstract(
     a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase
 ):
-    """
-    Abstract evaluation for the RFI visibility operation.
-    """
-    _dtype_suffix(rfi_amp_fine.dtype, rfi_phase.dtype)
-    # rfi_amp_fine and rfi_phase shape is
-    # (n_ant, n_freq, n_time, n_rfi, n_int_freq, n_int_time)
+    """Abstract evaluation for the RFI visibility operation."""
+    _validate_rfi_inputs(
+        a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase
+    )
     n_freq = rfi_amp_fine.shape[1]
     n_time = rfi_amp_fine.shape[2]
-    return ShapedArray([a1.shape[0], n_freq, n_time], rfi_amp_fine.dtype)
+    return ShapedArray((a1.shape[0], n_freq, n_time), rfi_amp_fine.dtype)
 
 
 rfi_vis_op.def_abstract_eval(rfi_vis_abstract)
-
-
-def rfi_vis_lowering_cpu(
-    ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase
-):
-    _check_tab_lib()
-    suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[7].dtype)
-    res = jax.ffi.ffi_lowering(_ffi_target("rfi_vis", "fwd", "cpu", suffix))
-    return res(
-            ctx,
-            a1,
-            a1_sorter,
-            a1_start,
-            a2,
-            a2_sorter,
-            a2_start,
-            rfi_amp_fine,
-            rfi_phase,
-        )
-
-
-mlir.register_lowering(rfi_vis_op, rfi_vis_lowering_cpu, platform="cpu")
-
-
-def rfi_vis_lowering_gpu(
-    ctx, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase
-):
-    _check_tab_lib_gpu()
-    suffix = _dtype_suffix(ctx.avals_in[6].dtype, ctx.avals_in[7].dtype)
-    res = jax.ffi.ffi_lowering(_ffi_target("rfi_vis", "fwd", "gpu", suffix))
-    return res(
-            ctx,
-            a1,
-            a1_sorter,
-            a1_start,
-            a2,
-            a2_sorter,
-            a2_start,
-            rfi_amp_fine,
-            rfi_phase,
-        )
-
-
-mlir.register_lowering(rfi_vis_op, rfi_vis_lowering_gpu, platform="gpu")
+_register_lowerings(rfi_vis_op, "fwd", phase_idx=7)
 
 
 def rfi_vis_jvp(args, tangents):
-    """
-    JVP rule for the RFI visibility operation.
-    """
+    """JVP rule for the RFI visibility operation."""
     a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine, rfi_phase = args
     _, _, _, _, _, _, rfi_amp_fine_dot, rfi_phase_dot = tangents
 

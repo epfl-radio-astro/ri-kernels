@@ -2,11 +2,8 @@
 #include <cassert>
 #include <complex>
 #include <cstdint>
-#include <cstdio>
-#include <cstring>
 #include <limits>
-#include <stdexcept>
-#include <unistd.h>
+#include <string>
 
 
 #include "gpu_compat.h"
@@ -179,6 +176,18 @@ ffi::Error rfi_vis_transpose_gpu_dispatch(
     }
   }
 
+  if (a1_sorter.dimensions()[0] != a1.dimensions()[0] ||
+      a2_sorter.dimensions()[0] != a1.dimensions()[0]) {
+    return ffi::Error::InvalidArgument(
+        "Expected a1_sorter and a2_sorter to match the number of baselines");
+  }
+
+  if (a1_start.dimensions()[0] != rfi_amp_fine.dimensions()[0] ||
+      a2_start.dimensions()[0] != rfi_amp_fine.dimensions()[0]) {
+    return ffi::Error::InvalidArgument(
+        "Expected a1_start and a2_start to match the number of antennas");
+  }
+
   Tensor1D<const int *, INT_T> a1_tensor(a1.typed_data(), a1.dimensions()[0]);
   Tensor1D<const int *, INT_T> a1_sorter_tensor(a1_sorter.typed_data(),
                                                 a1_sorter.dimensions()[0]);
@@ -218,18 +227,30 @@ ffi::Error rfi_vis_transpose_gpu_dispatch(
       rfi_vis_grad.dimensions()[0], rfi_vis_grad.dimensions()[1],
       rfi_vis_grad.dimensions()[2]);
 
-  const INT_T n_freq = (INT_T)rfi_amp_fine.dimensions()[1];
-  const INT_T n_time = (INT_T)rfi_amp_fine.dimensions()[2];
-  const INT_T n_int_f = (INT_T)rfi_amp_fine.dimensions()[4];
-  const INT_T n_int_t = (INT_T)rfi_amp_fine.dimensions()[5];
-  const INT_T n_ant = (INT_T)rfi_amp_fine.dimensions()[0];
-  const INT_T n_red = rfi_amp_fine_tensor.shape[3];
+  const std::int64_t n_freq = rfi_amp_fine.dimensions()[1];
+  const std::int64_t n_time = rfi_amp_fine.dimensions()[2];
+  const std::int64_t n_int_f = rfi_amp_fine.dimensions()[4];
+  const std::int64_t n_int_t = rfi_amp_fine.dimensions()[5];
+  const std::int64_t n_ant = rfi_amp_fine.dimensions()[0];
+  const std::int64_t n_red = rfi_amp_fine_tensor.shape[3];
+  const std::int64_t n_int = n_int_t * n_int_f;
 
-  const T n_int_inv = T(1) / T(n_int_t * n_int_f);
+  const T n_int_inv =
+      n_int > 0 ? T(1) / T(n_int) : std::numeric_limits<T>::quiet_NaN();
+
+  if (n_ant == 0 || n_freq == 0 || n_time == 0 || n_red == 0) {
+    return ffi::Error::Success();
+  }
+
+  DeviceLimits limits;
+  if (auto err = get_device_limits(limits); err != cudaSuccess) {
+    return ffi::Error::Internal(std::string("GPU device query error: ") +
+                                cudaGetErrorString(err));
+  }
 
   // Grid: (n_freq * n_time, n_ant). Each block covers one (i_ant, i_f, i_t);
   // threads in the block split the collapsed (n_rfi, n_int_f, n_int_t) dim.
-  auto grid = create_clamped_grid(n_freq * n_time, n_ant, 1);
+  auto grid = create_clamped_grid(n_freq * n_time, n_ant, 1, limits);
 
   // BLOCK_SIZE chosen to match n_red (the per-block parallel dim). The ladder
   // avoids leaving most of a large block idle when n_red is small.
@@ -273,10 +294,14 @@ ffi::Error rfi_vis_transpose_gpu_impl_tmpl(
     ffi::Result<ffi::Buffer<PHASE_DT, 6>> rfi_phase_grad) {
   constexpr std::int64_t max32 = std::numeric_limits<std::int32_t>::max();
   // use 32 bit indexing if possible
-  if (a1.element_count() < max32 && a2.element_count() < max32 &&
+  if (a1.element_count() < max32 && a1_sorter.element_count() < max32 &&
+      a1_start.element_count() < max32 && a2.element_count() < max32 &&
+      a2_sorter.element_count() < max32 && a2_start.element_count() < max32 &&
       rfi_amp_fine.element_count() < max32 &&
       rfi_phase.element_count() < max32 &&
-      rfi_vis_grad.element_count() < max32) {
+      rfi_vis_grad.element_count() < max32 &&
+      rfi_amp_fine_grad->element_count() < max32 &&
+      rfi_phase_grad->element_count() < max32) {
     return rfi_vis_transpose_gpu_dispatch<T, std::int32_t, AMP_DT, PHASE_DT>(
         stream, a1, a1_sorter, a1_start, a2, a2_sorter, a2_start, rfi_amp_fine,
         rfi_phase, rfi_vis_grad, rfi_amp_fine_grad, rfi_phase_grad);

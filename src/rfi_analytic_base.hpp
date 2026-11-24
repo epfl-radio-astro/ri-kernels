@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <complex>
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -51,6 +52,13 @@ TAB_H_D constexpr std::int64_t analytic_tile_count(std::int64_t n_ant) {
 template <typename T> struct Cplx {
   T re, im;
 };
+
+static_assert(std::is_trivially_copyable_v<Cplx<float>> &&
+              sizeof(Cplx<float>) == sizeof(std::complex<float>) &&
+              alignof(Cplx<float>) == alignof(std::complex<float>));
+static_assert(std::is_trivially_copyable_v<Cplx<double>> &&
+              sizeof(Cplx<double>) == sizeof(std::complex<double>) &&
+              alignof(Cplx<double>) == alignof(std::complex<double>));
 
 // i * a
 template <typename T> TAB_H_D inline Cplx<T> ctimes_i(Cplx<T> a) {
