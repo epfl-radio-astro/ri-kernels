@@ -32,7 +32,7 @@ jobs:
     name: sdist (ri_kernels)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The build requirements pin jax==0.6.0, whose jaxlib ships cp310-cp313
       # wheels only; the runner's default Python can be newer. Use the version
       # the wheels are built for.
@@ -58,7 +58,7 @@ jobs:
           - { os: ubuntu-24.04-arm, arch: aarch64 }
           - { os: macos-26, arch: arm64 }
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074 # v4.2.0
         env:
@@ -109,7 +109,7 @@ jobs:
           - { os: ubuntu-latest, arch: x86_64, repo_arch: x86_64, cuda12_prefix: "52-real;" }
           - { os: ubuntu-24.04-arm, arch: aarch64, repo_arch: sbsa, cuda12_prefix: "" }
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Rewrite metadata for the CUDA ${{ matrix.cuda.major }} variant
         run: |
@@ -157,7 +157,7 @@ jobs:
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Tag must match the version in pyproject.toml
         env:
           TAG: ${{ github.event.release.tag_name }}
