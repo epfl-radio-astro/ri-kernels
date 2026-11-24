@@ -98,11 +98,5 @@ inline ffi::Error make_analytic_chunk_plan(
   return ffi::Error::Success();
 }
 
-// Clamp a grid-stride axis while it is still wide; casting a large work count
-// to int before create_clamped_grid would wrap instead of clamping it.
-inline int analytic_grid_extent(std::int64_t count) {
-  return int(std::min<std::int64_t>(count, std::numeric_limits<int>::max()));
-}
-
 } // namespace gpu
 } // namespace ri_kernels

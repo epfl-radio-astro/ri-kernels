@@ -130,7 +130,9 @@ if(RI_KERNELS_CPU)
 
   if(RI_KERNELS_BUNDLED_HIGHWAY)
 	# add google highway
-	set(HWY_ENABLE_CONTRIB ON CACHE BOOL "")
+	# Only the header-only contrib/math is used (see src/hwy_dispatch.hpp), so
+	# the hwy_contrib library itself is not needed.
+	set(HWY_ENABLE_CONTRIB OFF CACHE BOOL "")
 	set(HWY_ENABLE_EXAMPLES OFF CACHE BOOL "")
 	set(HWY_ENABLE_INSTALL OFF CACHE BOOL "")
 	set(HWY_ENABLE_TESTS OFF CACHE BOOL "")
@@ -141,6 +143,12 @@ if(RI_KERNELS_CPU)
 	  URL_HASH SHA256=e72241ac9524bb653ae52ced768b508045d4438726a303f10181a38f764a453c
 	)
 	FetchContent_MakeAvailable(hwy)
+	# Highway defines these unconditionally; keep them out of the default build.
+	foreach(_hwy_extra hwy_test hwy_list_targets)
+	  if(TARGET ${_hwy_extra})
+		set_target_properties(${_hwy_extra} PROPERTIES EXCLUDE_FROM_ALL ON)
+	  endif()
+	endforeach()
 	if(NOT TARGET hwy::hwy)
 	  add_library(hwy::hwy ALIAS hwy)
 	endif()
