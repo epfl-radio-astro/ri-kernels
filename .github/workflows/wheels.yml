@@ -42,7 +42,7 @@ jobs:
       - run: |
           python -m pip install build
           python -m build --sdist
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sdist-ri_kernels
           path: dist/*.tar.gz
@@ -71,7 +71,7 @@ jobs:
             python -c "from ri_kernels.jax_api import rfi_vis_op as m, rfi_analytic_vis_op as a; assert m._TAB_LIB is not None and a._TAB_LIB_ANALYTIC is not None, 'libri_kernels.so missing from wheel'"
             && RI_KERNELS_REQUIRE_CPU=1 pytest ./tests -q
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-ri_kernels-${{ matrix.os }}-${{ matrix.arch }}
           path: wheelhouse/*.whl
@@ -147,7 +147,7 @@ jobs:
       - name: Smoke-test the built library
         run: python ci/check_library.py wheelhouse ri_kernels_cuda${{ matrix.cuda.major }}
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheels-ri_kernels_cuda${{ matrix.cuda.major }}-${{ matrix.platform.arch }}
           path: wheelhouse/*.whl
