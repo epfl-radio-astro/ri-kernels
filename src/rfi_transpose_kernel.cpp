@@ -2,12 +2,8 @@
 #include <cassert>
 #include <complex>
 #include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <stdexcept>
-#include <array>
-#include <vector>
-#include <unistd.h>
+#include <limits>
+#include <type_traits>
 
 #include "parallel_for.hpp"
 #include "tensor.hpp"
@@ -109,8 +105,9 @@ rfi_transpose_kernel_opt_tmpl(
                             hn::Set(d, vis_grad_scalar.imag())};
 
             const auto phase_diff = hn::Sub(my_phase, other_phase);
-            const auto e =
-                ComplexV<D>{hn::Cos(d, phase_diff), hn::Sin(d, phase_diff)};
+            hn::Vec<D> s, c;
+            hn::SinCos(d, phase_diff, s, c);
+            const auto e = ComplexV<D>{c, s};
 
             // t1 = vis_grad * conj(other_amp) * e
             const auto t1 = Mul(MulConj(vis_grad, other_amp), e);
@@ -135,8 +132,9 @@ rfi_transpose_kernel_opt_tmpl(
                             hn::Set(d, vis_grad_scalar.imag())};
 
             const auto phase_diff = hn::Sub(other_phase, my_phase);
-            const auto e =
-                ComplexV<D>{hn::Cos(d, phase_diff), hn::Sin(d, phase_diff)};
+            hn::Vec<D> s, c;
+            hn::SinCos(d, phase_diff, s, c);
+            const auto e = ComplexV<D>{c, s};
 
             // t2 = conj(vis_grad * other_amp * e)
             const auto t2_pre = Mul(Mul(vis_grad, other_amp), e);
@@ -299,6 +297,36 @@ ffi::Future rfi_vis_transpose_cpu_impl_tmpl(
     }
   }
 
+  const int64_t n_bl = a1.dimensions()[0];
+  const int64_t n_ant = rfi_amp_fine.dimensions()[0];
+  if (a1_sorter.dimensions()[0] != n_bl || a2_sorter.dimensions()[0] != n_bl) {
+    return completed_future(ffi::Error::InvalidArgument(
+        "Expected a1_sorter and a2_sorter to match the number of baselines"));
+  }
+  if (a1_start.dimensions()[0] != n_ant || a2_start.dimensions()[0] != n_ant) {
+    return completed_future(ffi::Error::InvalidArgument(
+        "Expected a1_start and a2_start to match the number of antennas"));
+  }
+  for (int64_t b = 0; b < n_bl; ++b) {
+    if (a1.typed_data()[b] < 0 || a1.typed_data()[b] >= n_ant ||
+        a2.typed_data()[b] < 0 || a2.typed_data()[b] >= n_ant) {
+      return completed_future(
+          ffi::Error::InvalidArgument("Baseline antenna index out of range"));
+    }
+    if (a1_sorter.typed_data()[b] < 0 || a1_sorter.typed_data()[b] >= n_bl ||
+        a2_sorter.typed_data()[b] < 0 || a2_sorter.typed_data()[b] >= n_bl) {
+      return completed_future(
+          ffi::Error::InvalidArgument("Baseline sorter index out of range"));
+    }
+  }
+  for (int64_t i = 0; i < n_ant; ++i) {
+    if (a1_start.typed_data()[i] < 0 || a1_start.typed_data()[i] > n_bl ||
+        a2_start.typed_data()[i] < 0 || a2_start.typed_data()[i] > n_bl) {
+      return completed_future(
+          ffi::Error::InvalidArgument("Baseline start offset out of range"));
+    }
+  }
+
   // Snapshot of everything the chunks need. These views own their extents by
   // value, so they stay valid after the handler returns - unlike the ffi::Buffer
   // arguments, which point into the FFI call frame. See parallel_for().
@@ -340,9 +368,9 @@ ffi::Future rfi_vis_transpose_cpu_impl_tmpl(
 
   const auto n_int_f = rfi_amp_fine.dimensions()[4];
   const auto n_int_t = rfi_amp_fine.dimensions()[5];
-  const T n_int_inv = T(1) / T(n_int_f * n_int_t);
-
-  const int64_t n_ant = rfi_amp_fine_tensor.shape[0];
+  const std::int64_t n_int = n_int_f * n_int_t;
+  const T n_int_inv =
+      n_int > 0 ? T(1) / T(n_int) : std::numeric_limits<T>::quiet_NaN();
 
   return parallel_for(
       thread_pool, n_ant,

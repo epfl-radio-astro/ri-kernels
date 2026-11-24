@@ -31,17 +31,17 @@ from jax.core import ShapedArray
 from jax.extend import core
 from jax.interpreters import ad, mlir, partial_eval as pe, xla
 
-from .rfi_vis_op import (
+from ._common import _dtype_suffix
+from ._lib import (
     _TAB_LIB,
-    _TAB_LIB_GPU,
-    _TAB_PLATFORM_NAME,
+    _TAB_LIB_CUDA,
+    _TAB_LIB_ROCM,
     _check_tab_lib,
     _check_tab_lib_gpu,
-    _dtype_suffix,
     _ffi_target,
     _register_targets,
-    prepare_indices,
 )
+from .rfi_vis_op import prepare_indices
 
 
 #: Antennas per tile in the staged GPU kernels; the tile-pair list is built for
@@ -193,15 +193,21 @@ def _has_analytic(lib, platform):
 
 
 _TAB_LIB_ANALYTIC = _TAB_LIB if _has_analytic(_TAB_LIB, "cpu") else None
-_TAB_LIB_ANALYTIC_GPU = _TAB_LIB_GPU if _has_analytic(_TAB_LIB_GPU, "gpu") else None
+_TAB_LIB_ANALYTIC_CUDA = _TAB_LIB_CUDA if _has_analytic(_TAB_LIB_CUDA, "gpu") else None
+_TAB_LIB_ANALYTIC_ROCM = _TAB_LIB_ROCM if _has_analytic(_TAB_LIB_ROCM, "gpu") else None
+# Backwards-compatible alias: CUDA takes precedence when both are installed.
+_TAB_LIB_ANALYTIC_GPU = (
+    _TAB_LIB_ANALYTIC_CUDA if _TAB_LIB_ANALYTIC_CUDA is not None else _TAB_LIB_ANALYTIC_ROCM
+)
 
 if _TAB_LIB_ANALYTIC:
     _register_targets(_TAB_LIB_ANALYTIC, "rfi_analytic_vis", _ANALYTIC_PASSES, "cpu", "cpu")
 
-if _TAB_LIB_ANALYTIC_GPU:
-    _register_targets(
-        _TAB_LIB_ANALYTIC_GPU, "rfi_analytic_vis", _ANALYTIC_PASSES, "gpu", _TAB_PLATFORM_NAME
-    )
+if _TAB_LIB_ANALYTIC_CUDA:
+    _register_targets(_TAB_LIB_ANALYTIC_CUDA, "rfi_analytic_vis", _ANALYTIC_PASSES, "gpu", "CUDA")
+
+if _TAB_LIB_ANALYTIC_ROCM:
+    _register_targets(_TAB_LIB_ANALYTIC_ROCM, "rfi_analytic_vis", _ANALYTIC_PASSES, "gpu", "ROCM")
 
 
 def _check_analytic_lib(platform):
@@ -209,6 +215,14 @@ def _check_analytic_lib(platform):
         if _TAB_LIB_ANALYTIC is None:
             _check_tab_lib()
             raise RuntimeError("Installed libri_kernels.so has no RFI analytic kernels")
+    elif platform == "cuda":
+        if _TAB_LIB_ANALYTIC_CUDA is None:
+            _check_tab_lib_gpu("cuda")
+            raise RuntimeError("Installed CUDA library has no RFI analytic kernels")
+    elif platform == "rocm":
+        if _TAB_LIB_ANALYTIC_ROCM is None:
+            _check_tab_lib_gpu("rocm")
+            raise RuntimeError("Installed ROCm library has no RFI analytic kernels")
     elif _TAB_LIB_ANALYTIC_GPU is None:
         _check_tab_lib_gpu()
         raise RuntimeError("Installed GPU library has no RFI analytic kernels")
@@ -240,11 +254,13 @@ def _validate(amp, phase, delay, w_freq, start_freq, g_time, start_time, dnu, in
             raise TypeError(f"RFI analytic kernels require int32 {name}; got {x.dtype}.")
     if len(amp.shape) != 4:
         raise ValueError(f"Expected a rank-4 signal (n_ant, n_rfi, n_freq, n_time); got {amp.shape}")
+    if len(dnu.shape) != 1 or dnu.shape[0] < 1:
+        raise ValueError("dnu_mhz must be a nonempty vector")
     n_ant, n_rfi, n_freq, n_time = amp.shape
     expected = {
         "phase": amp.shape,
         "delay_us": (n_ant, n_rfi, n_time, delay.shape[-1] if len(delay.shape) == 4 else -1),
-        "w_freq": (n_freq, w_freq.shape[1] if len(w_freq.shape) == 3 else -1, len(dnu.shape) == 1 and dnu.shape[0]),
+        "w_freq": (n_freq, w_freq.shape[1] if len(w_freq.shape) == 3 else -1, dnu.shape[0]),
         "start_freq": (n_freq,),
         "g_time": (n_time, g_time.shape[1] if len(g_time.shape) == 3 else -1, g_time.shape[2] if len(g_time.shape) == 3 else -1),
         "start_time": (n_time,),
@@ -262,8 +278,6 @@ def _validate(amp, phase, delay, w_freq, start_freq, g_time, start_time, dnu, in
         raise ValueError("delay_us needs at least the delay itself, (..., 1)")
     if int_time.shape != ():
         raise ValueError("int_time must be a scalar in seconds")
-    if len(dnu.shape) != 1 or dnu.shape[0] < 1:
-        raise ValueError("dnu_mhz must be a nonempty vector")
     if not 1 <= g_time.shape[2] <= 9:
         raise ValueError("g_time supports 1 through 9 monomial coefficients")
     if min(amp.shape) < 1:
@@ -313,10 +327,12 @@ def _validate_options(*, segments, terms, cubic_terms, scratch_mb, delay_grad=Fa
 
 
 def _lowering(pass_, platform):
+    ffi_platform = "cpu" if platform == "cpu" else "gpu"
+
     def lowering(ctx, *args, **options):
         _check_analytic_lib(platform)
         suffix = _dtype_suffix(ctx.avals_in[N_IDX].dtype, ctx.avals_in[N_IDX + 1].dtype)
-        target = _ffi_target("rfi_analytic_vis", pass_, platform, suffix)
+        target = _ffi_target("rfi_analytic_vis", pass_, ffi_platform, suffix)
         return jax.ffi.ffi_lowering(target)(ctx, *args, **{k: np.int64(v) for k, v in options.items()})
 
     return lowering
@@ -359,8 +375,8 @@ def _full_transpose_dce(used_outputs, *args):
 
 
 pe.dce_rules[rfi_analytic_full_transpose_op] = _full_transpose_dce
-mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("full_transpose", "cpu"), platform="cpu")
-mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("full_transpose", "gpu"), platform="gpu")
+for _platform in ("cpu", "cuda", "rocm"):
+    mlir.register_lowering(rfi_analytic_full_transpose_op, _lowering("full_transpose", _platform), platform=_platform)
 
 # --- JVP: linear in the signal tangent -----------------------------------------
 
@@ -382,17 +398,19 @@ rfi_analytic_jvp_op.def_abstract_eval(_jvp_abstract)
 
 def _jvp_lowering(pass_, platform):
     # The signal tangent follows the signal, so the phase is one slot later.
+    ffi_platform = "cpu" if platform == "cpu" else "gpu"
+
     def lowering(ctx, *args, **options):
         _check_analytic_lib(platform)
         suffix = _dtype_suffix(ctx.avals_in[N_IDX].dtype, ctx.avals_in[N_IDX + 2].dtype)
-        target = _ffi_target("rfi_analytic_vis", pass_, platform, suffix)
+        target = _ffi_target("rfi_analytic_vis", pass_, ffi_platform, suffix)
         return jax.ffi.ffi_lowering(target)(ctx, *args, **{k: np.int64(v) for k, v in options.items()})
 
     return lowering
 
 
-mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("jvp", "cpu"), platform="cpu")
-mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("jvp", "gpu"), platform="gpu")
+for _platform in ("cpu", "cuda", "rocm"):
+    mlir.register_lowering(rfi_analytic_jvp_op, _jvp_lowering("jvp", _platform), platform=_platform)
 
 
 def _jvp_transpose(g, *args, **options):
@@ -430,8 +448,8 @@ def _full_jvp_abstract(*args, **options):
 
 
 rfi_analytic_full_jvp_op.def_abstract_eval(_full_jvp_abstract)
-mlir.register_lowering(rfi_analytic_full_jvp_op, _jvp_lowering("full_jvp", "cpu"), platform="cpu")
-mlir.register_lowering(rfi_analytic_full_jvp_op, _jvp_lowering("full_jvp", "gpu"), platform="gpu")
+for _platform in ("cpu", "cuda", "rocm"):
+    mlir.register_lowering(rfi_analytic_full_jvp_op, _jvp_lowering("full_jvp", _platform), platform=_platform)
 
 
 def _full_jvp_transpose(g, *args, **options):
@@ -468,8 +486,8 @@ def _vis_abstract(*args, **options):
 
 
 rfi_analytic_vis_op.def_abstract_eval(_vis_abstract)
-mlir.register_lowering(rfi_analytic_vis_op, _lowering("fwd", "cpu"), platform="cpu")
-mlir.register_lowering(rfi_analytic_vis_op, _lowering("fwd", "gpu"), platform="gpu")
+for _platform in ("cpu", "cuda", "rocm"):
+    mlir.register_lowering(rfi_analytic_vis_op, _lowering("fwd", _platform), platform=_platform)
 
 
 def _vis_jvp(args, tangents, **options):

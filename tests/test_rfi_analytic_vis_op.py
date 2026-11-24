@@ -1,28 +1,53 @@
 """Analytic CPU/CUDA values and amplitude, phase and delay derivatives against :class:`RFIAnalyticVisOpRef`."""
 from collections import namedtuple
 from functools import partial
+import os
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from helpers import (
+    ANALYTIC_SHAPES as SHAPES,
+    assert_analytic_close as assert_close,
+    make_analytic_baselines as make_baselines,
+    make_analytic_inputs as make_inputs,
+    upcast,
+)
 from ri_kernels.jax_api.rfi_analytic_vis_op import (
-    RFIAnalyticVisOp, _TAB_LIB_ANALYTIC, _TAB_LIB_ANALYTIC_GPU,
-    rfi_analytic_vis_op, rfi_analytic_jvp_op,
-    rfi_analytic_full_jvp_op, rfi_analytic_full_transpose_op,
+    RFIAnalyticVisOp,
+    _TAB_LIB_ANALYTIC,
+    _TAB_LIB_ANALYTIC_CUDA,
+    _TAB_LIB_ANALYTIC_ROCM,
+    rfi_analytic_vis_op,
+    rfi_analytic_jvp_op,
+    rfi_analytic_full_jvp_op,
+    rfi_analytic_full_transpose_op,
 )
 from ri_kernels.jax_api.rfi_analytic_vis_op_ref import RFIAnalyticVisOpRef
 
 
+def _require_cpu():
+    return os.environ.get("RI_KERNELS_REQUIRE_CPU", "").lower() in ("1", "true", "yes", "on")
+
+
 def _devices():
-    devices = jax.devices("cpu")[:1] if _TAB_LIB_ANALYTIC else []
-    if _TAB_LIB_ANALYTIC_GPU:
-        for platform in ("cuda", "rocm"):
-            try:
-                devices += jax.devices(platform)[:1]
-            except RuntimeError:
-                pass
+    devices = []
+    if _TAB_LIB_ANALYTIC is not None:
+        devices.extend(jax.devices("cpu")[:1])
+    elif _require_cpu():
+        pytest.fail("RI_KERNELS_REQUIRE_CPU is set, but analytic CPU kernels were not loaded")
+    if _TAB_LIB_ANALYTIC_CUDA is not None:
+        try:
+            devices.extend(jax.devices("cuda")[:1])
+        except RuntimeError:
+            pass
+    if _TAB_LIB_ANALYTIC_ROCM is not None:
+        try:
+            devices.extend(jax.devices("rocm")[:1])
+        except RuntimeError:
+            pass
     return devices
 
 
@@ -35,115 +60,6 @@ def device(request):
 @pytest.fixture(params=[(jnp.float32, jnp.complex64), (jnp.float64, jnp.complex128)])
 def precision(request):
     return request.param
-
-
-def lagrange_basis(nodes, x):
-    basis = np.ones((len(nodes), len(x)))
-    for k, x_k in enumerate(nodes):
-        for j, x_j in enumerate(nodes):
-            if j != k:
-                basis[k] *= (x - x_j) / (x_k - x_j)
-    return basis
-
-
-def interp_tables(n_cells, half_width, offsets):
-    half_width = min(half_width, (n_cells - 1) // 2)
-    n_stencil = 2 * half_width + 1
-    start = np.clip(np.arange(n_cells) - half_width, 0, n_cells - n_stencil)
-    nodes = np.arange(n_stencil)
-    weights = np.stack([lagrange_basis(nodes, (c - s) + offsets) for c, s in enumerate(start)])
-    return weights, start.astype(np.int32)
-
-
-def fine_offsets(n_int, spacing):
-    return (np.arange(n_int) - n_int // 2) * (spacing / n_int)
-
-
-def _interp_inputs(real, complex_, seed=0, n_ant=5, n_rfi=2, n_freq=3, n_time=6,
-                n_int_f=2, n_int_t=3, half_width=1, n_path=4):
-    """Random data-grid inputs and the tables for a config of that shape."""
-    rng = np.random.default_rng(seed)
-    int_time, chan_width = 2.0, 1e4
-    dt = fine_offsets(n_int_t, int_time)
-    dnu = fine_offsets(n_int_f, chan_width) / 1e6  # MHz
-    freqs = (1.5e8 + chan_width * np.arange(n_freq)) / 1e6  # MHz
-    w_time, start_time = interp_tables(n_time, half_width, dt / int_time)
-    w_freq, start_freq = interp_tables(n_freq, half_width, dnu * 1e6 / chan_width)
-
-    shape = (n_ant, n_rfi, n_freq, n_time)
-    amp = rng.normal(size=shape) + 1j * rng.normal(size=shape)
-    phase = rng.uniform(-2 * np.pi, 0.0, size=shape)
-    # The delay relative to the array mean, in microseconds, as tabascal's
-    # FixedOrbitCoarse writes it: a kilometre-scale array against a LEO satellite.
-    scales = [1.7, 0.07, 3e-4, 3e-6, 3e-8, 3e-10][:n_path]
-    delay = np.stack(
-        [rng.normal(0.0, s, (n_ant, n_rfi, n_time)) for s in scales], axis=-1
-    )
-    arrays = (amp, phase, delay, w_freq, start_freq, w_time, start_time, dnu, dt, freqs)
-    out = []
-    for x in arrays:
-        if np.iscomplexobj(x):
-            out.append(jnp.asarray(x, dtype=complex_))
-        elif x.dtype.kind == "i":
-            out.append(jnp.asarray(x, dtype=jnp.int32))
-        else:
-            out.append(jnp.asarray(x, dtype=real))
-    return out
-
-
-def make_baselines(n_ant, shuffle=False, autocorr=True):
-    lo = 0 if autocorr else 1
-    pairs = np.asarray(
-        [(i, j) for i in range(n_ant) for j in range(i + lo, n_ant)], dtype=np.int32
-    )
-    if shuffle:
-        pairs = pairs[np.random.default_rng(4).permutation(len(pairs))]
-    return jnp.asarray(pairs[:, 0]), jnp.asarray(pairs[:, 1])
-
-
-def monomial_tables(n_cells: int, half_width: int):
-    """Lagrange coefficients in x = 2*tau/T, including the shifted edge stencils.
-
-    These occupy the time-table slot of ``fine_signal``: the identical stencil
-    contraction now yields polynomial coefficients rather than sampled values.
-    No Vandermonde fit is needed; multiplying each basis's linear factors gives
-    its monomials directly on the host in double precision.
-    """
-    _, starts = interp_tables(n_cells, half_width, np.zeros(1))
-    degree = 2 * min(half_width, (n_cells - 1) // 2)
-    coefficients = np.zeros((n_cells, degree + 1, degree + 1))
-    for cell, start in enumerate(starts):
-        nodes = 2 * (np.arange(degree + 1) + start - cell)
-        for k, node in enumerate(nodes):
-            polynomial = np.polynomial.Polynomial([1.])
-            for j, other in enumerate(nodes):
-                if j != k:
-                    polynomial *= np.polynomial.Polynomial([-other, 1.]) / (node - other)
-            coefficients[cell, k, :len(polynomial.coef)] = polynomial.coef
-    return coefficients, starts
-
-
-def make_inputs(real, complex_, **shape):
-    args = _interp_inputs(real, complex_, **shape)
-    g, starts = monomial_tables(args[0].shape[-1], shape.get("half_width", 1))
-    args[5] = jnp.asarray(g, real)
-    args[6] = jnp.asarray(starts, jnp.int32)
-    args[8] = jnp.asarray(2., real)
-    return args
-
-
-def upcast(x):
-    if jnp.iscomplexobj(x):
-        return x.astype(jnp.complex128)
-    if jnp.issubdtype(x.dtype, jnp.floating):
-        return x.astype(jnp.float64)
-    return x
-
-
-def assert_close(actual, expected, real):
-    tolerance = 3e-5 if real == jnp.float32 else 5e-10
-    scale = max(float(np.max(np.abs(expected), initial=0)), 1.)
-    np.testing.assert_allclose(actual, expected, rtol=tolerance, atol=tolerance * scale)
 
 
 # --- the reference and the operator, each compiled once per configuration -----
@@ -256,16 +172,6 @@ def check(op, args, a1, a2, seed=1, **options):
     return actual
 
 
-SHAPES = {
-    "default": {},
-    "held": dict(half_width=0),
-    "one-cell": dict(n_time=1, n_freq=1, n_int_f=1),
-    "wide": dict(half_width=2, n_time=5, n_freq=5),
-    "constant-delay": dict(n_path=1),
-    "linear-delay": dict(n_path=2),
-    "quadratic-delay": dict(n_path=3),
-    "higher-delay": dict(n_path=6),
-}
 # Every shape with the default options, which take the specialised kernels
 # wherever the stencil has three coefficients. The conservative and the
 # cubic-free configurations take the general path on a few shapes each.
@@ -551,3 +457,54 @@ def test_ffi_rejects_excess_coefficients(device):
     with pytest.raises(Exception, match="capacity"):
         call(*op.indices, *args, segments=np.int64(2), terms=np.int64(6),
              cubic_terms=np.int64(3), scratch_mb=np.int64(256)).block_until_ready()
+
+
+def test_subnormal_winding_no_nan(device):
+    """A nonzero winding that rounds to 0.0f takes the a = 0 limit, not 0/0.
+
+    A cell's winding is a = 2*pi * nu * (int_time / 2) * delta_rate / segments,
+    formed in double. The GPU kernels run the recurrence in the operator's
+    precision, so in float32 a winding below the smallest subnormal becomes
+    0.0f while a double ``a == 0`` guard still sees it as nonzero. The CPU
+    kernels always recurse in double, so there this only checks that nothing
+    changes. Both inputs are normal float32 values, so the test does not
+    depend on the GPU flushing subnormals to zero.
+    """
+    tiny = 1e-25
+    args = make_inputs(jnp.float32, jnp.complex64, n_ant=2, n_rfi=1, n_freq=1, n_time=3, n_int_f=1)
+    args[9] = jnp.full_like(args[9], tiny)  # freq_mhz; n_int_f=1 makes dnu zero
+    zero_delay = jnp.zeros_like(args[2])
+    still = list(args)
+    still[2] = zero_delay
+    args[2] = zero_delay.at[0, :, :, 1].set(tiny)  # only antenna 0 has a delay rate
+
+    # More segments only shrink a, so segments=1 bounds it from above.
+    winding = 2 * np.pi * tiny * (float(args[8]) / 2) * tiny
+    assert winding > 0 and np.float32(winding) == 0
+
+    op = RFIAnalyticVisOp(2, jnp.array([0], jnp.int32), jnp.array([1], jnp.int32))
+    vis = op.eval(*args)
+    assert np.all(np.isfinite(np.asarray(vis)))
+    assert_close(vis, op.eval(*still), jnp.float32)
+
+
+def test_multi_device_cpu_pmap():
+    """Exercise async parallel_for Futures across multiple CPU devices."""
+    cpu_devices = jax.devices("cpu")
+    if len(cpu_devices) < 2 or _TAB_LIB_ANALYTIC is None:
+        pytest.skip("requires >= 2 CPU devices (set XLA_FLAGS=--xla_force_host_platform_device_count=4)")
+    n_dev = len(cpu_devices)
+    a1, a2 = make_baselines(5, shuffle=True)
+    op = RFIAnalyticVisOp(5, a1, a2)
+    base = make_inputs(jnp.float64, jnp.complex128)
+    amps = jnp.stack([make_inputs(jnp.float64, jnp.complex128, seed=i)[0] for i in range(n_dev)])
+    rest = base[1:]
+
+    def loss_and_grad(a):
+        return jax.value_and_grad(lambda x: jnp.sum(jnp.abs(op.eval(x, *rest)) ** 2))(a)
+
+    vals, grads = jax.pmap(loss_and_grad)(amps)
+    for i in range(n_dev):
+        ref_val, ref_grad = loss_and_grad(amps[i])
+        assert_close(vals[i], ref_val, jnp.float64)
+        assert_close(grads[i], ref_grad, jnp.float64)

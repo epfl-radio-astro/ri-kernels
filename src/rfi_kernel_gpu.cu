@@ -2,11 +2,8 @@
 #include <cassert>
 #include <complex>
 #include <cstdint>
-#include <cstdio>
-#include <cstring>
 #include <limits>
-#include <stdexcept>
-#include <unistd.h>
+#include <string>
 
 #include "gpu_compat.h"
 #include "tensor.hpp"
@@ -157,16 +154,26 @@ rfi_vis_fwd_gpu_dispatch(cudaStream_t stream, ffi::BufferR1<ffi::S32> a1,
       (complex_t *)rfi_vis->typed_data(), rfi_vis->dimensions()[0],
       rfi_vis->dimensions()[1], rfi_vis->dimensions()[2]);
 
-  const INT_T n_int_f = (INT_T)rfi_amp_fine.dimensions()[4];
-  const INT_T n_int_t = (INT_T)rfi_amp_fine.dimensions()[5];
+  const std::int64_t n_int_f = rfi_amp_fine.dimensions()[4];
+  const std::int64_t n_int_t = rfi_amp_fine.dimensions()[5];
+  const std::int64_t n_int = n_int_t * n_int_f;
 
-  const T scale = T(1) / T(n_int_t * n_int_f);
+  const T scale =
+      n_int > 0 ? T(1) / T(n_int) : std::numeric_limits<T>::quiet_NaN();
 
-  const auto n_time = rfi_vis_tensor.shape[2];
-  const auto n_bl = a1.dimensions()[0];
-  const auto n_freq = rfi_vis_tensor.shape[1];
+  const std::int64_t n_time = rfi_vis_tensor.shape[2];
+  const std::int64_t n_bl = a1.dimensions()[0];
+  const std::int64_t n_freq = rfi_vis_tensor.shape[1];
+  if (n_bl == 0 || n_freq == 0 || n_time == 0) {
+    return ffi::Error::Success();
+  }
 
-  auto grid = create_clamped_grid(n_time, n_bl, n_freq);
+  DeviceLimits limits;
+  if (auto err = get_device_limits(limits); err != cudaSuccess) {
+    return ffi::Error::Internal(std::string("GPU device query error: ") +
+                                cudaGetErrorString(err));
+  }
+  auto grid = create_clamped_grid(n_time, n_bl, n_freq, limits);
 
   if (rfi_phase_tensor.shape[3] / 2 < 32) {
     constexpr int block_size = 32;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <utility>
 
 #include "xla/ffi/api/ffi.h"
@@ -66,7 +67,14 @@ ffi::Future parallel_for(ffi::ThreadPool &thread_pool, std::int64_t n_items,
   // nothing to gain from a round trip through the queue. Running it inline is
   // also what keeps the degenerate one-schedulable-CPU case working.
   if (n_chunks == 1) {
-    body(std::int64_t{0}, n_items);
+    try {
+      body(std::int64_t{0}, n_items);
+    } catch (const std::exception &e) {
+      return completed_future(ffi::Error::Internal(e.what()));
+    } catch (...) {
+      return completed_future(
+          ffi::Error::Internal("Unknown exception in parallel_for task"));
+    }
     return completed_future(ffi::Error::Success());
   }
 
@@ -81,8 +89,15 @@ ffi::Future parallel_for(ffi::ThreadPool &thread_pool, std::int64_t n_items,
     // gone by the time these run. ThreadPool::Schedule may also run the task
     // inline if no pool is available, which this is safe under.
     thread_pool.Schedule([promise, body, begin, end]() mutable {
-      body(begin, end);
-      promise.CountDown();
+      try {
+        body(begin, end);
+        promise.CountDown();
+      } catch (const std::exception &e) {
+        promise.CountDown(ffi::Error::Internal(e.what()));
+      } catch (...) {
+        promise.CountDown(
+            ffi::Error::Internal("Unknown exception in parallel_for task"));
+      }
     });
   }
 

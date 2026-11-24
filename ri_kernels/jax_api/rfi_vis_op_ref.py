@@ -9,7 +9,7 @@ for checking the kernels and for small problems.
 
 import jax.numpy as jnp
 
-from .rfi_vis_op import _dtype_suffix
+from ._common import _dtype_suffix
 
 
 class RFIVisOpRef:

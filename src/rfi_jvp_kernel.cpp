@@ -2,8 +2,8 @@
 #include <cassert>
 #include <complex>
 #include <cstdint>
-#include <cstring>
-#include <unistd.h>
+#include <limits>
+#include <type_traits>
 
 #include "parallel_for.hpp"
 #include "tensor.hpp"
@@ -57,16 +57,12 @@ rfi_jvp_kernel_opt_tmpl(T n_int_inv,
   assert(grad.shape[1] == n_freq);
   assert(grad.shape[2] == n_time);
 
-  const ComplexV<D> i_unit{hn::Zero(d), hn::Set(d, T(1))};
-
   for (std::int64_t i_bl = 0; i_bl < n_bl; ++i_bl) {
     std::int64_t i_a1 = a1(i_bl);
     std::int64_t i_a2 = a2(i_bl);
 
     for (std::int64_t i_f = 0; i_f < n_freq; ++i_f) {
       for (std::int64_t i_t = 0; i_t < n_time; ++i_t) {
-        std::complex<T> sum{0, 0};
-
         const auto ptr_val_rfi_amp_1 = &rfi_amp_fine(i_a1, i_f, i_t, 0);
         const auto ptr_val_rfi_amp_2 = &rfi_amp_fine(i_a2, i_f, i_t, 0);
 
@@ -81,6 +77,8 @@ rfi_jvp_kernel_opt_tmpl(T n_int_inv,
         const auto ptr_val_rfi_phase_grad_2 =
             &rfi_phase_grad(i_a2, i_f, i_t, 0);
 
+        ComplexV<D> sum_v{hn::Zero(d), hn::Zero(d)};
+
         std::int64_t i_red = 0;
         for (; i_red + n_lanes <= n_red; i_red += n_lanes) {
           const auto val_rfi_phase_1 =
@@ -94,34 +92,32 @@ rfi_jvp_kernel_opt_tmpl(T n_int_inv,
           const auto val_rfi_amp_grad_1 = LoadU(d, ptr_rfi_amp_grad_1 + i_red);
           const auto val_rfi_amp_grad_2 = LoadU(d, ptr_rfi_amp_grad_2 + i_red);
 
-          const auto val_rfi_phase_grad_1 =
-              ComplexV<D>{hn::LoadU(d, ptr_val_rfi_phase_grad_1 + i_red),
-                          hn::Zero(d)};
-          const auto val_rfi_phase_grad_2 =
-              ComplexV<D>{hn::LoadU(d, ptr_val_rfi_phase_grad_2 + i_red),
-                          hn::Zero(d)};
+          const auto phase_grad_diff =
+              hn::Sub(hn::LoadU(d, ptr_val_rfi_phase_grad_1 + i_red),
+                      hn::LoadU(d, ptr_val_rfi_phase_grad_2 + i_red));
 
           const auto phase_diff = hn::Sub(val_rfi_phase_1, val_rfi_phase_2);
 
-          const auto val_c = hn::Cos(d, phase_diff);
-          const auto val_s = hn::Sin(d, phase_diff);
+          hn::Vec<D> val_s, val_c;
+          hn::SinCos(d, phase_diff, val_s, val_c);
 
           const auto val_e = ComplexV<D>{val_c, val_s};
+          const auto val_ie = ComplexV<D>{hn::Neg(val_s), val_c};
 
           const auto g1 =
               Mul(val_e, Add(MulConj(val_rfi_amp_grad_1, val_rfi_amp_2),
                              MulConj(val_rfi_amp_1, val_rfi_amp_grad_2)));
 
-          const auto g2 =
-              Mul(Mul(val_e, i_unit),
-                  Mul(Sub(val_rfi_phase_grad_1, val_rfi_phase_grad_2),
-                      MulConj(val_rfi_amp_1, val_rfi_amp_2)));
+          const auto g2_unscaled =
+              Mul(val_ie, MulConj(val_rfi_amp_1, val_rfi_amp_2));
+          const auto g2 = ComplexV<D>{hn::Mul(phase_grad_diff, g2_unscaled.re),
+                                      hn::Mul(phase_grad_diff, g2_unscaled.im)};
 
-          const auto g_sum = Add(g1, g2);
-
-          sum += std::complex<T>(hn::ReduceSum(d, g_sum.re),
-                                 hn::ReduceSum(d, g_sum.im));
+          sum_v = Add(sum_v, Add(g1, g2));
         }
+
+        std::complex<T> sum(hn::ReduceSum(d, sum_v.re),
+                            hn::ReduceSum(d, sum_v.im));
 
         for (; i_red < n_red; ++i_red) {
           const auto val_rfi_amp_1 = ptr_val_rfi_amp_1[i_red];
@@ -246,6 +242,16 @@ ffi::Future rfi_vis_jvp_cpu_impl_tmpl(
     }
   }
 
+  const int64_t n_ant = rfi_amp_fine.dimensions()[0];
+  const int64_t n_bl = a1.dimensions()[0];
+  for (int64_t b = 0; b < n_bl; ++b) {
+    if (a1.typed_data()[b] < 0 || a1.typed_data()[b] >= n_ant ||
+        a2.typed_data()[b] < 0 || a2.typed_data()[b] >= n_ant) {
+      return completed_future(
+          ffi::Error::InvalidArgument("Baseline antenna index out of range"));
+    }
+  }
+
   // Snapshot of everything the chunks need. These views own their extents by
   // value, so they stay valid after the handler returns - unlike the ffi::Buffer
   // arguments, which point into the FFI call frame. See parallel_for().
@@ -278,9 +284,9 @@ ffi::Future rfi_vis_jvp_cpu_impl_tmpl(
 
   const auto n_int_f = rfi_amp_fine.dimensions()[4];
   const auto n_int_t = rfi_amp_fine.dimensions()[5];
-  const T n_int_inv = T(1) / T(n_int_f * n_int_t);
-
-  const int64_t n_bl = a1.dimensions()[0];
+  const std::int64_t n_int = n_int_f * n_int_t;
+  const T n_int_inv =
+      n_int > 0 ? T(1) / T(n_int) : std::numeric_limits<T>::quiet_NaN();
 
   return parallel_for(
       thread_pool, n_bl,

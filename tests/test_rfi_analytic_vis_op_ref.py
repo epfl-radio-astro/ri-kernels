@@ -13,8 +13,14 @@ import numpy as np
 import pytest
 from jax.test_util import check_grads
 
+from helpers import (
+    ANALYTIC_SHAPES as SHAPES,
+    assert_analytic_close as assert_close,
+    make_analytic_baselines as make_baselines,
+    make_analytic_inputs as make_inputs,
+    upcast,
+)
 from ri_kernels.jax_api import RFIAnalyticVisOpRef
-from test_rfi_analytic_vis_op import SHAPES, assert_close, make_baselines, make_inputs, upcast
 
 
 def quadrature(amp, phase, delay, w_freq, start_freq, g_time, start_time, dnu_mhz, int_time,

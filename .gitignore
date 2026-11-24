@@ -1,4 +1,12 @@
-**/__pycache__
+**/__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+build/
+dist/
+wheelhouse/
+*.egg-info/
+/ri_kernels_cuda*/
 
 # Local FFI builds are platform-specific artifacts, never source changes.
 /ri_kernels/*.so

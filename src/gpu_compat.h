@@ -25,8 +25,15 @@ namespace cub = hipcub;
 #define cuConjf hipConjf
 
 // Runtime type/function aliases not provided by HIP's headers.
+using cudaError_t = hipError_t;
 using cudaStream_t = hipStream_t;
 using cudaDeviceProp = hipDeviceProp_t;
+#define cudaGetDevice hipGetDevice
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrMaxGridDimX hipDeviceAttributeMaxGridDimX
+#define cudaDevAttrMaxGridDimY hipDeviceAttributeMaxGridDimY
+#define cudaDevAttrMaxGridDimZ hipDeviceAttributeMaxGridDimZ
+#define cudaDevAttrMaxSharedMemoryPerBlock hipDeviceAttributeMaxSharedMemoryPerBlock
 #define cudaGetLastError hipGetLastError
 #define cudaSuccess hipSuccess
 #define cudaGetErrorString hipGetErrorString

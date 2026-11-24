@@ -2,11 +2,8 @@
 #include <cassert>
 #include <complex>
 #include <cstdint>
-#include <cstdio>
-#include <cstring>
 #include <limits>
-#include <stdexcept>
-#include <unistd.h>
+#include <string>
 
 #include "gpu_compat.h"
 #include "tensor.hpp"
@@ -100,9 +97,11 @@ __global__ void __launch_bounds__(BLOCK_SIZE)
           g1 = traits::mul(g1, e_val);
 
           // g2 = val_e * i * (phase_grad_1 - phase_grad_2) * val_rfi_amp_1 * conj(val_rfi_amp_2)
-          complex_t g2{val_rfi_phase_grad_1 - val_rfi_phase_grad_2, T(0)};
-          g2 = traits::mul(g2, traits::mul(val_rfi_amp_1, traits::conj(val_rfi_amp_2)));
-          g2 = traits::mul(g2, complex_t{-e_val.y, e_val.x});
+          const T phase_grad_diff = val_rfi_phase_grad_1 - val_rfi_phase_grad_2;
+          auto g2 = traits::mul(traits::mul(val_rfi_amp_1, traits::conj(val_rfi_amp_2)),
+                                complex_t{-e_val.y, e_val.x});
+          g2.x *= phase_grad_diff;
+          g2.y *= phase_grad_diff;
 
           sum = traits::add(sum, traits::add(g1, g2));
         }
@@ -201,16 +200,26 @@ ffi::Error rfi_vis_jvp_gpu_dispatch(
       (complex_t *)rfi_grad->typed_data(), rfi_grad->dimensions()[0],
       rfi_grad->dimensions()[1], rfi_grad->dimensions()[2]);
 
-  const INT_T n_int_f = (INT_T)rfi_amp_fine.dimensions()[4];
-  const INT_T n_int_t = (INT_T)rfi_amp_fine.dimensions()[5];
+  const std::int64_t n_int_f = rfi_amp_fine.dimensions()[4];
+  const std::int64_t n_int_t = rfi_amp_fine.dimensions()[5];
+  const std::int64_t n_int = n_int_t * n_int_f;
 
-  const T scale = T(1) / T(n_int_t * n_int_f);
+  const T scale =
+      n_int > 0 ? T(1) / T(n_int) : std::numeric_limits<T>::quiet_NaN();
 
-  const auto n_time = rfi_grad_tensor.shape[2];
-  const auto n_bl = a1.dimensions()[0];
-  const auto n_freq = rfi_grad_tensor.shape[1];
+  const std::int64_t n_time = rfi_grad_tensor.shape[2];
+  const std::int64_t n_bl = a1.dimensions()[0];
+  const std::int64_t n_freq = rfi_grad_tensor.shape[1];
+  if (n_bl == 0 || n_freq == 0 || n_time == 0) {
+    return ffi::Error::Success();
+  }
 
-  auto grid = create_clamped_grid(n_time, n_bl, n_freq);
+  DeviceLimits limits;
+  if (auto err = get_device_limits(limits); err != cudaSuccess) {
+    return ffi::Error::Internal(std::string("GPU device query error: ") +
+                                cudaGetErrorString(err));
+  }
+  auto grid = create_clamped_grid(n_time, n_bl, n_freq, limits);
 
   if (rfi_phase_tensor.shape[3] / 2 < 32) {
     constexpr int block_size = 32;
@@ -264,7 +273,10 @@ ffi::Error rfi_vis_jvp_gpu_impl_tmpl(
   // use 32 bit indexing if possible
   if (a1.element_count() < max32 && a2.element_count() < max32 &&
       rfi_amp_fine.element_count() < max32 &&
-      rfi_phase.element_count() < max32 && rfi_grad->element_count() < max32) {
+      rfi_amp_fine_grad.element_count() < max32 &&
+      rfi_phase.element_count() < max32 &&
+      rfi_phase_grad.element_count() < max32 &&
+      rfi_grad->element_count() < max32) {
     return rfi_vis_jvp_gpu_dispatch<T, std::int32_t, AMP_DT, PHASE_DT>(
         stream, a1, a2, rfi_amp_fine, rfi_amp_fine_grad, rfi_phase,
         rfi_phase_grad, rfi_grad);

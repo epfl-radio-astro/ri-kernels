@@ -2,10 +2,8 @@
 #include <cassert>
 #include <complex>
 #include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <stdexcept>
-#include <unistd.h>
+#include <limits>
+#include <type_traits>
 
 #include "parallel_for.hpp"
 #include "tensor.hpp"
@@ -63,13 +61,13 @@ rfi_kernel_opt_tmpl(T n_int_inv,
 
     for (std::int64_t i_f = 0; i_f < n_freq; ++i_f) {
       for (std::int64_t i_t = 0; i_t < n_time; ++i_t) {
-        std::complex<T> sum{0, 0};
-
         const auto ptr_val_rfi_amp_1 = &rfi_amp_fine(i_a1, i_f, i_t, 0);
         const auto ptr_val_rfi_amp_2 = &rfi_amp_fine(i_a2, i_f, i_t, 0);
 
         const auto ptr_val_rfi_phase_1 = &rfi_phase(i_a1, i_f, i_t, 0);
         const auto ptr_val_rfi_phase_2 = &rfi_phase(i_a2, i_f, i_t, 0);
+
+        ComplexV<D> sum_v{hn::Zero(d), hn::Zero(d)};
 
         std::int64_t i_red = 0;
         for (; i_red + n_lanes <= n_red; i_red += n_lanes) {
@@ -83,16 +81,18 @@ rfi_kernel_opt_tmpl(T n_int_inv,
 
           const auto phase_diff = hn::Sub(val_rfi_phase_1, val_rfi_phase_2);
 
-          const auto c = hn::Cos(d, phase_diff);
-          const auto s = hn::Sin(d, phase_diff);
+          hn::Vec<D> s, c;
+          hn::SinCos(d, phase_diff, s, c);
 
           const auto e = ComplexV<D>{c, s};
 
           const auto res = Mul(MulConj(val_rfi_amp_1, val_rfi_amp_2), e);
 
-          sum += std::complex<T>(hn::ReduceSum(d, res.re),
-                                 hn::ReduceSum(d, res.im));
+          sum_v = Add(sum_v, res);
         }
+
+        std::complex<T> sum(hn::ReduceSum(d, sum_v.re),
+                            hn::ReduceSum(d, sum_v.im));
 
         for (; i_red < n_red; ++i_red) {
           const auto val_rfi_amp_1 = ptr_val_rfi_amp_1[i_red];
@@ -184,6 +184,16 @@ ffi::Future rfi_vis_fwd_cpu_impl_tmpl(
         "Expected rfi_vis and rfi_amp_fine to have the same number of times"));
   }
 
+  const int64_t n_ant = rfi_amp_fine.dimensions()[0];
+  const int64_t n_bl = a1.dimensions()[0];
+  for (int64_t b = 0; b < n_bl; ++b) {
+    if (a1.typed_data()[b] < 0 || a1.typed_data()[b] >= n_ant ||
+        a2.typed_data()[b] < 0 || a2.typed_data()[b] >= n_ant) {
+      return completed_future(
+          ffi::Error::InvalidArgument("Baseline antenna index out of range"));
+    }
+  }
+
   // Snapshot of everything the chunks need. These views own their extents by
   // value, so they stay valid after the handler returns - unlike the ffi::Buffer
   // arguments, which point into the FFI call frame. See parallel_for().
@@ -206,9 +216,9 @@ ffi::Future rfi_vis_fwd_cpu_impl_tmpl(
 
   const auto n_int_f = rfi_amp_fine.dimensions()[4];
   const auto n_int_t = rfi_amp_fine.dimensions()[5];
-  const T n_int_inv = T(1) / T(n_int_f * n_int_t);
-
-  const int64_t n_bl = a1.dimensions()[0];
+  const std::int64_t n_int = n_int_f * n_int_t;
+  const T n_int_inv =
+      n_int > 0 ? T(1) / T(n_int) : std::numeric_limits<T>::quiet_NaN();
 
   return parallel_for(
       thread_pool, n_bl,

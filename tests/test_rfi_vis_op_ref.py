@@ -12,11 +12,11 @@ import numpy as np
 import pytest
 from jax.test_util import check_grads
 
-from ri_kernels.jax_api import RFIVisOpRef
-from test_rfi_vis_op import (
+from helpers import (
     BASELINE_LAYOUTS, DEFAULT_SHAPE, PRECISIONS, SHAPES,
     assert_close, make_baselines, make_cotangent, make_signal,
 )
+from ri_kernels.jax_api import RFIVisOpRef
 
 
 @pytest.fixture(params=PRECISIONS, ids=["f32", "f64"])
